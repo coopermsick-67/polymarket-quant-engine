@@ -468,25 +468,6 @@ button { color: inherit; }
 .backtest-trades-panel .positions-table-wrap { min-height: 274px; }
 .side-chip.down { background: rgba(255, 125, 138, 0.09); color: var(--red); }
 
-.email-access-gate { align-items: center; background: radial-gradient(circle at 50% 0%, rgba(111, 216, 255, 0.1), transparent 42%), rgba(1, 4, 8, 0.92); display: flex; inset: 0; justify-content: center; padding: 22px; position: fixed; z-index: 100; }
-.email-access-card { background: linear-gradient(145deg, #101b29, #09101a); border: 1px solid rgba(111, 216, 255, 0.28); border-radius: 14px; box-shadow: 0 30px 100px rgba(0, 0, 0, 0.58); max-width: 470px; padding: 30px; width: 100%; }
-.email-access-icon { align-items: center; background: rgba(111, 216, 255, 0.1); border: 1px solid rgba(111, 216, 255, 0.24); border-radius: 9px; color: var(--cyan); display: flex; height: 42px; justify-content: center; margin-bottom: 20px; width: 42px; }
-.email-access-card h1 { color: #dce9f4; font-size: clamp(25px, 5vw, 32px); letter-spacing: -0.05em; margin: 9px 0 10px; }
-.email-access-card > p { color: #9aa9ba; font-size: 13px; line-height: 1.55; margin: 0; }
-.email-access-form { display: flex; flex-direction: column; gap: 9px; margin-top: 22px; }
-.email-access-form label { color: #8c9caf; font-family: "IBM Plex Mono", monospace; font-size: 9px; letter-spacing: 0.04em; }
-.email-access-form input { background: rgba(5, 8, 14, 0.68); border: 1px solid rgba(146, 166, 191, 0.3); border-radius: 6px; color: #d1dce7; font-family: "IBM Plex Mono", monospace; font-size: 16px; min-height: 44px; padding: 0 12px; width: 100%; }
-.email-access-form input:focus { border-color: var(--cyan); outline: none; }
-.email-access-note { align-items: flex-start; background: rgba(108, 242, 196, 0.05); border: 1px solid rgba(108, 242, 196, 0.18); border-radius: 6px; color: var(--mint); display: flex; font-size: 10px; gap: 8px; line-height: 1.4; margin-top: 4px; padding: 9px 10px; }
-.email-access-note span { color: #8ca99e; }
-.email-access-submit { justify-content: center; margin-top: 3px; min-height: 42px; width: 100%; }
-.email-access-disclaimer { color: #68798c; display: block; font-family: "IBM Plex Mono", monospace; font-size: 8px; line-height: 1.45; margin-top: 16px; }
-
-@media (max-width: 680px) {
-  .email-access-gate { padding: 16px; }
-  .email-access-card { padding: 24px 20px; }
-}
-
 @media (max-width: 1120px) {
   .backtest-grid, .backtest-results { grid-template-columns: 1fr; }
   .backtest-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }

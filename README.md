@@ -86,9 +86,10 @@ For live execution on a trusted localhost machine, explicitly opt in to the loop
 ```text
 POLYMARKET_LIVE_ALLOW_LOCALHOST=true
 POLYMARKET_LIVE_SESSION_SECRET=<64 hexadecimal characters>
+POLYMARKET_TELEGRAM_SESSION_SECRET=<another 64 hexadecimal characters>
 ```
 
-Generate a session secret with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, restart the server, and then link the wallet in the local dashboard. Local live sessions are short-lived, encrypted, and bound to loopback requests. This flag must remain `false` on shared or production deployments.
+Generate each session secret with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, restart the server, and then link the wallet or Telegram bot in the local dashboard. Local live and Telegram sessions are encrypted and bound to loopback requests. This flag must remain `false` on shared or production deployments.
 
 ## Safety and live integration boundary
 

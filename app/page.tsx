@@ -23,7 +23,6 @@ import {
   LineChart,
   LoaderCircle,
   LockKeyhole,
-  Mail,
   Pause,
   Play,
   RefreshCw,
@@ -88,7 +87,6 @@ type DataStatus = "loading" | "ready" | "error";
 
 type LogItem = { id: string; time: string; message: string; detail: string; tone: Tone };
 type Config = { minEdge: number; maxTrade: number; maxLoss: number; feeRate: number; slippageBps: number };
-type AccessSession = { email: string; grantedAt: number };
 type AccountConnection = { walletAddress: string; privateKey: string; signatureType: string };
 type AccountPosition = { id: string; title: string; slug: string | null; outcome: string; size: number | null; averagePrice: number | null; currentPrice: number | null; currentValue: number | null; unrealizedPnl: number | null; realizedPnl: number | null; percentPnl: number | null; status: string; lastEventAt: number | null };
 type AccountOrder = { id: string; side: string; price: number | null; size: number | null; matched: number | null; status: string; createdAt: number | null };
@@ -101,7 +99,6 @@ const ACCOUNT_WALLET_STORAGE_KEY = "polymarket-quant-account-wallet-v1";
 const LIVE_RISK_STORAGE_KEY = "polymarket-quant-live-risk-v1";
 const LEDGER_STORAGE_KEY = "polymarket-quant-decision-ledger-v1";
 const TELEGRAM_LAST_SENT_KEY = "polymarket-quant-telegram-last-sent-v1";
-const ACCESS_SESSION_KEY = "polymarket-quant-paper-access-v1";
 const DEFAULT_CONFIG: Config = { minEdge: 0.03, maxTrade: 25, maxLoss: 0.05, feeRate: 0.02, slippageBps: 15 };
 const EMPTY_ACCOUNT_CONNECTION: AccountConnection = { walletAddress: "", privateKey: "", signatureType: "3" };
 
@@ -122,15 +119,6 @@ const readStoredJson = <T,>(key: string): T | null => {
   if (typeof window === "undefined") return null;
   try { const value = window.localStorage.getItem(key); return value ? JSON.parse(value) as T : null; } catch { return null; }
 };
-
-const readSessionJson = <T,>(key: string): T | null => {
-  if (typeof window === "undefined") return null;
-  try { const value = window.sessionStorage.getItem(key); return value ? JSON.parse(value) as T : null; } catch { return null; }
-};
-
-const readAccessSession = (): AccessSession | null => readSessionJson<AccessSession>(ACCESS_SESSION_KEY) ?? readStoredJson<AccessSession>(ACCESS_SESSION_KEY);
-
-const validEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
 
 function Sparkline({ values, color = "#6cf2c4", height = 28 }: { values: number[]; color?: string; height?: number }) {
   const safeValues = values.length ? values : [0];
@@ -218,10 +206,6 @@ function AccountConnectModal({ connection, loading, error, onChange, onSubmit, o
   return <div className="modal-backdrop" onClick={onClose} role="presentation"><div aria-labelledby="account-connect-title" aria-modal="true" className="modal-card account-modal" onClick={(event) => event.stopPropagation()} role="dialog"><button aria-label="Close account connection" className="modal-close" onClick={onClose} type="button"><X size={17} /></button><div className="modal-icon account-modal-icon"><Wallet size={20} /></div><div className="eyebrow">SECURE LIVE CONNECTION</div><h2 id="account-connect-title">Link Polymarket account</h2><p>Enter your Polymarket wallet address and signer private key. The key is used once to derive CLOB credentials, check your balance, and establish a short-lived encrypted session for the live executor.</p><form className="account-form" onSubmit={(event) => { event.preventDefault(); onSubmit(); }}><label><span>Wallet address <em>required</em></span><input autoComplete="off" autoFocus onChange={(event) => onChange("walletAddress", event.target.value)} placeholder="0x…" spellCheck={false} value={connection.walletAddress} /></label><label><span>Wallet / signer type <em>select the Polymarket account type</em></span><select onChange={(event) => onChange("signatureType", event.target.value)} value={connection.signatureType}><option value="3">Polymarket proxy / smart wallet (3)</option><option value="0">EOA signer (0)</option><option value="1">Proxy wallet (1)</option><option value="2">Gnosis Safe (2)</option></select></label><label><span>Signer private key <em>required</em></span><input autoComplete="new-password" onChange={(event) => onChange("privateKey", event.target.value)} placeholder="64 hex characters" spellCheck={false} type="password" value={connection.privateKey} /></label>{error ? <div className="account-form-error"><AlertTriangle size={14} />{error}</div> : null}<div className="account-security-note"><LockKeyhole size={15} /><span>Raw private keys are highly sensitive. Use this only if you trust this deployment. The browser clears the key after linking; it is not stored in localStorage or logs. The encrypted session expires automatically.</span></div><div className="account-docs"><a href="https://docs.polymarket.com/getting-started/api" rel="noreferrer" target="_blank">API authentication docs ↗</a><a href="https://docs.polymarket.com/trading/wallets-auth" rel="noreferrer" target="_blank">Wallet auth docs ↗</a></div><div className="modal-actions"><button className="button-secondary" onClick={onClose} type="button">Cancel</button><button className="button-primary" disabled={loading || !connection.walletAddress.trim() || !connection.privateKey.trim()} type="submit">{loading ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />} {loading ? "Linking…" : "Connect & secure session"}</button></div></form></div></div>;
 }
 
-function EmailAccessGate({ email, error, onChange, onSubmit }: { email: string; error: string; onChange: (value: string) => void; onSubmit: () => void }) {
-  return <div className="email-access-gate"><div aria-labelledby="paper-access-title" aria-modal="true" className="email-access-card" role="dialog"><div className="email-access-icon"><Mail size={21} /></div><div className="eyebrow">PAPER TERMINAL ACCESS</div><h1 id="paper-access-title">Start the paper engine</h1><p>Enter your email to open the terminal. The engine uses public Polymarket data and stays in paper mode; no live orders or wallet signing are enabled.</p><form className="email-access-form" noValidate onSubmit={(event) => { event.preventDefault(); onSubmit(); }}><label htmlFor="paper-access-email">Email address</label><input autoCapitalize="none" autoComplete="email" autoFocus id="paper-access-email" inputMode="email" onChange={(event) => onChange(event.target.value)} placeholder="you@example.com" spellCheck={false} type="text" value={email} /><div className="email-access-note"><ShieldCheck size={15} /><span>Your access is remembered on this device. No code or password is required.</span></div>{error ? <div className="account-form-error"><AlertTriangle size={14} />{error}</div> : null}<button className="button-primary email-access-submit" disabled={!email.trim()} type="submit"><Play fill="currentColor" size={15} />Enter paper mode</button></form><small className="email-access-disclaimer">Email-only entry is a convenience gate, not identity verification.</small></div></div>;
-}
-
 const RUNNER_COMMAND = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run_forever.ps1";
 
 function RunnerSetupModal({ onClose }: { onClose: () => void }) {
@@ -241,7 +225,6 @@ function RunnerSetupModal({ onClose }: { onClose: () => void }) {
 export default function Home() {
   const [view, setView] = useState<View>("overview"); const [markets, setMarkets] = useState<LiveMarket[]>([]); const [selectedMarketId, setSelectedMarketId] = useState(""); const [durationFilter, setDurationFilter] = useState<"ALL" | Horizon>("ALL");
   const [account, setAccount] = useState<PaperAccount>(() => createPaperAccount(1000, 0)); const [config, setConfig] = useState<Config>(DEFAULT_CONFIG); const [logs, setLogs] = useState<LogItem[]>([]);
-  const [accessSession, setAccessSession] = useState<AccessSession | null>(() => readAccessSession()); const [accessEmailInput, setAccessEmailInput] = useState(() => readAccessSession()?.email ?? ""); const [accessError, setAccessError] = useState("");
   const [dataStatus, setDataStatus] = useState<DataStatus>("loading"); const [dataError, setDataError] = useState(""); const [lastUpdated, setLastUpdated] = useState<number | null>(null); const [lastStreamUpdate, setLastStreamUpdate] = useState<number | null>(null); const [clock, setClock] = useState(0); const [refreshing, setRefreshing] = useState(false); const [streamStatus, setStreamStatus] = useState<"CONNECTING" | "LIVE" | "REST FALLBACK">("CONNECTING");
   const [engineRunning, setEngineRunning] = useState(false); const [paused, setPaused] = useState(false); const [killSwitch, setKillSwitch] = useState(false); const [runnerDialogOpen, setRunnerDialogOpen] = useState(false); const [selectedRange, setSelectedRange] = useState("ALL"); const [startingCashInput, setStartingCashInput] = useState("1000");
   const [recordedTicks, setRecordedTicks] = useState<BacktestRow[]>([]); const [backtestRows, setBacktestRows] = useState<BacktestRow[]>([]); const [backtestRejected, setBacktestRejected] = useState(0); const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null); const [backtestStartingCash, setBacktestStartingCash] = useState(1000);
@@ -262,26 +245,9 @@ export default function Home() {
   useEffect(() => { if (typeof window !== "undefined") window.localStorage.setItem(LIVE_RISK_STORAGE_KEY, JSON.stringify(liveRisk)); }, [liveRisk]);
   useEffect(() => { if (typeof window !== "undefined") { try { window.localStorage.setItem(LEDGER_STORAGE_KEY, JSON.stringify(ledgerRows)); } catch { /* Keep the in-memory ledger if browser storage is full. */ } } }, [ledgerRows]);
   useEffect(() => {
-    const existing = readAccessSession();
-    if (existing && !accessSession) {
-      setAccessSession(existing);
-      setAccessEmailInput(existing.email);
-    }
-  }, [accessSession]);
-  const grantPaperAccess = () => {
-    const email = accessEmailInput.trim().toLowerCase();
-    if (!validEmail(email)) { setAccessError("Enter a valid email address to continue."); return; }
-    const session = { email, grantedAt: Date.now() } satisfies AccessSession;
-    setAccessError(""); setAccessSession(session);
-    if (typeof window !== "undefined") {
-      window.sessionStorage.setItem(ACCESS_SESSION_KEY, JSON.stringify(session));
-      window.localStorage.setItem(ACCESS_SESSION_KEY, JSON.stringify(session));
-    }
-  };
-  useEffect(() => {
-    if (!accessSession || paperAutoStarted.current || killSwitch) return;
-    paperAutoStarted.current = true; setEngineRunning(true); setPaused(false); setView("paper"); appendLog("Paper engine started automatically", `Paper-only session opened for ${accessSession.email}. Candle signals and public asks only; no live orders.`, "positive");
-  }, [accessSession, appendLog, killSwitch]);
+    if (paperAutoStarted.current || killSwitch) return;
+    paperAutoStarted.current = true; setEngineRunning(true); setPaused(false); setView("paper"); appendLog("Paper engine started automatically", "Paper mode is open. Candle signals and public asks only; no live orders.", "positive");
+  }, [appendLog, killSwitch]);
   const fetchConnectedAccount = useCallback(async (connection: AccountConnection): Promise<boolean> => {
     if (!connection.walletAddress.trim()) { setAccountError("Enter a wallet address before connecting."); return false; }
     setAccountLoading(true); setAccountError("");
@@ -337,7 +303,7 @@ export default function Home() {
   const marketMap = useMemo(() => new Map(markets.map((market) => [market.id, market])), [markets]); const liveMarketMap = useMemo(() => new Map(liveMarkets.map((market) => [market.id, market])), [liveMarkets]); const selectedMarket = useMemo(() => liveMarkets.find((market) => market.id === selectedMarketId) ?? liveMarkets[0] ?? null, [liveMarkets, selectedMarketId]); const filteredMarkets = useMemo(() => durationFilter === "ALL" ? liveMarkets : liveMarkets.filter((market) => market.duration === durationFilter), [durationFilter, liveMarkets]);
   const ledgerMetrics = useMemo(() => computeLedgerMetrics(ledgerRows), [ledgerRows]);
   useEffect(() => {
-    if (!accessSession || !liveMarkets.length) return;
+    if (!liveMarkets.length) return;
     const now = Date.now();
     if (now - ledgerLastScan.current < 4500) return;
     ledgerLastScan.current = now;
@@ -429,7 +395,7 @@ export default function Home() {
       }
       return changed ? [...rows.values()].sort((left, right) => right.observedAt - left.observedAt) : current;
     });
-  }, [accessSession, config.maxTrade, config.minEdge, costs, liveMarkets]);
+  }, [config.maxTrade, config.minEdge, costs, liveMarkets]);
   const equity = useMemo(() => accountEquity(account, marketMap), [account, marketMap]); const unrealized = useMemo(() => accountUnrealized(account, marketMap), [account, marketMap]); const winRate = useMemo(() => accountWinRate(account), [account]); const deployed = useMemo(() => accountDeployed(account), [account]); const todayPnl = equity - account.startingCash;
   const paperTestView = useMemo<PaperTestViewState>(() => ({ ...paperTest, balance: accountEquity(account, liveMarketMap), trades: account.fills.filter((fill) => fill.action === "BUY").length, openPositions: account.positions.length, realizedPnl: account.realizedPnl, winRate: accountWinRate(account) }), [account, liveMarketMap, paperTest]);
   const maxDrawdown = useMemo(() => { let peak = 0; let drawdown = 0; for (const point of account.equityHistory) { peak = Math.max(peak, point.equity); if (peak > 0) drawdown = Math.max(drawdown, (peak - point.equity) / peak); } return drawdown; }, [account.equityHistory]); const equitySeries = useMemo(() => account.equityHistory.map((point) => point.equity), [account.equityHistory]); const selectedSignal = selectedMarket ? analyzeMarketSignal(selectedMarket, costs, config.maxTrade, config.minEdge) : null; const currentAction = !selectedSignal || selectedSignal.action === "PASS" ? { label: "PASS", tone: "warning" as Tone } : { label: `${selectedSignal.tier} ${selectedSignal.action}`, tone: selectedSignal.action === "UP" ? "positive" as Tone : "negative" as Tone };
@@ -449,7 +415,6 @@ export default function Home() {
   }, [appendLog]);
 
   useEffect(() => {
-    if (!accessSession) return;
     void refreshMarkets();
     const refreshOnWake = () => void refreshMarkets();
     const handleVisibility = () => { if (document.visibilityState === "visible") refreshOnWake(); };
@@ -458,13 +423,13 @@ export default function Home() {
     window.addEventListener("online", refreshOnWake);
     document.addEventListener("visibilitychange", handleVisibility);
     return () => { window.clearInterval(timer); window.removeEventListener("focus", refreshOnWake); window.removeEventListener("online", refreshOnWake); document.removeEventListener("visibilitychange", handleVisibility); };
-  }, [accessSession, refreshMarkets]);
+  }, [refreshMarkets]);
   const streamAssetKey = useMemo(() => [...new Set(markets.map((market) => market.asset))].sort().join(","), [markets]);
   const streamTokenKey = useMemo(() => [...new Set(markets.flatMap((market) => [market.upTokenId, market.downTokenId]))].sort().join(","), [markets]);
   const streamAssets = useMemo(() => streamAssetKey ? streamAssetKey.split(",") : [], [streamAssetKey]);
   const streamTokens = useMemo(() => streamTokenKey ? streamTokenKey.split(",") : [], [streamTokenKey]);
   useEffect(() => {
-    if (!accessSession || !streamAssetKey || !streamTokenKey) return;
+    if (!streamAssetKey || !streamTokenKey) return;
     let disposed = false;
     let liveSockets = 0;
     let fallbackActivated = false;
@@ -578,12 +543,12 @@ export default function Home() {
     connectCoinbase(); connectClob();
     const fallbackTimer = window.setTimeout(() => { fallbackActivated = true; if (liveSockets < 2) setStreamStatus("REST FALLBACK"); }, 10000);
     return () => { disposed = true; window.clearTimeout(fallbackTimer); for (const timer of retries) window.clearTimeout(timer); for (const socket of sockets) socket.close(); };
-  }, [accessSession, streamAssetKey, streamTokenKey, streamAssets, streamTokens]);
+  }, [streamAssetKey, streamTokenKey, streamAssets, streamTokens]);
   useEffect(() => { if (markets.length && !markets.some((market) => market.id === selectedMarketId)) setSelectedMarketId(markets[0].id); }, [markets, markets.length, selectedMarketId]);
   useEffect(() => { setAccount((current) => markAccount(current, marketMap)); }, [marketMap]);
 
   useEffect(() => {
-    if (!accessSession || !engineRunning) return;
+    if (!engineRunning) return;
     const now = Date.now();
     const simulationMarkets = new Map(liveMarketMap);
     for (const [marketId, snapshot] of ledgerSnapshots.current) if (!simulationMarkets.has(marketId)) simulationMarkets.set(marketId, snapshot.market);
@@ -606,7 +571,7 @@ export default function Home() {
     if (maxDrawdown >= config.maxLoss) { setEngineRunning(false); setPaused(true); appendLog("Daily loss halt triggered", `Drawdown reached ${percentage(maxDrawdown)} against the ${percentage(config.maxLoss)} guardrail.`, "negative"); return; }
     const candidates = liveMarkets.map((market) => ({ market, candidate: marketEdge(market, config) })).filter((item): item is { market: LiveMarket; candidate: NonNullable<ReturnType<typeof marketEdge>> } => Boolean(item.candidate && item.candidate.edge >= config.minEdge && item.market.liquidity >= config.maxTrade)); const next = candidates.sort((left, right) => right.candidate.edge - left.candidate.edge)[0]; if (!next || account.cash <= 0 || account.positions.some((position) => position.marketId === next.market.id)) return;
     const last = autoLastFill.current.get(next.market.id) ?? 0; if (now - last < 15000) return; const result = buyPaper(account, next.market, next.candidate.side, config.maxTrade, costs, "auto engine candidate", now); if (!result.fill) return; autoLastFill.current.set(next.market.id, now); setAccount(markAccount(result.account, marketMap, now)); appendLog(`${next.market.asset} ${next.market.duration} paper fill`, `${next.candidate.side} · ${result.fill.shares.toFixed(2)} shares @ ${cents(result.fill.price)} · edge ${percentage(next.candidate.edge)}`, "positive");
-  }, [accessSession, account, config, costs, engineRunning, killSwitch, liveMarketMap, liveMarkets, marketMap, markets.length, paused, maxDrawdown, appendLog, paperTest.days, paperTest.endsAt, paperTest.status]);
+  }, [account, config, costs, engineRunning, killSwitch, liveMarketMap, liveMarkets, marketMap, markets.length, paused, maxDrawdown, appendLog, paperTest.days, paperTest.endsAt, paperTest.status]);
 
   const startEngine = () => { if (killSwitch) { appendLog("Start blocked by kill switch", "Reset the paper session before enabling the engine.", "negative"); return; } setEngineRunning(true); setPaused(false); setPaperTest((current) => current.status === "PAUSED" ? { ...current, status: "RUNNING" } : current); setView("paper"); appendLog("Paper engine started", "The Paper Trader and Paper Lab now use the same shared account, positions, and resolution ledger.", "positive"); };
   const togglePause = () => { const nextPaused = !paused; setPaused(nextPaused); setPaperTest((current) => current.status === "RUNNING" || current.status === "PAUSED" ? { ...current, status: nextPaused ? "PAUSED" : "RUNNING" } : current); appendLog(nextPaused ? "New paper trades paused" : "Paper engine resumed", "Existing shared positions remain marked and will settle from market outcomes.", "warning"); };
@@ -663,7 +628,6 @@ export default function Home() {
 
   const telegramRequest = useCallback(async (body: Record<string, unknown>) => fetch("/api/telegram", { body: JSON.stringify(body), cache: "no-store", credentials: "same-origin", headers: { "Content-Type": "application/json" }, method: "POST" }), []);
   const refreshTelegramStatus = useCallback(async () => {
-    if (!accessSession) return;
     try {
       const response = await telegramRequest({ action: "status" });
       const payload = await response.json() as { ok?: boolean; error?: string; telegram?: Partial<TelegramViewState> };
@@ -676,8 +640,8 @@ export default function Home() {
       const detail = error instanceof Error ? error.message : "Telegram status is unavailable.";
       if (!detail.includes("expired") && !detail.includes("Sign in")) setTelegram((current) => ({ ...current, lastError: detail }));
     }
-  }, [accessSession, telegramRequest]);
-  useEffect(() => { if (accessSession) void refreshTelegramStatus(); }, [accessSession, refreshTelegramStatus]);
+  }, [telegramRequest]);
+  useEffect(() => { void refreshTelegramStatus(); }, [refreshTelegramStatus]);
   const connectTelegram = useCallback(async (botToken: string, chatId: string): Promise<boolean> => {
     try {
       const response = await telegramRequest({ action: "connect", botToken, chatId });
@@ -727,7 +691,7 @@ export default function Home() {
   }, [appendLog, telegram.connected, telegramReportText, telegramRequest]);
   const sendTelegramTest = () => { void sendTelegramReport("Manual test report"); };
   useEffect(() => {
-    if (!accessSession || !telegram.connected) return;
+    if (!telegram.connected) return;
     const checkSchedule = () => {
       const parts = new Intl.DateTimeFormat("en-US", { day: "2-digit", hour: "2-digit", hourCycle: "h23", minute: "2-digit", month: "2-digit", timeZone: "America/New_York", weekday: "short", year: "numeric" }).formatToParts(new Date());
       const part = (type: string) => parts.find((item) => item.type === type)?.value ?? "";
@@ -737,7 +701,7 @@ export default function Home() {
       void sendTelegramReport("Scheduled Sunday 9pm ET report").then((sent) => { if (sent && typeof window !== "undefined") window.localStorage.setItem(TELEGRAM_LAST_SENT_KEY, JSON.stringify({ weekKey })); });
     };
     checkSchedule(); const timer = window.setInterval(checkSchedule, 30_000); return () => window.clearInterval(timer);
-  }, [accessSession, sendTelegramReport, telegram.connected]);
+  }, [sendTelegramReport, telegram.connected]);
 
   const liveCandidates = useMemo(() => liveMarkets.map((market) => ({ market, signal: analyzeMarketSignal(market, { feeRate: liveRisk.feeRate, slippageBps: liveRisk.slippageBps }, liveRisk.maxTradeUsd, liveRisk.minEdge) })).filter((item) => item.market.remaining >= 30 && liveRisk.allowedDurations.includes(item.market.duration) && item.signal.action !== "PASS" && (!liveRisk.requireLock || item.signal.tier === "LOCK")).sort((left, right) => (right.signal.edge ?? -1) - (left.signal.edge ?? -1)), [liveMarkets, liveRisk]);
   const liveRequest = useCallback(async (body: Record<string, unknown>, confirm = false) => fetch("/api/polymarket/live", { body: JSON.stringify(body), cache: "no-store", credentials: "same-origin", headers: { "Content-Type": "application/json", ...(confirm ? { "x-polymarket-live-confirm": "1" } : {}) }, method: "POST" }), []);
@@ -821,11 +785,11 @@ export default function Home() {
   const statusForData = dataStatus === "error" || dataStatus === "loading" ? "WARN" : "READY"; const rangeLength = ({ "5M": 5, "15M": 15, "1H": 60, "6H": 360, "24H": 1440 } as Record<string, number | undefined>)[selectedRange] ?? equitySeries.length; const selectedTicks = selectedRange === "ALL" ? equitySeries : equitySeries.slice(-rangeLength);
   const paperLab = <PaperLabPanel paperTest={paperTestView} paperAccount={account} paperMarkets={liveMarketMap} clock={clock} engineRunning={engineRunning} paused={paused} startingBalanceInput={paperTestStartingBalanceInput} durationDaysInput={paperTestDurationDaysInput} ledgerRows={ledgerRows} metrics={ledgerMetrics} telegram={telegram} onStartingBalanceChange={setPaperTestStartingBalanceInput} onDurationDaysChange={setPaperTestDurationDaysInput} onStart={startPaperTest} onPause={togglePaperTestPause} onStop={stopPaperTest} onReset={resetPaperTest} onExport={exportDecisionLedger} onClearLedger={clearDecisionLedger} onTelegramConnect={connectTelegram} onTelegramDisconnect={disconnectTelegram} onTelegramTest={sendTelegramTest} onTelegramRefresh={() => void refreshTelegramStatus()} />;
 
-    return <><main aria-hidden={!accessSession} className="terminal-shell"><aside className="sidebar-rail"><div className="brand-mark" aria-label="Polymarket Quant Engine"><span className="brand-mark-core">P</span><span className="brand-mark-pulse" /></div><nav className="rail-nav" aria-label="Primary navigation"><button className={`rail-button ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")} type="button" title="Overview"><LayoutDashboard size={19} /></button><button className={`rail-button ${view === "paper" ? "active" : ""}`} onClick={() => setView("paper")} type="button" title="Paper trader"><BarChart3 size={19} /></button><button className={`rail-button ${view === "backtest" ? "active" : ""}`} onClick={() => setView("backtest")} type="button" title="Paper lab"><LineChart size={19} /></button><button className={`rail-button ${view === "account" ? "active" : ""}`} onClick={() => setView("account")} type="button" title="Connected account"><CircleDollarSign size={19} /></button><button className="rail-button" onClick={() => setView("overview")} type="button" title="Public market data"><ScanLine size={19} /></button></nav><div className="rail-bottom"><button className="rail-button" onClick={() => setView("live")} type="button" title="Live executor"><Settings2 size={19} /></button><span className="rail-version">v0.2</span></div></aside>
+    return <><main className="terminal-shell"><aside className="sidebar-rail"><div className="brand-mark" aria-label="Polymarket Quant Engine"><span className="brand-mark-core">P</span><span className="brand-mark-pulse" /></div><nav className="rail-nav" aria-label="Primary navigation"><button className={`rail-button ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")} type="button" title="Overview"><LayoutDashboard size={19} /></button><button className={`rail-button ${view === "paper" ? "active" : ""}`} onClick={() => setView("paper")} type="button" title="Paper trader"><BarChart3 size={19} /></button><button className={`rail-button ${view === "backtest" ? "active" : ""}`} onClick={() => setView("backtest")} type="button" title="Paper lab"><LineChart size={19} /></button><button className={`rail-button ${view === "account" ? "active" : ""}`} onClick={() => setView("account")} type="button" title="Connected account"><CircleDollarSign size={19} /></button><button className="rail-button" onClick={() => setView("overview")} type="button" title="Public market data"><ScanLine size={19} /></button></nav><div className="rail-bottom"><button className="rail-button" onClick={() => setView("live")} type="button" title="Live executor"><Settings2 size={19} /></button><span className="rail-version">v0.2</span></div></aside>
     <section className="terminal-main"><header className="topbar"><div className="title-block"><div className="eyebrow"><span className="eyebrow-dot" />POLYMARKET / PM5 PREDICTOR</div><h1>Decision terminal</h1><p>Public market data in. Calibrated paper signals out. Every result traceable.</p></div><div className="topbar-right"><div className="connection-strip"><StatusDot label="GAMMA" status={statusForData} detail="Public market metadata layer" /><StatusDot label="CLOB" status="PUBLIC" detail="Public Polymarket order books" /><StatusDot label="SPOT" status="PUBLIC" detail="Public Coinbase spot endpoint" /><StatusDot label="LEDGER" status="READY" detail="Browser-local paper ledger" /><StatusDot label="ACCOUNT" status={connectedAccount ? "READY" : "LOCKED"} detail="Read-only wallet and CLOB account data" /></div><div className="topbar-actions"><button className="mode-pill runner-pill" onClick={() => setRunnerDialogOpen(true)} type="button"><Terminal size={13} />24/7 RUNNER</button><button className="mode-pill account-mode" onClick={() => setAccountDialogOpen(true)} type="button"><Wallet size={13} />{connectedAccount ? "ACCOUNT READY" : "LINK ACCOUNT"}</button><button className="mode-pill" onClick={() => setView("live")} type="button"><span className="mode-pill-dot" />{liveRunning ? "LIVE ACTIVE" : "PAPER / LIVE"}<ChevronDown size={13} /></button><span className="clock-readout"><Clock3 size={14} />{clock ? new Date(clock).toLocaleTimeString("en-US", { hour12: false, timeZone: "UTC" }) : "--:--:--"} UTC</span></div></div></header>
       {killSwitch ? <div className="critical-banner"><AlertTriangle size={17} /><span><strong>RISK HALT</strong> — paper auto-execution is disabled; reset only after reviewing the ledger.</span><button onClick={resetPaperSession} type="button">Reset empty ledger</button></div> : <div className="info-banner"><Activity size={16} /><span><strong>Paper is the default.</strong> Live execution is opt-in, owner-authenticated, balance-aware, and fail-closed.</span><span className="banner-spacer" /><button onClick={() => setRunnerDialogOpen(true)} type="button">24/7 runner setup <Terminal size={14} /></button><button onClick={() => setView("live")} type="button">Open live executor <ArrowUpRight size={14} /></button></div>}
       <div className="terminal-content"><div className="workspace-tabs" role="tablist" aria-label="Workspace"><button className={view === "overview" ? "active" : ""} onClick={() => setView("overview")} role="tab" aria-selected={view === "overview"} type="button"><LayoutDashboard size={14} />Overview</button><button className={view === "paper" ? "active" : ""} onClick={() => setView("paper")} role="tab" aria-selected={view === "paper"} type="button"><Wallet size={14} />Paper trader</button><button className={view === "backtest" ? "active" : ""} onClick={() => setView("backtest")} role="tab" aria-selected={view === "backtest"} type="button"><LineChart size={14} />Paper lab</button><button className={view === "account" ? "active" : ""} onClick={() => setView("account")} role="tab" aria-selected={view === "account"} type="button"><CircleDollarSign size={14} />Account</button><button className={view === "live" ? "active" : ""} onClick={() => setView("live")} role="tab" aria-selected={view === "live"} type="button"><Zap size={14} />Live executor</button><span className="workspace-tab-spacer" /><span className="data-receipt"><span className={`status-dot ${streamStatus === "LIVE" ? "status-ready" : "status-warning"}`} />{streamStatus === "LIVE" ? "WS LIVE" : streamStatus.toLowerCase()} · {lastStreamUpdate ? `${formatAge(lastStreamUpdate, clock)} stream tick` : "waiting for stream tick"}</span></div>
-        <section className="control-row" aria-label="Trading controls"><div className="engine-state"><span className={`engine-pulse ${engineRunning && !paused && !killSwitch ? "running" : ""}`} /><span><strong>{killSwitch ? "HALTED" : engineRunning ? (paused ? "PAPER ENGINE PAUSED" : "PAPER ENGINE RUNNING") : "PAPER ENGINE STANDBY"}</strong><small>{engineRunning ? "Candidate scan uses only executable public asks" : "Enter email to auto-start the paper engine"}</small></span></div><div className="control-buttons"><button className="button-primary" disabled={killSwitch || engineRunning} onClick={startEngine} type="button"><Play size={15} fill="currentColor" />{engineRunning ? "RUNNING" : "START PAPER ENGINE"}</button><button className={`button-secondary ${paused ? "button-warning" : ""}`} disabled={!engineRunning} onClick={togglePause} type="button"><Pause size={15} />{paused ? "RESUME" : "PAUSE NEW TRADES"}</button><button className="button-secondary" onClick={cancelOrders} type="button"><Ban size={15} />CLEAR QUEUE <span className="button-count">{account.openOrders}</span></button><button className="button-secondary" disabled={!account.positions.length} onClick={closePositions} type="button"><Wallet size={15} />CLOSE POSITIONS</button><button className="button-danger" onClick={triggerKillSwitch} type="button"><Zap size={15} />KILL SWITCH</button></div></section>
+        <section className="control-row" aria-label="Trading controls"><div className="engine-state"><span className={`engine-pulse ${engineRunning && !paused && !killSwitch ? "running" : ""}`} /><span><strong>{killSwitch ? "HALTED" : engineRunning ? (paused ? "PAPER ENGINE PAUSED" : "PAPER ENGINE RUNNING") : "PAPER ENGINE STANDBY"}</strong><small>{engineRunning ? "Candidate scan uses only executable public asks" : "Start the paper engine to scan signals"}</small></span></div><div className="control-buttons"><button className="button-primary" disabled={killSwitch || engineRunning} onClick={startEngine} type="button"><Play size={15} fill="currentColor" />{engineRunning ? "RUNNING" : "START PAPER ENGINE"}</button><button className={`button-secondary ${paused ? "button-warning" : ""}`} disabled={!engineRunning} onClick={togglePause} type="button"><Pause size={15} />{paused ? "RESUME" : "PAUSE NEW TRADES"}</button><button className="button-secondary" onClick={cancelOrders} type="button"><Ban size={15} />CLEAR QUEUE <span className="button-count">{account.openOrders}</span></button><button className="button-secondary" disabled={!account.positions.length} onClick={closePositions} type="button"><Wallet size={15} />CLOSE POSITIONS</button><button className="button-danger" onClick={triggerKillSwitch} type="button"><Zap size={15} />KILL SWITCH</button></div></section>
         {view === "account" ? <AccountView account={connectedAccount} error={accountError} loading={accountLoading} onConnect={() => setAccountDialogOpen(true)} onDisconnect={disconnectAccount} onRefresh={() => void fetchConnectedAccount(accountConnection)} /> : view === "live" ? <LiveExecutionPanel candidateCount={liveCandidates.length} consent={liveConsent} killSwitch={killSwitch} marketCount={liveMarkets.length} onConsentChange={setLiveConsent} onKill={() => void killLiveExecutor()} onLink={() => setAccountDialogOpen(true)} onPause={toggleLivePause} onRefresh={() => void refreshLiveBalance()} onRiskChange={(patch) => setLiveRisk((current) => normalizeLiveRiskConfig({ ...current, ...patch }))} onStart={startLiveExecutor} paused={livePaused} risk={liveRisk} running={liveRunning} session={liveSession} status={liveStatus} /> : view !== "backtest" ? <><section className="metric-grid" aria-label="Paper account summary"><MetricCard label="TOTAL EQUITY" value={dollars(equity)} delta={signedDollars(todayPnl)} deltaTone={todayPnl >= 0 ? "positive" : "negative"} detail="vs. starting cash" icon={<CircleDollarSign size={17} />} spark={selectedTicks} /><MetricCard label="CASH" value={dollars(account.cash)} delta={`${account.positions.length} open`} deltaTone="neutral" detail="available balance" icon={<Wallet size={17} />} /><MetricCard label="SESSION P&L" value={signedDollars(todayPnl)} delta={`${account.fills.length} fills`} deltaTone={todayPnl >= 0 ? "positive" : "negative"} detail="paper ledger" icon={todayPnl >= 0 ? <TrendingUp size={17} /> : <TrendingDown size={17} />} spark={selectedTicks} /><MetricCard label="UNREALIZED" value={signedDollars(unrealized)} delta={`${account.positions.length} positions`} deltaTone={unrealized >= 0 ? "positive" : "negative"} detail="marked to bid" icon={<Activity size={17} />} /><MetricCard label="REALIZED P&L" value={signedDollars(account.realizedPnl)} delta={`${account.closedTrades.length} closed`} deltaTone={account.realizedPnl >= 0 ? "positive" : "negative"} detail="after recorded fees" icon={<Target size={17} />} /><MetricCard label="FEES" value={dollars(account.fees)} delta={`${(config.feeRate * 100).toFixed(2)}% model`} deltaTone="neutral" detail="configured cost" icon={<CircleDot size={17} />} /><MetricCard label="DRAWDOWN" value={percentage(maxDrawdown)} delta={maxDrawdown <= config.maxLoss ? "within limit" : "halt threshold"} deltaTone={maxDrawdown <= config.maxLoss ? "positive" : "negative"} detail={`max ${percentage(config.maxLoss)} configured`} icon={<Gauge size={17} />} /><MetricCard label="WIN RATE" value={percentage(winRate)} delta={account.closedTrades.length ? `${account.closedTrades.length} settled` : "no settled trades"} deltaTone="neutral" detail="paper ledger only" icon={<ShieldCheck size={17} />} /></section>
           <section className="section-heading"><div><div className="eyebrow">PUBLIC MARKET DISCOVERY</div><h2>Active short-duration markets</h2></div><div className="section-heading-right"><span className="last-tick">{filteredMarkets.length ? `${filteredMarkets.length} markets` : "no markets"}</span><span className="last-tick"><span className={`status-dot ${dataStatus === "ready" ? "status-ready" : "status-warning"}`} />{lastUpdated ? formatAge(lastUpdated, clock) : "no tick"}</span><div className="filter-tabs" role="tablist" aria-label="Market duration">{(["ALL", "5m", "15m"] as const).map((filter) => <button aria-selected={durationFilter === filter} className={durationFilter === filter ? "filter-tab active" : "filter-tab"} key={filter} onClick={() => setDurationFilter(filter)} role="tab" type="button">{filter}</button>)}</div><button className="icon-button" disabled={refreshing} onClick={() => void refreshMarkets()} title="Refresh public market discovery" type="button">{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}</button></div></section>
           {dataStatus === "error" ? <div className="data-alert"><AlertTriangle size={16} /><div><strong>Public data unavailable</strong><span>{dataError}</span></div><button onClick={() => void refreshMarkets()} type="button">Retry</button></div> : null}{dataStatus === "ready" && !filteredMarkets.length ? <EmptyState title="No eligible markets right now" detail={dataError || "Gamma returned no active crypto markets matching the 5m/15m filters. The engine will keep checking; it will not fabricate quotes."} action={<button className="button-secondary" onClick={() => void refreshMarkets()} type="button"><RefreshCw size={14} />Refresh public feed</button>} /> : null}
@@ -849,5 +813,5 @@ export default function Home() {
     {null}
     {accountDialogOpen ? <AccountConnectModal connection={accountConnection} error={accountError} loading={accountLoading} onChange={(field, value) => setAccountConnection((current) => ({ ...current, [field]: value }))} onClose={() => setAccountDialogOpen(false)} onSubmit={() => void connectAccount()} /> : null}
     {runnerDialogOpen ? <RunnerSetupModal onClose={() => setRunnerDialogOpen(false)} /> : null}
-  </main>{!accessSession ? <EmailAccessGate email={accessEmailInput} error={accessError} onChange={setAccessEmailInput} onSubmit={grantPaperAccess} /> : null}</>;
+  </main></>;
 }

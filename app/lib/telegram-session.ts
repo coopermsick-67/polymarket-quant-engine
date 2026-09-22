@@ -68,5 +68,5 @@ export const readTelegramSession = async (request: Request, userId: string): Pro
   }
 };
 
-export const telegramSessionCookie = (token: string, maxAge = TELEGRAM_SESSION_TTL_SECONDS) => TELEGRAM_SESSION_COOKIE + "=" + token + "; Path=/api/telegram; Max-Age=" + maxAge + "; HttpOnly; Secure; SameSite=Lax";
-export const clearTelegramSessionCookie = () => telegramSessionCookie("", 0);
+export const telegramSessionCookie = (token: string, maxAge = TELEGRAM_SESSION_TTL_SECONDS, secure = true) => TELEGRAM_SESSION_COOKIE + "=" + token + "; Path=/api/telegram; Max-Age=" + maxAge + "; HttpOnly" + (secure ? "; Secure" : "") + "; SameSite=Lax";
+export const clearTelegramSessionCookie = (secure = true) => telegramSessionCookie("", 0, secure);
