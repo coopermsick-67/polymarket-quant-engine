@@ -1,6 +1,11 @@
 import type { Horizon } from "./polymarket-data";
+import {
+  DEFAULT_LIVE_EARLY_EXIT,
+  normalizeEarlyExitPolicy,
+  type EarlyExitPolicy,
+} from "./early-exit";
 
-export type LiveRiskConfig = {
+export type LiveRiskConfig = EarlyExitPolicy & {
   unitBalancePct: number;
   unitsPerTrade: number;
   kellyFraction: number;
@@ -31,6 +36,7 @@ export type KellySizing = {
 };
 
 export const DEFAULT_LIVE_RISK: LiveRiskConfig = {
+  ...DEFAULT_LIVE_EARLY_EXIT,
   unitBalancePct: 0.01,
   unitsPerTrade: 1,
   kellyFraction: 0.25,
@@ -52,6 +58,7 @@ export const normalizeLiveRiskConfig = (input: Partial<LiveRiskConfig> | null | 
     ? input.allowedDurations.filter((value): value is Horizon => value === "5m" || value === "15m")
     : DEFAULT_LIVE_RISK.allowedDurations;
   return {
+    ...normalizeEarlyExitPolicy(input, DEFAULT_LIVE_EARLY_EXIT),
     unitBalancePct: clamp(finite(input?.unitBalancePct, DEFAULT_LIVE_RISK.unitBalancePct), 0.0025, 0.05),
     unitsPerTrade: clamp(finite(input?.unitsPerTrade, DEFAULT_LIVE_RISK.unitsPerTrade), 0.25, 5),
     kellyFraction: clamp(finite(input?.kellyFraction, DEFAULT_LIVE_RISK.kellyFraction), 0.05, 0.5),

@@ -79,6 +79,7 @@ import {
 import LiveExecutionPanel, { type LiveExecutionStatus, type LiveSessionState } from "./components/live-execution-panel";
 import PaperLabPanel, { type PaperTestViewState, type TelegramViewState } from "./components/paper-lab-panel";
 import { computeLedgerMetrics, decisionLedgerCsv, ledgerResultFor, type MarketDecisionRow } from "./lib/decision-ledger";
+import { DEFAULT_PAPER_EARLY_EXIT, evaluateModelAwareExit, normalizeEarlyExitPolicy, type EarlyExitPolicy } from "./lib/early-exit";
 import { normalizeLiveRiskConfig, type LiveRiskConfig } from "./lib/live-risk";
 
 type View = "overview" | "paper" | "account" | "live" | "backtest";
@@ -86,12 +87,13 @@ type Tone = "positive" | "warning" | "negative" | "neutral";
 type DataStatus = "loading" | "ready" | "error";
 
 type LogItem = { id: string; time: string; message: string; detail: string; tone: Tone };
-type Config = { minEdge: number; maxTrade: number; maxLoss: number; feeRate: number; slippageBps: number };
+type Config = EarlyExitPolicy & { minEdge: number; maxTrade: number; maxLoss: number; feeRate: number; slippageBps: number };
 type AccountConnection = { walletAddress: string; privateKey: string; signatureType: string };
 type AccountPosition = { id: string; title: string; slug: string | null; outcome: string; size: number | null; averagePrice: number | null; currentPrice: number | null; currentValue: number | null; unrealizedPnl: number | null; realizedPnl: number | null; percentPnl: number | null; status: string; lastEventAt: number | null };
 type AccountOrder = { id: string; side: string; price: number | null; size: number | null; matched: number | null; status: string; createdAt: number | null };
 type AccountTrade = { id: string; timestamp: number | null; title: string; slug: string | null; side: string; outcome: string; price: number | null; shares: number | null; amount: number | null; status: string; transactionHash: string | null };
 type ConnectedAccount = { walletAddress: string; authenticated: boolean; portfolioValue: number | null; cashBalance: number | null; openPositions: AccountPosition[]; openOrders: AccountOrder[]; recentTrades: AccountTrade[]; pnl: number | null; tradedMarketCount: number | null; fetchedAt: number; warnings: string[] };
+type LivePositionSnapshot = { id: string; tokenID: string | null; conditionId: string | null; title: string; outcome: string; size: number | null; averagePrice: number | null };
 
 const PAPER_STORAGE_KEY = "polymarket-quant-paper-v2";
 const CONFIG_STORAGE_KEY = "polymarket-quant-config-v2";
@@ -99,7 +101,7 @@ const ACCOUNT_WALLET_STORAGE_KEY = "polymarket-quant-account-wallet-v1";
 const LIVE_RISK_STORAGE_KEY = "polymarket-quant-live-risk-v1";
 const LEDGER_STORAGE_KEY = "polymarket-quant-decision-ledger-v1";
 const TELEGRAM_LAST_SENT_KEY = "polymarket-quant-telegram-last-sent-v1";
-const DEFAULT_CONFIG: Config = { minEdge: 0.03, maxTrade: 25, maxLoss: 0.05, feeRate: 0.02, slippageBps: 15 };
+const DEFAULT_CONFIG: Config = { minEdge: 0.03, maxTrade: 25, maxLoss: 0.05, feeRate: 0.02, slippageBps: 15, ...DEFAULT_PAPER_EARLY_EXIT };
 const EMPTY_ACCOUNT_CONNECTION: AccountConnection = { walletAddress: "", privateKey: "", signatureType: "3" };
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
@@ -234,12 +236,12 @@ export default function Home() {
   const [paperTestStartingBalanceInput, setPaperTestStartingBalanceInput] = useState("1000"); const [paperTestDurationDaysInput, setPaperTestDurationDaysInput] = useState("1");
   const [paperTest, setPaperTest] = useState<PaperTestViewState>({ status: "IDLE", startingBalance: 1000, days: 1, startedAt: null, endsAt: null, balance: 1000, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null });
   const [telegram, setTelegram] = useState<TelegramViewState>({ connected: false, botUsername: "", botName: "", chatId: "", chatTitle: "", expiresAt: null, lastStatus: "", lastError: "" });
-  const previousSpots = useRef(new Map<Asset, number>()); const priceHistoryByAsset = useRef(new Map<Asset, MarketPriceTick[]>()); const autoLastFill = useRef(new Map<string, number>()); const dataLogState = useRef(""); const hydrated = useRef(false); const refreshBusy = useRef(false); const paperAutoStarted = useRef(false); const liveBusy = useRef(false); const liveAttempted = useRef(new Map<string, number>()); const liveReason = useRef("");
+  const previousSpots = useRef(new Map<Asset, number>()); const priceHistoryByAsset = useRef(new Map<Asset, MarketPriceTick[]>()); const autoLastFill = useRef(new Map<string, number>()); const dataLogState = useRef(""); const hydrated = useRef(false); const refreshBusy = useRef(false); const paperAutoStarted = useRef(false); const liveBusy = useRef(false); const liveAttempted = useRef(new Map<string, number>()); const liveReason = useRef(""); const paperExitObservations = useRef(new Map<string, { count: number; lastSeen: number }>()); const livePositionsRef = useRef<LivePositionSnapshot[]>([]); const liveExitObservations = useRef(new Map<string, { count: number; lastSeen: number }>()); const livePositionRefreshBusy = useRef(false); const livePositionRefreshedAt = useRef(0);
   const ledgerSnapshots = useRef(new Map<string, { market: LiveMarket; observedAt: number }>()); const ledgerLastScan = useRef(0); const telegramSendBusy = useRef(false);
 
   const appendLog = useCallback((message: string, detail: string, tone: Tone = "neutral") => { setLogs((current) => [{ id: `${Date.now()}-${message}`, time: new Date().toLocaleTimeString("en-US", { hour12: false }), message, detail, tone }, ...current].slice(0, 18)); }, []);
 
-  useEffect(() => { if (typeof window === "undefined") return; const rawAccount = readStoredJson<PaperAccount>(PAPER_STORAGE_KEY); const rawConfig = readStoredJson<Config>(CONFIG_STORAGE_KEY); if (rawAccount?.startingCash) setAccount(rawAccount); if (rawConfig) setConfig({ ...DEFAULT_CONFIG, ...rawConfig }); setStartingCashInput(String(rawAccount?.startingCash ?? 1000)); hydrated.current = true; }, []);
+  useEffect(() => { if (typeof window === "undefined") return; const rawAccount = readStoredJson<PaperAccount>(PAPER_STORAGE_KEY); const rawConfig = readStoredJson<Partial<Config>>(CONFIG_STORAGE_KEY); if (rawAccount?.startingCash) setAccount(rawAccount); if (rawConfig) setConfig({ ...DEFAULT_CONFIG, ...rawConfig, ...normalizeEarlyExitPolicy(rawConfig, DEFAULT_PAPER_EARLY_EXIT) }); setStartingCashInput(String(rawAccount?.startingCash ?? 1000)); hydrated.current = true; }, []);
   useEffect(() => { if (hydrated.current && typeof window !== "undefined") window.localStorage.setItem(PAPER_STORAGE_KEY, JSON.stringify(account)); }, [account]);
   useEffect(() => { if (typeof window !== "undefined") window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config)); }, [config]);
   useEffect(() => { if (typeof window !== "undefined") window.localStorage.setItem(LIVE_RISK_STORAGE_KEY, JSON.stringify(liveRisk)); }, [liveRisk]);
@@ -301,6 +303,14 @@ export default function Home() {
     return { ...market, remaining, fairUp, edgeUp: fairUp !== null && market.upAsk !== null ? fairUp - market.upAsk : null, edgeDown: fairUp !== null && market.downAsk !== null ? 1 - fairUp - market.downAsk : null };
   }), [clock, markets]);
   const marketMap = useMemo(() => new Map(markets.map((market) => [market.id, market])), [markets]); const liveMarketMap = useMemo(() => new Map(liveMarkets.map((market) => [market.id, market])), [liveMarkets]); const selectedMarket = useMemo(() => liveMarkets.find((market) => market.id === selectedMarketId) ?? liveMarkets[0] ?? null, [liveMarkets, selectedMarketId]); const filteredMarkets = useMemo(() => durationFilter === "ALL" ? liveMarkets : liveMarkets.filter((market) => market.duration === durationFilter), [durationFilter, liveMarkets]);
+  const liveTokenMap = useMemo(() => {
+    const next = new Map<string, { market: LiveMarket; side: PaperSide }>();
+    for (const market of liveMarkets) {
+      next.set(market.upTokenId, { market, side: "UP" });
+      next.set(market.downTokenId, { market, side: "DOWN" });
+    }
+    return next;
+  }, [liveMarkets]);
   const ledgerMetrics = useMemo(() => computeLedgerMetrics(ledgerRows), [ledgerRows]);
   useEffect(() => {
     if (!liveMarkets.length) return;
@@ -567,6 +577,44 @@ export default function Home() {
       appendLog("Paper markets resolved", `${settlement.closed} position${settlement.closed === 1 ? "" : "s"} settled · ${signedDollars(settlement.realized)} realized and returned to shared cash.`, settlement.realized >= 0 ? "positive" : "negative");
       return;
     }
+    if (!killSwitch && account.positions.length) {
+      const exitIds = new Set<string>();
+      const exitDetails: string[] = [];
+      const activePositionIds = new Set(account.positions.map((position) => position.id));
+      for (const key of paperExitObservations.current.keys()) if (!activePositionIds.has(key)) paperExitObservations.current.delete(key);
+      for (const position of account.positions) {
+        const market = simulationMarkets.get(position.marketId);
+        if (!market || market.fairUp === null) {
+          paperExitObservations.current.delete(position.id);
+          continue;
+        }
+        const currentPrice = position.side === "UP" ? market.upBid : market.downBid;
+        const fairProbability = position.side === "UP" ? market.fairUp : 1 - market.fairUp;
+        const evaluation = evaluateModelAwareExit({ policy: config, entryPrice: position.avgEntry, currentPrice: currentPrice ?? 0, fairProbability, shares: position.shares, feeRate: config.feeRate, remainingSeconds: market.remaining });
+        if (!evaluation.shouldExit) {
+          paperExitObservations.current.delete(position.id);
+          continue;
+        }
+        const previous = paperExitObservations.current.get(position.id);
+        const count = previous && now - previous.lastSeen <= 15_000 ? previous.count + 1 : 1;
+        paperExitObservations.current.set(position.id, { count, lastSeen: now });
+        if (count >= config.earlyExitConfirmations) {
+          exitIds.add(position.id);
+          exitDetails.push(`${position.asset} ${position.duration} ${position.side} ${evaluation.reason}`);
+        }
+      }
+      if (exitIds.size) {
+        const earlyExit = closePaperPositions(account, simulationMarkets, costs, "model-aware early exit", now, exitIds);
+        if (earlyExit.closed) {
+          setAccount(markAccount(earlyExit.account, simulationMarkets, now));
+          for (const id of exitIds) paperExitObservations.current.delete(id);
+          appendLog("Model-aware paper cashout", `${exitDetails.join(" · ")} · ${signedDollars(earlyExit.realized)} realized.`, earlyExit.realized >= 0 ? "positive" : "warning");
+          return;
+        }
+      }
+    } else if (!config.earlyExitEnabled) {
+      paperExitObservations.current.clear();
+    }
     if (paused || killSwitch || !markets.length) return;
     if (maxDrawdown >= config.maxLoss) { setEngineRunning(false); setPaused(true); appendLog("Daily loss halt triggered", `Drawdown reached ${percentage(maxDrawdown)} against the ${percentage(config.maxLoss)} guardrail.`, "negative"); return; }
     const candidates = liveMarkets.map((market) => ({ market, candidate: marketEdge(market, config) })).filter((item): item is { market: LiveMarket; candidate: NonNullable<ReturnType<typeof marketEdge>> } => Boolean(item.candidate && item.candidate.edge >= config.minEdge && item.market.liquidity >= config.maxTrade)); const next = candidates.sort((left, right) => right.candidate.edge - left.candidate.edge)[0]; if (!next || account.cash <= 0 || account.positions.some((position) => position.marketId === next.market.id)) return;
@@ -705,6 +753,23 @@ export default function Home() {
 
   const liveCandidates = useMemo(() => liveMarkets.map((market) => ({ market, signal: analyzeMarketSignal(market, { feeRate: liveRisk.feeRate, slippageBps: liveRisk.slippageBps }, liveRisk.maxTradeUsd, liveRisk.minEdge) })).filter((item) => item.market.remaining >= 30 && liveRisk.allowedDurations.includes(item.market.duration) && item.signal.action !== "PASS" && (!liveRisk.requireLock || item.signal.tier === "LOCK")).sort((left, right) => (right.signal.edge ?? -1) - (left.signal.edge ?? -1)), [liveMarkets, liveRisk]);
   const liveRequest = useCallback(async (body: Record<string, unknown>, confirm = false) => fetch("/api/polymarket/live", { body: JSON.stringify(body), cache: "no-store", credentials: "same-origin", headers: { "Content-Type": "application/json", ...(confirm ? { "x-polymarket-live-confirm": "1" } : {}) }, method: "POST" }), []);
+  const refreshLivePositions = useCallback(async () => {
+    if (!liveSession?.connected || livePositionRefreshBusy.current) return;
+    livePositionRefreshBusy.current = true;
+    try {
+      const response = await liveRequest({ action: "positions" });
+      const payload = await response.json() as { ok?: boolean; error?: string; positions?: LivePositionSnapshot[] };
+      if (!response.ok || !payload.ok || !Array.isArray(payload.positions)) throw new Error(payload.error || "Live positions could not be refreshed.");
+      livePositionsRef.current = payload.positions.filter((position) => (position.size ?? 0) > 0);
+      livePositionRefreshedAt.current = Date.now();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Live positions could not be refreshed.";
+      appendLog("Live positions unavailable", detail, "warning");
+    } finally {
+      livePositionRefreshedAt.current = Date.now();
+      livePositionRefreshBusy.current = false;
+    }
+  }, [appendLog, liveRequest, liveSession?.connected]);
   const refreshLiveBalance = useCallback(async () => {
     if (!liveSession?.connected) return;
     try {
@@ -744,6 +809,64 @@ export default function Home() {
       if (disposed) return;
       if (liveBusy.current) { timer = window.setTimeout(() => void loop(), 900); return; }
       const now = Date.now();
+      if (liveRisk.earlyExitEnabled && now - livePositionRefreshedAt.current >= 5_000) {
+        if (!livePositionsRef.current.length) await refreshLivePositions();
+        else void refreshLivePositions();
+      }
+      if (liveRisk.earlyExitEnabled && livePositionsRef.current.length) {
+        const activePositionKeys = new Set<string>();
+        const exitCandidates: Array<{ position: LivePositionSnapshot; market: LiveMarket; side: PaperSide; tokenID: string; evaluation: ReturnType<typeof evaluateModelAwareExit> }> = [];
+        for (const position of livePositionsRef.current) {
+          const tokenID = position.tokenID ?? position.id;
+          const mapped = liveTokenMap.get(tokenID);
+          if (!mapped || position.size === null || position.averagePrice === null) continue;
+          activePositionKeys.add(tokenID);
+          const currentPrice = mapped.side === "UP" ? mapped.market.upBid : mapped.market.downBid;
+          const fairProbability = mapped.side === "UP" ? mapped.market.fairUp : mapped.market.fairUp === null ? null : 1 - mapped.market.fairUp;
+          if (currentPrice === null || fairProbability === null) {
+            liveExitObservations.current.delete(tokenID);
+            continue;
+          }
+          const evaluation = evaluateModelAwareExit({ policy: liveRisk, entryPrice: position.averagePrice, currentPrice, fairProbability, shares: position.size, feeRate: liveRisk.feeRate, remainingSeconds: mapped.market.remaining });
+          if (!evaluation.shouldExit) {
+            liveExitObservations.current.delete(tokenID);
+            continue;
+          }
+          const previous = liveExitObservations.current.get(tokenID);
+          const count = previous && now - previous.lastSeen <= 15_000 ? previous.count + 1 : 1;
+          liveExitObservations.current.set(tokenID, { count, lastSeen: now });
+          if (count >= liveRisk.earlyExitConfirmations) exitCandidates.push({ position, market: mapped.market, side: mapped.side, tokenID, evaluation });
+        }
+        for (const key of liveExitObservations.current.keys()) if (!activePositionKeys.has(key)) liveExitObservations.current.delete(key);
+        const exitCandidate = exitCandidates[0];
+        if (exitCandidate) {
+          liveBusy.current = true;
+          try {
+            const response = await liveRequest({ action: "exit", marketId: exitCandidate.market.id, tokenID: exitCandidate.tokenID, amount: exitCandidate.position.size, requestId: `exit:${exitCandidate.tokenID}:${Math.floor(now / 10_000)}`, confirmLive: true, config: liveRisk }, true);
+            const payload = await response.json() as { ok?: boolean; status?: string; reason?: string; error?: string; uncertain?: boolean; latencyMs?: number; balanceAfter?: number | null; sizing?: { shares?: number; netProfit?: number; modelGap?: number } };
+            const latencyMs = typeof payload.latencyMs === "number" ? payload.latencyMs : null;
+            const detail = payload.reason || payload.error || "No live exit submitted.";
+            setLiveStatus({ lastAction: payload.status === "EXECUTED" ? "EARLY EXIT EXECUTED" : payload.status || "EARLY EXIT PASSED", lastDetail: detail, lastError: payload.uncertain ? (payload.error || "Exit outcome is uncertain; reconcile the Account tab.") : response.ok ? "" : (payload.error || "Live exit request failed."), lastLatencyMs: latencyMs });
+            liveExitObservations.current.delete(exitCandidate.tokenID);
+            const balanceAfter = typeof payload.balanceAfter === "number" ? payload.balanceAfter : null;
+            if (balanceAfter !== null) setLiveSession((current) => current ? { ...current, balance: balanceAfter } : current);
+            if (payload.uncertain || response.status === 401 || response.status === 403) {
+              setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", payload.error || "Live exit authorization or submission state needs reconciliation.", "negative");
+            } else if (payload.status === "EXECUTED") {
+              appendLog(`${exitCandidate.market.asset} ${exitCandidate.market.duration} live early exit`, `${exitCandidate.side} · ${detail} · ${latencyMs ?? "—"} ms`, "positive");
+              livePositionRefreshedAt.current = 0;
+            }
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : "Live exit request failed.";
+            setLiveStatus({ lastAction: "EARLY EXIT ERROR", lastDetail: detail, lastError: detail, lastLatencyMs: null });
+            appendLog("Live early exit unavailable", detail, "negative");
+            liveExitObservations.current.delete(exitCandidate.tokenID);
+          }
+          liveBusy.current = false;
+          timer = window.setTimeout(() => void loop(), 1_100);
+          return;
+        }
+      }
       const next = liveCandidates.find((item) => now - (liveAttempted.current.get(item.market.id) ?? 0) >= 45000);
       if (!next) {
         const reason = liveCandidates.length ? "Candidates are cooling down after a recent attempt." : "No fresh LOCK candidate passes the configured live gates.";
@@ -780,7 +903,7 @@ export default function Home() {
     };
     void loop();
     return () => { disposed = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [killSwitch, liveCandidates, livePaused, liveRequest, liveRisk, liveRunning, liveSession?.connected, appendLog]);
+  }, [killSwitch, liveCandidates, livePaused, liveRequest, liveRisk, liveRunning, liveSession?.connected, liveTokenMap, refreshLivePositions, appendLog]);
 
   const statusForData = dataStatus === "error" || dataStatus === "loading" ? "WARN" : "READY"; const rangeLength = ({ "5M": 5, "15M": 15, "1H": 60, "6H": 360, "24H": 1440 } as Record<string, number | undefined>)[selectedRange] ?? equitySeries.length; const selectedTicks = selectedRange === "ALL" ? equitySeries : equitySeries.slice(-rangeLength);
   const paperLab = <PaperLabPanel paperTest={paperTestView} paperAccount={account} paperMarkets={liveMarketMap} clock={clock} engineRunning={engineRunning} paused={paused} startingBalanceInput={paperTestStartingBalanceInput} durationDaysInput={paperTestDurationDaysInput} ledgerRows={ledgerRows} metrics={ledgerMetrics} telegram={telegram} onStartingBalanceChange={setPaperTestStartingBalanceInput} onDurationDaysChange={setPaperTestDurationDaysInput} onStart={startPaperTest} onPause={togglePaperTestPause} onStop={stopPaperTest} onReset={resetPaperTest} onExport={exportDecisionLedger} onClearLedger={clearDecisionLedger} onTelegramConnect={connectTelegram} onTelegramDisconnect={disconnectTelegram} onTelegramTest={sendTelegramTest} onTelegramRefresh={() => void refreshTelegramStatus()} />;

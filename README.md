@@ -13,6 +13,7 @@ Polymarket Quant Engine is a paper-first terminal for active crypto Up/Down mark
 - Browser-local decision ledger for all active markets with UP/DOWN/PASS, outcomes, timestamps, sizing, and CSV export.
 - Timeframe paper tests with a chosen starting balance and duration, Telegram test/report delivery, and Sunday 9 PM Eastern browser-assisted scheduling.
 - Optional owner-authenticated Polymarket account reads and live execution gates in the hosted Site, with balance checks, risk limits, fractional Kelly sizing, duration filters, pause, and cancel-all controls.
+- Model-aware cashouts for paper positions and an opt-in live exit policy: the current executable bid must clear the model fair probability, minimum dollar/percentage profit, remaining-time, and repeated-confirmation checks before a sell is attempted. The server revalidates the position and market immediately before submitting a non-retried FAK sell.
 
 The model is heuristic and uncalibrated. Nothing in the interface guarantees a profit or a fill. Live orders use real funds and must be independently tested with paper data first.
 
@@ -80,6 +81,8 @@ Use `systemd`, `launchd`, or a login service to start that script after reboot. 
 ## Local environment
 
 Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by production live execution.
+
+Live linking retries transient Polymarket credential, balance, and open-order reads. If the upstream socket is reset, the request returns a readable error and no order is retried or assumed successful; reconcile the Account view before trying any uncertain execution again.
 
 For live execution on a trusted localhost machine, explicitly opt in to the loopback-only gate and provide a 32-byte session secret:
 
