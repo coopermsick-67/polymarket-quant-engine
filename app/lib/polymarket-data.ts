@@ -15,6 +15,23 @@ export type OrderBook = {
   hash: string | null;
 };
 
+export type MarketCandle = {
+  timestamp: number;
+  low: number;
+  high: number;
+  open: number;
+  close: number;
+  volume: number;
+};
+
+export type MarketPriceTick = { timestamp: number; price: number };
+
+export type CandleHistory = {
+  fiveMinute: MarketCandle[];
+  fifteenMinute: MarketCandle[];
+  updatedAt: number;
+};
+
 export type MarketDefinition = {
   id: string;
   conditionId: string | null;
@@ -25,6 +42,7 @@ export type MarketDefinition = {
   startTime: number | null;
   endTime: number;
   reference: number | null;
+  referenceSource: "POLYMARKET" | "COINBASE ESTIMATE" | "MISSING";
   upTokenId: string;
   downTokenId: string;
   sourceUrl: string;
@@ -32,6 +50,7 @@ export type MarketDefinition = {
 
 export type LiveMarket = MarketDefinition & {
   remaining: number;
+  countdownEndsAt: number;
   spot: number | null;
   upBook: OrderBook | null;
   downBook: OrderBook | null;
@@ -49,22 +68,30 @@ export type LiveMarket = MarketDefinition & {
   distance: number | null;
   regime: string;
   sourceTimestamp: number;
+  chart5m: MarketCandle[];
+  chart15m: MarketCandle[];
+  chartUpdatedAt: number | null;
+  spotHistory?: MarketPriceTick[];
 };
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
 const SPOT_API = "https://api.coinbase.com/v2/prices";
+const COINBASE_CANDLES_API = "https://api.exchange.coinbase.com/products";
 const CRYPTO_TAG_ID = "21";
 const GAMMA_PAGE_SIZE = 100;
-const GAMMA_MAX_PAGES = 8;
+const GAMMA_MAX_PAGES = 12;
 const GAMMA_LOOKAHEAD_MS = 2 * 60 * 60 * 1000;
-const DISCOVERY_CACHE_MS = 5_000;
+const DISCOVERY_CACHE_MS = 15_000;
 const POLYMARKET_TIME_CACHE_MS = 15_000;
 const PUBLIC_REQUEST_TIMEOUT_MS = 15_000;
 const CLOB_BATCH_SIZE = 500;
+const CANDLE_CACHE_MS = 60_000;
+const CANDLE_LOOKBACK_BARS = 100;
 
 let polymarketClockOffsetMs = 0;
 let polymarketClockSyncedAt = 0;
+const candleHistoryCache = new Map<Asset, CandleHistory>();
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
@@ -309,7 +336,8 @@ const normalizeMarket = (raw: Record<string, unknown>, now = Date.now()): Market
   if (!endTime || endTime <= now) return null;
   const duration = horizonFor(text, slug, raw, startTime, endTime);
   if (!duration) return null;
-  const alignedStartTime = startTime ?? endTime - (duration === "5m" ? 300_000 : 900_000);
+  const expectedStartTime = endTime - (duration === "5m" ? 300_000 : 900_000);
+  const alignedStartTime = startTime !== null && Math.abs(startTime - expectedStartTime) <= 15_000 ? startTime : expectedStartTime;
 
   const outcomes = outcomeLabelsFor(raw);
   const tokenIds = tokenIdsFor(raw);
@@ -326,6 +354,7 @@ const normalizeMarket = (raw: Record<string, unknown>, now = Date.now()): Market
 
   const id = normalizeText(raw.id || raw.conditionId || raw.condition_id || slug);
   if (!id) return null;
+  const reference = referenceFor(raw, text);
   return {
     id,
     conditionId: normalizeText(raw.conditionId || raw.condition_id) || null,
@@ -335,7 +364,8 @@ const normalizeMarket = (raw: Record<string, unknown>, now = Date.now()): Market
     duration,
     startTime: alignedStartTime,
     endTime,
-    reference: referenceFor(raw, text),
+    reference,
+    referenceSource: reference !== null ? "POLYMARKET" : "MISSING",
     upTokenId,
     downTokenId,
     sourceUrl: slug ? `https://polymarket.com/market/${slug}` : "https://polymarket.com",
@@ -391,7 +421,6 @@ const nextCursorFor = (payload: unknown): string | null => {
 const fetchCryptoMarketRows = async (signal?: AbortSignal): Promise<{ rows: Record<string, unknown>[]; now: number }> => {
   const rows: Record<string, unknown>[] = [];
   let afterCursor: string | null = null;
-  let emptyDefinitionPages = 0;
   const now = await fetchPolymarketNow(signal);
 
   for (let page = 0; page < GAMMA_MAX_PAGES; page += 1) {
@@ -411,17 +440,9 @@ const fetchCryptoMarketRows = async (signal?: AbortSignal): Promise<{ rows: Reco
     const payload = await fetchJson<unknown>(url.toString(), { signal });
     const pageRows = rawMarkets(payload);
     rows.push(...pageRows);
-    const pageHasShortMarket = pageRows.some((row) => horizonFor(
-      [normalizeText(row.question), normalizeText(row.slug), normalizeText(row.description)].join(" "),
-      normalizeText(row.slug),
-      row,
-      intervalStartFor(row, normalizeText(row.slug)),
-      intervalEndFor(row),
-    ) !== null);
-    emptyDefinitionPages = pageHasShortMarket ? 0 : emptyDefinitionPages + 1;
 
     const nextCursor = nextCursorFor(payload);
-    if (!nextCursor || nextCursor === afterCursor || pageRows.length === 0 || emptyDefinitionPages >= 3) break;
+    if (!nextCursor || nextCursor === afterCursor || pageRows.length === 0) break;
     afterCursor = nextCursor;
   }
 
@@ -535,10 +556,144 @@ export async function fetchSpotPrices(assets: Asset[], signal?: AbortSignal): Pr
   return new Map(results.filter((result): result is readonly [Asset, number] => Boolean(result)));
 }
 
+const candleProductsFor = (asset: Asset): string[] => {
+  const aliases: Record<string, string[]> = {
+    POL: ["POL", "MATIC"],
+  };
+  return aliases[asset] ?? [asset];
+};
+
+const fetchCoinbaseCandles = async (asset: Asset, granularity: 300 | 900, signal?: AbortSignal): Promise<MarketCandle[]> => {
+  const now = Math.floor(Date.now() / 1000);
+  const start = now - granularity * CANDLE_LOOKBACK_BARS;
+
+  for (const product of candleProductsFor(asset)) {
+    const url = new URL(`${COINBASE_CANDLES_API}/${encodeURIComponent(`${product}-USD`)}/candles`);
+    url.searchParams.set("granularity", String(granularity));
+    url.searchParams.set("start", new Date(start * 1000).toISOString());
+    url.searchParams.set("end", new Date(now * 1000).toISOString());
+    try {
+      const payload = await fetchJson<unknown>(url.toString(), { signal });
+      if (!Array.isArray(payload)) continue;
+      const candles = payload.flatMap((row): MarketCandle[] => {
+        if (!Array.isArray(row) || row.length < 5) return [];
+        const [timeValue, lowValue, highValue, openValue, closeValue, volumeValue] = row;
+        const timestampSeconds = finiteNumber(timeValue);
+        const low = finiteNumber(lowValue);
+        const high = finiteNumber(highValue);
+        const open = finiteNumber(openValue);
+        const close = finiteNumber(closeValue);
+        const volume = finiteNumber(volumeValue) ?? 0;
+        if (timestampSeconds === null || low === null || high === null || open === null || close === null) return [];
+        if (Math.min(low, high, open, close) <= 0 || high < low || volume < 0) return [];
+        return [{ timestamp: timestampSeconds * 1000, low, high, open, close, volume }];
+      });
+      return candles.sort((left, right) => left.timestamp - right.timestamp);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+  }
+  return [];
+};
+
+export async function fetchCandleHistories(assets: Asset[], signal?: AbortSignal): Promise<Map<Asset, CandleHistory>> {
+  const uniqueAssets = [...new Set(assets)].filter(Boolean);
+  const histories = new Map<Asset, CandleHistory>();
+  const now = Date.now();
+  const missing: Asset[] = [];
+
+  for (const asset of uniqueAssets) {
+    const cached = candleHistoryCache.get(asset);
+    if (cached && now - cached.updatedAt < CANDLE_CACHE_MS) histories.set(asset, cached);
+    else missing.push(asset);
+  }
+
+  for (let index = 0; index < missing.length; index += 4) {
+    const chunk = missing.slice(index, index + 4);
+    const fetched = await Promise.all(chunk.map(async (asset) => {
+      const [fiveMinute, fifteenMinute] = await Promise.all([
+        fetchCoinbaseCandles(asset, 300, signal),
+        fetchCoinbaseCandles(asset, 900, signal),
+      ]);
+      const history = { fiveMinute, fifteenMinute, updatedAt: Date.now() };
+      candleHistoryCache.set(asset, history);
+      return [asset, history] as const;
+    }));
+    for (const [asset, history] of fetched) histories.set(asset, history);
+  }
+
+  return histories;
+}
+
 const bestBid = (book: OrderBook | null): number | null => book?.bids.length ? Math.max(...book.bids.map((level) => level.price)) : null;
 const bestAsk = (book: OrderBook | null): number | null => book?.asks.length ? Math.min(...book.asks.map((level) => level.price)) : null;
 const depthNotional = (book: OrderBook | null): number => book?.asks.slice(0, 8).reduce((sum, level) => sum + level.price * level.size, 0) ?? 0;
 const topSize = (book: OrderBook | null): number => (book?.asks[0]?.size ?? 0) + (book?.bids[book.bids.length - 1]?.size ?? 0);
+
+const withUpdatedBooks = (market: LiveMarket, upBook: OrderBook | null, downBook: OrderBook | null, now: number): LiveMarket => {
+  const upBid = bestBid(upBook); const upAsk = bestAsk(upBook);
+  const downBid = bestBid(downBook); const downAsk = bestAsk(downBook);
+  const spreads = [upBid !== null && upAsk !== null ? upAsk - upBid : null, downBid !== null && downAsk !== null ? downAsk - downBid : null].filter((value): value is number => value !== null);
+  const upDepth = depthNotional(upBook); const downDepth = depthNotional(downBook); const total = upDepth + downDepth;
+  const spread = spreads.length ? Math.max(...spreads) : null;
+  return { ...market, upBook, downBook, upBid, upAsk, downBid, downAsk, spread, liquidity: total, imbalance: total > 0 ? (upDepth - downDepth) / total : null, edgeUp: market.fairUp !== null && upAsk !== null ? market.fairUp - upAsk : null, edgeDown: market.fairUp !== null && downAsk !== null ? 1 - market.fairUp - downAsk : null, sourceTimestamp: now };
+};
+
+export const replaceLiveMarketBook = (market: LiveMarket, tokenId: string, bids: BookLevel[], asks: BookLevel[], timestamp: number | null, hash: string | null, now = Date.now()): LiveMarket => {
+  const existing = tokenId === market.upTokenId ? market.upBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : tokenId === market.downTokenId ? market.downBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : null;
+  if (!existing) return market;
+  const book: OrderBook = { ...existing, bids: bids.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => right.price - left.price), asks: asks.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => left.price - right.price), timestamp, hash };
+  return tokenId === market.upTokenId ? withUpdatedBooks(market, book, market.downBook, now) : withUpdatedBooks(market, market.upBook, book, now);
+};
+
+export const updateLiveMarketBookLevel = (market: LiveMarket, tokenId: string, side: "BUY" | "SELL", price: number, size: number, now = Date.now()): LiveMarket => {
+  const existing = tokenId === market.upTokenId ? market.upBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : tokenId === market.downTokenId ? market.downBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : null;
+  if (!existing || price <= 0 || !Number.isFinite(price) || !Number.isFinite(size)) return market;
+  const sideKey = side === "BUY" ? "bids" : "asks";
+  const levels = existing[sideKey].filter((level) => level.price !== price);
+  if (size > 0) levels.push({ price, size });
+  const book = { ...existing, [sideKey]: levels.sort((left, right) => side === "BUY" ? right.price - left.price : left.price - right.price), timestamp: now };
+  return tokenId === market.upTokenId ? withUpdatedBooks(market, book, market.downBook, now) : withUpdatedBooks(market, market.upBook, book, now);
+};
+
+const normalCdf = (value: number): number => {
+  const absolute = Math.abs(value);
+  const t = 1 / (1 + 0.2316419 * absolute);
+  const density = 0.3989422804014327 * Math.exp(-0.5 * absolute * absolute);
+  const tail = density * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  return value >= 0 ? 1 - tail : tail;
+};
+
+const candleVolatility = (candles: MarketCandle[], durationSeconds: number, now: number): number | null => {
+  const completed = candles.filter((candle) => candle.timestamp + durationSeconds * 1000 <= now && candle.close > 0);
+  if (completed.length < 20) return null;
+  const recent = completed.slice(-21);
+  const returns = recent.slice(1).map((candle, index) => Math.log(candle.close / recent[index].close));
+  if (returns.length < 12) return null;
+  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (returns.length - 1);
+  const volatility = Math.sqrt(variance);
+  return Number.isFinite(volatility) && volatility > 0 ? volatility : null;
+};
+
+export const chartFairProbability = (
+  reference: number | null,
+  spot: number | null,
+  remainingSeconds: number,
+  duration: Horizon,
+  candles: MarketCandle[],
+  now: number,
+): number | null => {
+  if (reference === null || spot === null || reference <= 0 || spot <= 0) return null;
+  const barSeconds = duration === "5m" ? 300 : 900;
+  const volatility = candleVolatility(candles, barSeconds, now);
+  if (volatility === null) return null;
+  const remainingBars = Math.max(1 / 60, remainingSeconds / barSeconds);
+  const sigmaRemaining = volatility * Math.sqrt(remainingBars);
+  if (!Number.isFinite(sigmaRemaining) || sigmaRemaining <= 0) return null;
+  const zScore = Math.log(spot / reference) / sigmaRemaining;
+  return clamp(normalCdf(zScore), 0.01, 0.99);
+};
 
 export const estimateFairProbability = (reference: number | null, spot: number | null, remainingSeconds: number): number | null => {
   if (reference === null || spot === null || reference <= 0 || spot <= 0) return null;
@@ -553,12 +708,21 @@ export const buildLiveMarket = (
   spots: Map<Asset, number>,
   previousSpot: number | null,
   now = Date.now(),
+  candleHistory: CandleHistory | null = null,
 ): LiveMarket => {
   const upBook = books.get(definition.upTokenId) ?? null;
   const downBook = books.get(definition.downTokenId) ?? null;
   const spot = spots.get(definition.asset) ?? null;
   const remaining = Math.max(0, Math.ceil((definition.endTime - (now + polymarketClockOffsetMs)) / 1000));
-  const fairUp = estimateFairProbability(definition.reference, spot, remaining);
+  const chart5m = candleHistory?.fiveMinute ?? [];
+  const chart15m = candleHistory?.fifteenMinute ?? [];
+  const startCandle = definition.startTime === null ? null : chart5m
+    .filter((candle) => Math.abs(candle.timestamp - definition.startTime!) <= 60_000)
+    .sort((left, right) => Math.abs(left.timestamp - definition.startTime!) - Math.abs(right.timestamp - definition.startTime!))[0] ?? null;
+  const reference = definition.reference ?? startCandle?.open ?? null;
+  const referenceSource = definition.reference !== null ? definition.referenceSource : startCandle ? "COINBASE ESTIMATE" : "MISSING";
+  const targetCandles = definition.duration === "5m" ? chart5m : chart15m;
+  const fairUp = chartFairProbability(reference, spot, remaining, definition.duration, targetCandles, now);
   const upBid = bestBid(upBook);
   const upAsk = bestAsk(upBook);
   const downBid = bestBid(downBook);
@@ -571,12 +735,15 @@ export const buildLiveMarket = (
   const downDepth = depthNotional(downBook);
   const totalDepth = upDepth + downDepth;
   const imbalance = totalDepth > 0 ? (upDepth - downDepth) / totalDepth : null;
-  const distance = definition.reference !== null && spot !== null ? (spot - definition.reference) / definition.reference : null;
+  const distance = reference !== null && spot !== null ? (spot - reference) / reference : null;
   const momentum = previousSpot !== null && spot !== null && previousSpot > 0 ? Math.log(spot / previousSpot) : null;
-  const regime = definition.reference === null ? "REFERENCE MISSING" : distance === null ? "SPOT MISSING" : Math.abs(distance) < 0.0002 ? "NEUTRAL" : distance > 0 ? "UP MOMENTUM" : "DOWN MOMENTUM";
+  const regime = reference === null ? "REFERENCE MISSING" : distance === null ? "SPOT MISSING" : Math.abs(distance) < 0.0002 ? "NEUTRAL" : distance > 0 ? "UP MOMENTUM" : "DOWN MOMENTUM";
   return {
     ...definition,
     remaining,
+    countdownEndsAt: definition.endTime - polymarketClockOffsetMs,
+    reference,
+    referenceSource,
     spot,
     upBook,
     downBook,
@@ -594,7 +761,24 @@ export const buildLiveMarket = (
     distance,
     regime,
     sourceTimestamp: now,
+    chart5m,
+    chart15m,
+    chartUpdatedAt: candleHistory?.updatedAt ?? null,
   };
+};
+
+export const updateLiveCandles = (market: LiveMarket, spot: number, now = Date.now()): Pick<LiveMarket, "chart5m" | "chart15m"> => {
+  const update = (history: MarketCandle[], seconds: 300 | 900): MarketCandle[] => {
+    const start = Math.floor(now / (seconds * 1000)) * seconds * 1000;
+    const current = history[history.length - 1];
+    if (current?.timestamp === start) {
+      return [...history.slice(0, -1), { ...current, high: Math.max(current.high, spot), low: Math.min(current.low, spot), close: spot }];
+    }
+    if (current && current.timestamp > start) return history;
+    const open = current?.close ?? spot;
+    return [...history, { timestamp: start, low: Math.min(open, spot), high: Math.max(open, spot), open, close: spot, volume: 0 }].slice(-CANDLE_LOOKBACK_BARS);
+  };
+  return { chart5m: update(market.chart5m, 300), chart15m: update(market.chart15m, 900) };
 };
 
 export const orderBookFor = (market: LiveMarket, side: "UP" | "DOWN"): OrderBook | null => side === "UP" ? market.upBook : market.downBook;

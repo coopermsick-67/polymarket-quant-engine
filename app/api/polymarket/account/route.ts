@@ -1,4 +1,6 @@
 import { privateKeyToAccount } from "viem/accounts";
+import { getChatGPTUser } from "../../../chatgpt-auth";
+import { readLiveSession, type LiveSession } from "../../../lib/polymarket-session";
 
 const DATA_API = "https://data-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
@@ -252,7 +254,7 @@ export async function POST(request: Request) {
   const apiKey = text(input.apiKey);
   const secret = text(input.secret);
   const passphrase = text(input.passphrase);
-  const signatureType = text(input.signatureType) || "3";
+  let signatureType = text(input.signatureType) || "3";
 
   if (!validAddress(walletAddress)) return json({ ok: false, error: "Enter the Polymarket account wallet address (0x followed by 40 hex characters)." }, 400);
   const suppliedPrivateFields = [signerAddress, apiKey, secret, passphrase].filter(Boolean).length;
@@ -260,6 +262,13 @@ export async function POST(request: Request) {
   if (suppliedPrivateFields > 0 && (suppliedPrivateFields < 4 || !validAddress(signerAddress))) return json({ ok: false, error: "Provide signer address, API key, secret, and passphrase together, or leave all private fields blank." }, 400);
   if (privateKey && !validPrivateKey(privateKey)) return json({ ok: false, error: "Enter a 64-character hex signer private key, with or without the 0x prefix." }, 400);
   if (!/^[0-3]$/.test(signatureType)) return json({ ok: false, error: "Signature type must be 0, 1, 2, or 3." }, 400);
+
+  const viewer = !privateKey && suppliedPrivateFields === 0 ? await getChatGPTUser() : null;
+  const liveSession: LiveSession | null = viewer ? await readLiveSession(request, viewer.userId) : null;
+  if (liveSession && liveSession.walletAddress.toLowerCase() !== walletAddress.toLowerCase()) {
+    return json({ ok: false, error: "The requested wallet does not match the active live session. Disconnect and link the intended wallet." }, 409);
+  }
+  if (liveSession) signatureType = String(liveSession.signatureType);
 
   const publicWarnings: string[] = [];
   const [valueResult, positionsResult, activityResult, pnlResult, statsResult] = await Promise.allSettled([
@@ -293,6 +302,8 @@ export async function POST(request: Request) {
     }
   } else if (suppliedPrivateFields === 4) {
     credentials = { signerAddress, apiKey, secret, passphrase };
+  } else if (liveSession) {
+    credentials = { signerAddress: liveSession.signerAddress, apiKey: liveSession.apiKey, secret: liveSession.secret, passphrase: liveSession.passphrase };
   }
   const authenticated = credentials !== null;
   let cashBalance: number | null = null;

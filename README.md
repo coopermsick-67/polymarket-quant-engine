@@ -1,46 +1,88 @@
 # Polymarket Quant Engine
 
-Polymarket Quant Engine is a dark, paper-first trading terminal for short-duration crypto Up/Down markets. It puts market discovery, probability signals, cost-aware edge, paper positions, P&L, audit events, risk settings, and an emergency stop in one working surface.
+Polymarket Quant Engine is a paper-first terminal for active crypto Up/Down markets. It discovers 5m and 15m markets, shows public books and Coinbase chart context, produces UP/DOWN/PASS decisions, records a complete market ledger, and keeps the Paper Trader and Paper Lab on one shared account.
 
-## What is included
+## Included
 
-- Public Gamma discovery for active crypto 5m/15m markets, public CLOB order books, and public Coinbase spot prices.
-- No synthetic market, quote, position, P&L, or equity fallback: missing data renders as unavailable and blocks the related action.
-- Paper start/pause, manual paper buys, public-ask book walking, cash checks, minimum-order checks, close-positions, and an emergency kill switch.
-- Cost-aware heuristic signal panel with transparent reference/spot inputs, order-book depth, spread, edge, and no-trade guards.
-- Editable minimum edge, max trade, fee, slippage, and daily-loss guardrails.
-- Equity curve, open positions, paper P&L, fees, drawdown, win rate, and browser-local audit events.
-- A backtest lab that accepts a user CSV or public ticks recorded by the app, with settled/unsettled separation and no fabricated results.
-- A deliberate live-mode gate that keeps live activation blocked until a server-side credential, balance, stream, risk, and reconciliation adapter is installed.
+- Public Gamma discovery for active crypto 5m/15m markets, public CLOB order books, and public Coinbase spot/candle data.
+- Every discovered market remains visible, including PASS decisions caused by missing data, weak edge, stale candles, or wide spreads.
+- One-second countdowns plus Coinbase and Polymarket market WebSocket updates with REST recovery refreshes.
+- Transparent chart signal fields: model P(UP), UP/DOWN asks, net edge, 5m/15m trends, confidence, liquidity, and reason.
+- One shared paper account for manual Paper Trader entries, automatic entries, timeframe tests, balance, open positions, closed positions, realized P&L, and resolution payouts.
+- Resolution-aware paper settlement: winning shares pay $1, losing shares pay $0 when an expired market outcome is available; realized cash flows into the same balance used by newly opened markets.
+- Browser-local decision ledger for all active markets with UP/DOWN/PASS, outcomes, timestamps, sizing, and CSV export.
+- Timeframe paper tests with a chosen starting balance and duration, Telegram test/report delivery, and Sunday 9 PM Eastern browser-assisted scheduling.
+- Optional owner-authenticated Polymarket account reads and live execution gates in the hosted Site, with balance checks, risk limits, fractional Kelly sizing, duration filters, pause, and cancel-all controls.
 
-The browser never receives a wallet private key or CLOB secret. The current published build is paper mode; it does not submit live orders or claim profitable performance.
+The model is heuristic and uncalibrated. Nothing in the interface guarantees a profit or a fill. Live orders use real funds and must be independently tested with paper data first.
+
+## Clone this repository
+
+```bash
+git clone https://github.com/coopermsick-67/polymarket-quant-engine.git
+cd polymarket-quant-engine
+```
+
+The repository is private. Your GitHub account must have access to clone it.
 
 ## Run locally
 
-    pnpm install
-    pnpm run dev
+Requirements: Node.js 22.13+ and pnpm 11.25.0.
 
-For a production-style build:
+```bash
+corepack enable
+corepack prepare pnpm@11.25.0 --activate
+pnpm install
+pnpm run dev
+```
 
-    pnpm run build
-    pnpm run start
+Open the local URL printed by the terminal. For a production-style local worker:
 
-The managed Sites preview uses sites-preview start and http://terminal.local:4173/.
+```bash
+pnpm run build
+pnpm run start -- --port 8787
+```
 
-## Live integration boundary
+Then open `http://127.0.0.1:8787`.
 
-The official Polymarket docs currently describe Gamma for public market metadata, CLOB for books and orders, Data API for positions/activity, Relayer for wallet transactions, and separate public market and authenticated user WebSocket channels. CLOB authentication uses wallet-signed L1 setup plus API-credential L2 request signing.
+## Keep it running on an old Windows computer
 
-Before enabling live trading, implement a server-side adapter that:
+Run these once from the project root:
 
-1. Discovers and validates markets from official metadata.
-2. Maintains public books and reference-price streams.
-3. Uses the official SDK or exact current API signing flow.
-4. Reconciles orders, fills, positions, balances, and P&L on restart.
-5. Fails closed on stale data, uncertain order state, missing credentials, or risk-halt conditions.
+```powershell
+corepack enable
+corepack prepare pnpm@11.25.0 --activate
+pnpm install
+pnpm run build
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_forever.ps1
+```
 
-See SETUP.md, ARCHITECTURE.md, STRATEGY.md, RISK.md, and API.md.
+The supervisor restarts the local server if it exits. Open `http://127.0.0.1:8787` in Chrome and keep that tab open and awake. The browser tab performs public market scanning, paper fills, market-resolution settlement, ledger persistence, and the Telegram weekly check; running only the server is not a background trading process.
 
-## Safety
+To start it after every Windows logon, create a Task Scheduler task that runs:
 
-This application is a research and paper-execution surface, not a promise of returns. A positive displayed edge is not evidence of a profitable strategy. Do not fund live trading until out-of-sample calibration, fill simulation, fees, slippage, reconciliation, and risk limits have been independently verified.
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\to\polymarket-quant-engine\scripts\run_forever.ps1
+```
+
+Keep the computer plugged in, disable sleep while connected to power, and configure Chrome to reopen the local tab after reboot. Never put a wallet private key, Telegram bot token, or API secret in GitHub or a committed `.env` file.
+
+## Linux/macOS supervisor
+
+```bash
+pnpm install
+pnpm run build
+bash scripts/run_forever.sh
+```
+
+Use `systemd`, `launchd`, or a login service to start that script after reboot. The browser tab requirement still applies for the client-side market loop.
+
+## Local environment
+
+Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by the live account routes; a plain local clone is intended for paper mode unless you add and audit a separate local authentication boundary.
+
+## Safety and live integration boundary
+
+The official Polymarket APIs separate Gamma market metadata, CLOB books/orders, the Data API for positions/activity, Relayer wallet transactions, and public/authenticated WebSocket channels. Before enabling live trading, independently verify market selection, wallet/account type, L1/L2 signing, balance reconciliation, order/fill reconciliation after restart, stale-data halts, fees, slippage, and exposure limits.
+
+See `SETUP.md`, `ARCHITECTURE.md`, `STRATEGY.md`, `RISK.md`, and `API.md` for project details.

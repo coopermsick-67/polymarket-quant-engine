@@ -6,6 +6,7 @@ import {
   sideFairProbability,
   type Horizon,
   type LiveMarket,
+  type MarketCandle,
 } from "./polymarket-data";
 
 export type PaperSide = "UP" | "DOWN";
@@ -83,6 +84,27 @@ export type FillResult = {
   fee: number;
   totalCost: number;
   levels: number;
+};
+
+export type MarketSignal = {
+  action: PaperSide | "PASS";
+  tier: "LOCK" | "ENTRY" | "PASS";
+  bias: PaperSide | "NEUTRAL" | "WARMING UP";
+  biasConfidence: number | null;
+  confidence: number | null;
+  fairUp: number | null;
+  upEdge: number | null;
+  downEdge: number | null;
+  entryPrice: number | null;
+  edge: number | null;
+  trend5m: "UP" | "DOWN" | "MIXED" | "UNAVAILABLE";
+  trend15m: "UP" | "DOWN" | "MIXED" | "UNAVAILABLE";
+  score5m: number | null;
+  score15m: number | null;
+  rsi5m: number | null;
+  rsi15m: number | null;
+  reason: string;
+  estimatedFill: FillResult | null;
 };
 
 export type TradeResult = {
@@ -361,6 +383,79 @@ export const closePaperPositions = (
   };
 };
 
+export const settleResolvedPaperPositions = (
+  account: PaperAccount,
+  markets: Map<string, LiveMarket>,
+  reason: string,
+  timestamp = Date.now(),
+): { account: PaperAccount; closed: number; skipped: number; realized: number } => {
+  let cash = account.cash;
+  let realizedPnl = account.realizedPnl;
+  const remaining: PaperPosition[] = [];
+  const sells: PaperFill[] = [];
+  const closedTrades: ClosedPaperTrade[] = [];
+  let closed = 0;
+  let skipped = 0;
+  for (const position of account.positions) {
+    const market = markets.get(position.marketId);
+    const isExpired = market ? market.endTime <= timestamp : position.endTime <= timestamp;
+    const outcome = market && market.reference !== null && market.spot !== null && isExpired ? market.spot >= market.reference ? "UP" : "DOWN" : null;
+    if (!isExpired || !outcome) {
+      remaining.push(position);
+      if (isExpired) skipped += 1;
+      continue;
+    }
+    const exit = position.side === outcome ? 1 : 0;
+    const proceeds = position.shares * exit;
+    const pnl = proceeds - position.totalCost;
+    cash += proceeds;
+    realizedPnl += pnl;
+    closed += 1;
+    sells.push({
+      id: `${timestamp}-${position.marketId}-${position.side}-resolve`,
+      timestamp,
+      action: "SELL",
+      marketId: position.marketId,
+      marketLabel: position.marketLabel,
+      asset: position.asset,
+      duration: position.duration,
+      side: position.side,
+      shares: position.shares,
+      price: exit,
+      notional: proceeds,
+      fee: 0,
+      reason: `${reason} · ${outcome} resolved`,
+    });
+    closedTrades.push({
+      id: `${timestamp}-${position.marketId}-${position.side}-resolved`,
+      timestamp,
+      marketId: position.marketId,
+      marketLabel: position.marketLabel,
+      asset: position.asset,
+      duration: position.duration,
+      side: position.side,
+      shares: position.shares,
+      entry: position.avgEntry,
+      exit,
+      pnl,
+      reason: `${reason} · ${outcome} resolved`,
+    });
+  }
+  return {
+    account: {
+      ...account,
+      cash: round(cash),
+      realizedPnl: round(realizedPnl),
+      positions: remaining,
+      fills: [...sells, ...account.fills].slice(0, 2000),
+      closedTrades: [...closedTrades, ...account.closedTrades].slice(0, 2000),
+    },
+    closed,
+    skipped,
+    realized: round(realizedPnl - account.realizedPnl),
+  };
+};
+
 export const closeExpiringPaperPositions = (
   account: PaperAccount,
   markets: Map<string, LiveMarket>,
@@ -370,7 +465,7 @@ export const closeExpiringPaperPositions = (
 ): { account: PaperAccount; closed: number; skipped: number; realized: number } => {
   const expiring = new Set(account.positions.filter((position) => {
     const market = markets.get(position.marketId);
-    return market ? market.remaining <= 15 : position.endTime <= timestamp;
+    return market ? market.remaining <= 15 || market.endTime <= timestamp : position.endTime <= timestamp;
   }).map((position) => position.id));
   return expiring.size ? closePaperPositions(account, markets, costs, reason, timestamp, expiring) : { account, closed: 0, skipped: 0, realized: 0 };
 };
@@ -385,9 +480,243 @@ export const candidateFor = (market: LiveMarket, side: PaperSide, costs: CostCon
   return { side, fair, ask: fill.price, edge, estimatedFill: fill };
 };
 
-export const bestCandidateFor = (market: LiveMarket, costs: CostConfig, budget = 25) => {
-  const candidates = [candidateFor(market, "UP", costs, budget), candidateFor(market, "DOWN", costs, budget)].filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate));
-  return candidates.sort((left, right) => right.edge - left.edge)[0] ?? null;
+type ChartTrendStats = { score: number; rsi: number; volatility: number };
+
+const mean = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+const clampScore = (value: number) => Math.min(1, Math.max(-1, value));
+const tanh = (value: number) => {
+  const bounded = Math.max(-10, Math.min(10, value));
+  const exponential = Math.exp(2 * bounded);
+  return (exponential - 1) / (exponential + 1);
+};
+
+const ema = (values: number[], period: number) => {
+  if (!values.length) return null;
+  const alpha = 2 / (period + 1);
+  return values.slice(1).reduce((previous, value) => alpha * value + (1 - alpha) * previous, values[0]);
+};
+
+const rsi = (closes: number[], period = 14) => {
+  if (closes.length < period + 1) return null;
+  const recent = closes.slice(-period - 1);
+  const changes = recent.slice(1).map((close, index) => close - recent[index]);
+  const gains = changes.map((change) => Math.max(0, change));
+  const losses = changes.map((change) => Math.max(0, -change));
+  const averageGain = mean(gains);
+  const averageLoss = mean(losses);
+  if (averageLoss === 0) return averageGain === 0 ? 50 : 100;
+  return 100 - 100 / (1 + averageGain / averageLoss);
+};
+
+const standardDeviation = (values: number[]) => {
+  if (values.length < 2) return null;
+  const center = mean(values);
+  return Math.sqrt(values.reduce((sum, value) => sum + (value - center) ** 2, 0) / (values.length - 1));
+};
+
+const chartTrendStats = (history: MarketCandle[], barSeconds: number, now: number): ChartTrendStats | null => {
+  const candles = history.filter((candle) => candle.timestamp + barSeconds * 1000 <= now && candle.close > 0 && candle.high >= candle.low).slice(-80);
+  if (candles.length < 8) return null;
+  const closes = candles.map((candle) => candle.close);
+  const changes = closes.slice(1).map((close, index) => Math.log(close / closes[index]));
+  const volatility = standardDeviation(changes.slice(-24));
+  const rsiValue = rsi(closes, Math.min(14, closes.length - 1));
+  if (volatility === null || volatility <= 0 || rsiValue === null) return null;
+
+  const shortEma = ema(closes.slice(-8), 5);
+  const longEma = ema(closes.slice(-24), 18);
+  const atrCandles = candles.slice(-14);
+  const averageTrueRange = mean(atrCandles.map((candle, index) => {
+    const previousClose = atrCandles[index - 1]?.close ?? candle.close;
+    return Math.max(candle.high - candle.low, Math.abs(candle.high - previousClose), Math.abs(candle.low - previousClose));
+  }));
+  const emaScore = shortEma !== null && longEma !== null && averageTrueRange > 0 ? tanh(((shortEma - longEma) / averageTrueRange) * 1.4) : 0;
+  const recentReturn = Math.log(closes[closes.length - 1] / closes[closes.length - 4]);
+  const momentumScore = tanh(recentReturn / (volatility * Math.sqrt(3) * 1.35));
+  const rsiScore = clampScore((rsiValue - 50) / 23);
+  const recentCandles = candles.slice(-3);
+  const bodyScore = mean(recentCandles.map((candle) => {
+    const range = Math.max(candle.high - candle.low, candle.close * 0.000001);
+    return clampScore((candle.close - candle.open) / range);
+  }));
+  const previousVolume = mean(candles.slice(-15, -5).map((candle) => candle.volume));
+  const recentVolume = mean(recentCandles.map((candle) => candle.volume));
+  const volumeAgreement = previousVolume > 0 && recentVolume > previousVolume * 1.05
+    ? Math.sign(recentReturn) * Math.min(1, Math.log(recentVolume / previousVolume) / Math.log(2))
+    : 0;
+  const score = clampScore(emaScore * 0.34 + momentumScore * 0.32 + rsiScore * 0.16 + bodyScore * 0.1 + volumeAgreement * 0.08);
+  return { score, rsi: rsiValue, volatility };
+};
+
+const trendLabel = (score: number | null): MarketSignal["trend5m"] => score === null
+  ? "UNAVAILABLE"
+  : score >= 0.16 ? "UP" : score <= -0.16 ? "DOWN" : "MIXED";
+
+type DirectionalRead = { bias: MarketSignal["bias"]; confidence: number | null; ageSeconds: number | null };
+
+const liveMicroScore = (history: { timestamp: number; price: number }[] | undefined, start: number, now: number, early: boolean): number | null => {
+  const from = early ? start - 1500 : now - 30_000;
+  const points = (history ?? []).filter((point) => point.timestamp >= from && point.timestamp <= now && point.price > 0).slice(-60);
+  if (points.length < 5 || now - points[points.length - 1].timestamp > 5000 || points[points.length - 1].timestamp - points[0].timestamp < 4000) return null;
+  const changes = points.slice(1).map((point, index) => Math.log(point.price / points[index].price));
+  const volatility = standardDeviation(changes);
+  const netReturn = Math.log(points[points.length - 1].price / points[0].price);
+  if (volatility === null || volatility <= 0 || netReturn === 0) return 0;
+  const path = changes.reduce((sum, change) => sum + Math.abs(change), 0);
+  const efficiency = path > 0 ? Math.abs(netReturn) / path : 0;
+  const activeFraction = changes.filter((change) => Math.abs(change) > Math.max(1e-8, volatility * 0.05)).length / changes.length;
+  const zScore = netReturn / (volatility * Math.sqrt(changes.length));
+  return clampScore(tanh(zScore / 2) * Math.sqrt(efficiency * activeFraction));
+};
+
+const directionalRead = (market: LiveMarket, stats5m: ChartTrendStats | null, stats15m: ChartTrendStats | null, now: number): DirectionalRead => {
+  const marketStart = market.startTime ?? market.endTime - (market.duration === "5m" ? 300_000 : 900_000);
+  const ageSeconds = Math.max(0, (now - marketStart) / 1000);
+  const early = ageSeconds <= 90;
+  const micro = liveMicroScore(market.spotHistory, marketStart, now, early);
+  const target = market.duration === "5m" ? stats5m?.score : stats15m?.score;
+  const context = market.duration === "5m" ? stats15m?.score : stats5m?.score;
+  const chartScore = target !== undefined && target !== null && context !== undefined && context !== null
+    ? target * 0.62 + context * 0.38
+    : target !== undefined && target !== null ? target * 0.75
+      : context !== undefined && context !== null ? context * 0.5 : null;
+  const referenceScore = market.fairUp !== null
+    ? clampScore((market.fairUp - 0.5) * 3)
+    : market.distance !== null ? tanh(market.distance / 0.0008) : null;
+
+  let weightedScore = 0;
+  let totalWeight = 0;
+  let sourceCount = 0;
+  const add = (score: number | null, weight: number) => {
+    if (score === null) return;
+    weightedScore += score * weight;
+    totalWeight += weight;
+    sourceCount += 1;
+  };
+  if (early && micro !== null) {
+    add(micro, 0.58);
+    add(chartScore, 0.28);
+    add(referenceScore, 0.14);
+  } else {
+    add(chartScore, 0.58);
+    add(referenceScore, 0.27);
+    add(micro, 0.15);
+  }
+  if (!totalWeight) return { bias: "WARMING UP", confidence: null, ageSeconds };
+  const score = clampScore(weightedScore / totalWeight);
+  const bias: MarketSignal["bias"] = score >= 0.08 ? "UP" : score <= -0.08 ? "DOWN" : "NEUTRAL";
+  const confidence = Math.min(0.84, 0.5 + Math.abs(score) * 0.32 + Math.min(0.04, Math.max(0, sourceCount - 1) * 0.02));
+  return { bias, confidence, ageSeconds };
+};
+
+const passSignal = (reason: string, stats5m: ChartTrendStats | null = null, stats15m: ChartTrendStats | null = null, fairUp: number | null = null, read: DirectionalRead = { bias: "WARMING UP", confidence: null, ageSeconds: null }, upEdge: number | null = null, downEdge: number | null = null): MarketSignal => ({
+  action: "PASS",
+  tier: "PASS",
+  bias: read.bias,
+  biasConfidence: read.confidence,
+  confidence: null,
+  fairUp,
+  upEdge,
+  downEdge,
+  entryPrice: null,
+  edge: null,
+  trend5m: trendLabel(stats5m?.score ?? null),
+  trend15m: trendLabel(stats15m?.score ?? null),
+  score5m: stats5m?.score ?? null,
+  score15m: stats15m?.score ?? null,
+  rsi5m: stats5m?.rsi ?? null,
+  rsi15m: stats15m?.rsi ?? null,
+  reason,
+  estimatedFill: null,
+});
+
+export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budget = 25, minNetEdge = 0.04): MarketSignal => {
+  const now = market.sourceTimestamp || Date.now();
+  const stats5m = chartTrendStats(market.chart5m, 300, now);
+  const stats15m = chartTrendStats(market.chart15m, 900, now);
+  const read = directionalRead(market, stats5m, stats15m, now);
+  const comparePrices = (fairUp: number | null) => {
+    if (fairUp === null) return { upEdge: null, downEdge: null };
+    const upFill = walkAsks(market, "UP", budget, costs);
+    const downFill = walkAsks(market, "DOWN", budget, costs);
+    return {
+      upEdge: upFill ? fairUp - upFill.totalCost / upFill.shares : null,
+      downEdge: downFill ? 1 - fairUp - downFill.totalCost / downFill.shares : null,
+    };
+  };
+  const pass = (reason: string, fairUp = market.fairUp) => {
+    const comparison = comparePrices(fairUp);
+    return passSignal(reason, stats5m, stats15m, fairUp, read, comparison.upEdge, comparison.downEdge);
+  };
+  if (market.reference === null || market.reference <= 0 || market.spot === null || market.spot <= 0) return pass("Missing live spot or market reference.");
+  if (market.chartUpdatedAt === null || now - market.chartUpdatedAt > 120_000) return pass("Chart feed is stale; waiting for a fresh candle snapshot.");
+
+  if (!stats5m || !stats15m) {
+    const reason = !market.chart5m.length && !market.chart15m.length
+      ? `Coinbase OHLC history is unavailable for ${market.asset}.`
+      : "Need at least 8 complete candles on both 5m and 15m charts.";
+    return pass(reason);
+  }
+  if (market.remaining < (market.duration === "5m" ? 30 : 60)) return pass("Too little time remains for a fresh entry.");
+  if (market.fairUp === null) return pass("Candle volatility is unavailable, so probability is not estimated.");
+  if (market.referenceSource === "COINBASE ESTIMATE" && Math.abs(market.distance ?? 0) < 0.0005) return pass("Estimated Coinbase opening price is too close to spot; waiting for a clearer move or the market reference.");
+
+  const target = market.duration === "5m" ? stats5m.score : stats15m.score;
+  const context = market.duration === "5m" ? stats15m.score : stats5m.score;
+  const chartAgreement = Math.sign(target) !== 0 && Math.sign(target) === Math.sign(context) && Math.abs(target) >= 0.2 && Math.abs(context) >= 0.14;
+  if (!chartAgreement) return pass("5m and 15m chart trends do not confirm the same direction.");
+  if (Math.sign(market.fairUp - 0.5) !== Math.sign(target)) return pass("Spot versus the market reference conflicts with the candle trend.");
+
+  const combinedScore = clampScore(target * 0.62 + context * 0.38);
+  const fairUp = Math.min(0.99, Math.max(0.01, market.fairUp + combinedScore * 0.075));
+  const upFill = walkAsks(market, "UP", budget, costs);
+  const downFill = walkAsks(market, "DOWN", budget, costs);
+  const candidates = [
+    upFill ? { side: "UP" as const, fill: upFill, edge: fairUp - upFill.totalCost / upFill.shares } : null,
+    downFill ? { side: "DOWN" as const, fill: downFill, edge: 1 - fairUp - downFill.totalCost / downFill.shares } : null,
+  ].filter((candidate): candidate is { side: PaperSide; fill: FillResult; edge: number } => candidate !== null).sort((left, right) => right.edge - left.edge);
+  const best = candidates[0];
+  const priceComparison = comparePrices(fairUp);
+  if (!best) return { ...pass("Neither UP nor DOWN has executable ask depth for the configured paper size.", fairUp), upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge };
+  const side = best.side;
+  const fill = best.fill;
+  const edge = best.edge;
+  const sideSpread = side === "UP" && market.upAsk !== null && market.upBid !== null ? market.upAsk - market.upBid : side === "DOWN" && market.downAsk !== null && market.downBid !== null ? market.downAsk - market.downBid : market.spread;
+  if (sideSpread === null || sideSpread > 0.12) return { ...pass(`Best value is ${side}, but that side's spread is too wide for a reliable entry.`, fairUp), upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge };
+
+  const confidence = Math.min(0.96, 0.54 + Math.abs(combinedScore) * 0.2 + Math.abs(fairUp - 0.5) * 0.72 + (chartAgreement ? 0.06 : 0) - (market.referenceSource === "COINBASE ESTIMATE" ? 0.04 : 0));
+  const requiredEdge = Math.max(0.04, minNetEdge) + (market.referenceSource === "COINBASE ESTIMATE" ? 0.02 : 0);
+  if (confidence < 0.66) return { ...pass("Chart agreement is present, but model confidence is below the entry threshold.", fairUp), confidence, upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill };
+  if (edge < requiredEdge) return { ...pass(`Best price edge is ${Math.round(edge * 1000) / 10}% on ${side}, below the ${Math.round(requiredEdge * 1000) / 10}% entry floor.`, fairUp), confidence, upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill };
+
+  const locked = market.referenceSource === "POLYMARKET" && confidence >= 0.82 && edge >= Math.max(0.08, requiredEdge * 2) && Math.abs(target) >= 0.5 && Math.abs(context) >= 0.25;
+  return {
+    action: side,
+    tier: locked ? "LOCK" : "ENTRY",
+    bias: read.bias,
+    biasConfidence: read.confidence,
+    confidence,
+    fairUp,
+    upEdge: priceComparison.upEdge,
+    downEdge: priceComparison.downEdge,
+    entryPrice: fill.price,
+    edge,
+    trend5m: trendLabel(stats5m.score),
+    trend15m: trendLabel(stats15m.score),
+    score5m: stats5m.score,
+    score15m: stats15m.score,
+    rsi5m: stats5m.rsi,
+    rsi15m: stats15m.rsi,
+    reason: locked ? "5m and 15m trends align; confidence, order-book depth, and net-edge gates pass." : market.referenceSource === "COINBASE ESTIMATE" ? "5m and 15m trends align; entry gates include extra protection for an estimated opening price." : "5m and 15m trends align and the cost-adjusted entry gates pass.",
+    estimatedFill: fill,
+  };
+};
+
+export const bestCandidateFor = (market: LiveMarket, costs: CostConfig, budget = 25, minNetEdge = 0.04) => {
+  const signal = analyzeMarketSignal(market, costs, budget, minNetEdge);
+  if (signal.action === "PASS" || signal.entryPrice === null || signal.edge === null || signal.fairUp === null || !signal.estimatedFill) return null;
+  const fair = signal.action === "UP" ? signal.fairUp : 1 - signal.fairUp;
+  return { side: signal.action, fair, ask: signal.entryPrice, edge: signal.edge, estimatedFill: signal.estimatedFill };
 };
 
 export const runBacktest = (
