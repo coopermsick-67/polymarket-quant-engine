@@ -2,6 +2,21 @@ import { env } from "cloudflare:workers";
 
 export const LIVE_SESSION_COOKIE = "pm_live_session_v1";
 export const LIVE_SESSION_TTL_SECONDS = 15 * 60;
+export const LOCAL_LIVE_USER_ID = "local-owner";
+
+const truthy = (value: string | undefined) => ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
+
+/** Local live mode is an explicit opt-in for a trusted development machine. */
+export const localLiveEnabled = () => truthy(env.POLYMARKET_LIVE_ALLOW_LOCALHOST);
+
+export const isLoopbackRequest = (request: Request) => {
+  try {
+    const hostname = new URL(request.url).hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  } catch {
+    return false;
+  }
+};
 
 export type LiveSession = {
   userId: string;
@@ -72,5 +87,5 @@ export const readLiveSession = async (request: Request, userId: string): Promise
   }
 };
 
-export const liveSessionCookie = (token: string, maxAge = LIVE_SESSION_TTL_SECONDS) => `${LIVE_SESSION_COOKIE}=${token}; Path=/api/polymarket; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
-export const clearLiveSessionCookie = () => liveSessionCookie("", 0);
+export const liveSessionCookie = (token: string, maxAge = LIVE_SESSION_TTL_SECONDS, secure = true) => `${LIVE_SESSION_COOKIE}=${token}; Path=/api/polymarket; Max-Age=${maxAge}; HttpOnly${secure ? "; Secure" : ""}; SameSite=Lax`;
+export const clearLiveSessionCookie = (secure = true) => liveSessionCookie("", 0, secure);

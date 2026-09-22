@@ -16,6 +16,9 @@ import {
   clearLiveSessionCookie,
   liveSessionCookie,
   LIVE_SESSION_TTL_SECONDS,
+  isLoopbackRequest,
+  LOCAL_LIVE_USER_ID,
+  localLiveEnabled,
   readLiveSession,
   sealLiveSession,
   type LiveSession,
@@ -81,9 +84,17 @@ const cleanBalance = async (client: ClobClient) => {
   return balanceNumber(payload.balance);
 };
 
-const ensureLiveUser = async () => {
+const ensureLiveUser = async (request: Request) => {
+  if (isLoopbackRequest(request) && localLiveEnabled()) {
+    return { response: null, user: { userId: LOCAL_LIVE_USER_ID, displayName: "Local owner", email: "localhost", fullName: null } };
+  }
   const user = await getChatGPTUser();
-  if (!user) return { response: json({ ok: false, error: "Sign in with ChatGPT before arming live execution." }, 401), user: null };
+  if (!user) {
+    const error = isLoopbackRequest(request)
+      ? "Local live execution is disabled. Set POLYMARKET_LIVE_ALLOW_LOCALHOST=true in .env.local and restart the server."
+      : "Sign in with ChatGPT before arming live execution.";
+    return { response: json({ ok: false, error }, 401), user: null };
+  }
   const ownerId = SESSION_OWNER();
   if (!ownerId) return { response: json({ ok: false, error: "Live execution is not armed for this deployment." }, 503), user: null };
   if (user.userId !== ownerId) return { response: json({ ok: false, error: "This live executor is restricted to its owner account." }, 403), user: null };
@@ -155,30 +166,31 @@ const publicLiveSession = (session: LiveSession, balance: number | null, openOrd
 const pass = (reason: string, extra: JsonRecord = {}) => ({ ok: true, status: "PASS", reason, ...extra });
 
 export async function POST(request: Request) {
-  const gate = await ensureLiveUser();
+  const gate = await ensureLiveUser(request);
   if (gate.response || !gate.user) return gate.response ?? json({ ok: false, error: "Live authorization failed." }, 401);
+  const secureCookie = !isLoopbackRequest(request);
   let input: LiveRequest;
   try { input = await request.json() as LiveRequest; } catch { return json({ ok: false, error: "Invalid JSON request." }, 400); }
 
   const action = text(input.action) as LiveAction;
   if (!["connect", "balance", "execute", "cancel-all", "disconnect"].includes(action)) return json({ ok: false, error: "Unsupported live action." }, 400);
-  if (action === "disconnect") return json({ ok: true, status: "DISCONNECTED" }, 200, { "Set-Cookie": clearLiveSessionCookie() });
+  if (action === "disconnect") return json({ ok: true, status: "DISCONNECTED" }, 200, { "Set-Cookie": clearLiveSessionCookie(secureCookie) });
 
   if (action === "connect") {
     try {
       const connected = await sessionFromConnection(input, gate.user.userId);
       const token = await sealLiveSession(connected.session);
       if (!token) return json({ ok: false, error: "Secure live session storage is not configured." }, 503);
-      return json({ ok: true, status: "CONNECTED", live: publicLiveSession(connected.session, connected.balance, connected.openOrders) }, 200, { "Set-Cookie": liveSessionCookie(token) });
+      return json({ ok: true, status: "CONNECTED", live: publicLiveSession(connected.session, connected.balance, connected.openOrders) }, 200, { "Set-Cookie": liveSessionCookie(token, LIVE_SESSION_TTL_SECONDS, secureCookie) });
     } catch (error) {
       return json({ ok: false, error: errorMessage(error) }, 502);
     }
   }
 
   const session = await readLiveSession(request, gate.user.userId);
-  if (!session) return json({ ok: false, error: "Live session expired. Re-link the account before trading." }, 401, { "Set-Cookie": clearLiveSessionCookie() });
+  if (!session) return json({ ok: false, error: "Live session expired. Re-link the account before trading." }, 401, { "Set-Cookie": clearLiveSessionCookie(secureCookie) });
   let client: ClobClient;
-  try { client = clientFromSession(session); } catch { return json({ ok: false, error: "The encrypted live session could not be opened. Re-link the account." }, 401, { "Set-Cookie": clearLiveSessionCookie() }); }
+  try { client = clientFromSession(session); } catch { return json({ ok: false, error: "The encrypted live session could not be opened. Re-link the account." }, 401, { "Set-Cookie": clearLiveSessionCookie(secureCookie) }); }
 
   if (action === "balance") {
     try {

@@ -1,6 +1,6 @@
 import { privateKeyToAccount } from "viem/accounts";
 import { getChatGPTUser } from "../../../chatgpt-auth";
-import { readLiveSession, type LiveSession } from "../../../lib/polymarket-session";
+import { isLoopbackRequest, LOCAL_LIVE_USER_ID, localLiveEnabled, readLiveSession, type LiveSession } from "../../../lib/polymarket-session";
 
 const DATA_API = "https://data-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
@@ -263,8 +263,12 @@ export async function POST(request: Request) {
   if (privateKey && !validPrivateKey(privateKey)) return json({ ok: false, error: "Enter a 64-character hex signer private key, with or without the 0x prefix." }, 400);
   if (!/^[0-3]$/.test(signatureType)) return json({ ok: false, error: "Signature type must be 0, 1, 2, or 3." }, 400);
 
-  const viewer = !privateKey && suppliedPrivateFields === 0 ? await getChatGPTUser() : null;
-  const liveSession: LiveSession | null = viewer ? await readLiveSession(request, viewer.userId) : null;
+  const sessionUserId = !privateKey && suppliedPrivateFields === 0
+    ? isLoopbackRequest(request) && localLiveEnabled()
+      ? LOCAL_LIVE_USER_ID
+      : (await getChatGPTUser())?.userId ?? null
+    : null;
+  const liveSession: LiveSession | null = sessionUserId ? await readLiveSession(request, sessionUserId) : null;
   if (liveSession && liveSession.walletAddress.toLowerCase() !== walletAddress.toLowerCase()) {
     return json({ ok: false, error: "The requested wallet does not match the active live session. Disconnect and link the intended wallet." }, 409);
   }

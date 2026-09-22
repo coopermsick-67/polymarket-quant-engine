@@ -79,7 +79,16 @@ Use `systemd`, `launchd`, or a login service to start that script after reboot. 
 
 ## Local environment
 
-Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by the live account routes; a plain local clone is intended for paper mode unless you add and audit a separate local authentication boundary.
+Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by production live execution.
+
+For live execution on a trusted localhost machine, explicitly opt in to the loopback-only gate and provide a 32-byte session secret:
+
+```text
+POLYMARKET_LIVE_ALLOW_LOCALHOST=true
+POLYMARKET_LIVE_SESSION_SECRET=<64 hexadecimal characters>
+```
+
+Generate a session secret with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, restart the server, and then link the wallet in the local dashboard. Local live sessions are short-lived, encrypted, and bound to loopback requests. This flag must remain `false` on shared or production deployments.
 
 ## Safety and live integration boundary
 
