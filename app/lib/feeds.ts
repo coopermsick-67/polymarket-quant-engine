@@ -1,20 +1,20 @@
-// Per-asset price feeds and the derived "underlying" series the TWAP model needs.
+// Per-asset price feeds and the derived underlying series the settlement model needs.
 //
-// Verified against live data: the Chainlink value Polymarket RTDS publishes
-// (topic crypto_prices_chainlink) at a window's start equals the official
-// openPrice exactly, so that stream IS the 60s TWAP stream markets settle on.
-// A TWAP stream is an average, so the model cannot use it as the instantaneous
-// price. Instead we sample exchange ticks once per second and shift them by a
-// basis so their trailing 60s mean equals the latest stream value. The shifted
-// series is the best available estimate of the underlying Chainlink spot.
+// Verified live (2026-09-23): the Chainlink price Polymarket RTDS publishes
+// (topic crypto_prices_chainlink) equals the official open/close prices to
+// 0.00bp at window boundaries, and it tracks the instantaneous exchange price
+// with about 1 s of lag (residual sd 0.5bp for BTC against the point price vs
+// 1.35bp against a 60 s average). So it is a spot stream, and we anchor exchange
+// ticks to it with a basis: basis = median over the last minute of
+// stream(t) - exchange(t - lag). exchange_now + basis then estimates where the
+// settlement stream will print about one second from now.
 
-import { mean } from "./num";
 import { blendVolatility, ewmaTickVolatility, garmanKlassVolatility, type Candle, type PriceTick } from "./pricing";
 import type { SpotSource } from "./signal";
 
 export type AssetFeed = {
   asset: string;
-  /** Chainlink TWAP-stream prints (about 1 Hz). */
+  /** Chainlink settlement-stream prints (about 1 Hz). */
   stream: PriceTick[];
   /** Primary exchange prints for the underlying (Coinbase ticker). */
   exchange: PriceTick[];
@@ -33,7 +33,7 @@ export type DerivedFeed = {
   ticks: PriceTick[];
   settlementValue: number | null;
   settlementTimestamp: number | null;
-  /** Latest stream value minus the trailing exchange mean, in bp of price. */
+  /** Median stream-minus-lagged-exchange gap over the last minute, in bp of price. */
   basisBps: number | null;
   exchangeSpot: number | null;
   exchangeSpotTimestamp: number | null;
@@ -44,6 +44,8 @@ export type DerivedFeed = {
 };
 
 export const FEED_RETENTION_MS = 30 * 60 * 1000;
+/** Measured lag of the Chainlink stream behind exchange prints. */
+export const STREAM_LAG_MS = 1_000;
 
 /** Append a tick, keep order, drop duplicates and ticks older than the retention window. */
 export const appendTick = (ticks: PriceTick[], tick: PriceTick, retentionMs = FEED_RETENTION_MS): PriceTick[] => {
@@ -117,7 +119,7 @@ export const deriveFeed = (
     ticks.length && now - ticks[ticks.length - 1].timestamp <= maxAge ? resampleSeconds(ticks, now - lookback * 1000, now).length : -1;
   const exchangeTicks = coverage(feed.exchangeAlt) > coverage(feed.exchange) ? feed.exchangeAlt : feed.exchange;
   const lastExchange = exchangeTicks[exchangeTicks.length - 1] ?? null;
-  // Chainlink prints are nominally 1 Hz but gaps of ~9 s were observed live; the stream is an average, so a few seconds of age barely moves it.
+  // Chainlink prints are nominally 1 Hz but gaps of ~9 s were observed live; the basis is slow-moving, so a stale stream only delays anchoring.
   const streamMaxAge = Math.max(maxAge, 15_000);
   const freshStream = lastStream && now - lastStream.timestamp <= streamMaxAge ? lastStream : null;
   const freshExchange = lastExchange && now - lastExchange.timestamp <= maxAge ? lastExchange : null;
@@ -137,9 +139,16 @@ export const deriveFeed = (
   };
 
   if (freshStream && freshExchange) {
-    const window = sampled.filter((tick) => tick.timestamp > freshStream.timestamp - lookback * 1000 && tick.timestamp <= freshStream.timestamp);
-    if (window.length >= lookback * 0.75) {
-      const basis = freshStream.price - mean(window.map((tick) => tick.price));
+    const exchangeAt = new Map(sampled.map((tick) => [tick.timestamp, tick.price]));
+    const gaps = feed.stream
+      .filter((tick) => tick.timestamp > freshStream.timestamp - lookback * 1000 && tick.timestamp <= freshStream.timestamp)
+      .flatMap((tick) => {
+        const lagged = exchangeAt.get(Math.round((tick.timestamp - STREAM_LAG_MS) / 1000) * 1000);
+        return lagged === undefined ? [] : [tick.price - lagged];
+      })
+      .sort((left, right) => left - right);
+    if (gaps.length >= Math.min(20, lookback * 0.3)) {
+      const basis = gaps[Math.floor(gaps.length / 2)];
       const ticks = sampled.map((tick) => ({ timestamp: tick.timestamp, price: tick.price + basis }));
       return {
         ...base,

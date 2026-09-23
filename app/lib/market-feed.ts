@@ -6,7 +6,7 @@
 //   Gamma (REST)            market discovery and official resolutions
 //   CLOB  (REST + WS)       order books; WS deltas are checked against the
 //                           best bid/ask the server reports and resynced on drift
-//   RTDS  (WS)              Chainlink TWAP stream (settlement) + Binance prices
+//   RTDS  (WS)              Chainlink settlement stream + Binance prices
 //   Coinbase (WS)           primary exchange feed for the underlying
 //   crypto-price (REST)     official price to beat, via an injected fetcher
 

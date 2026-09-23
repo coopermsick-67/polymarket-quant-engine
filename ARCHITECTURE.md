@@ -6,7 +6,7 @@ One engine, three hosts: the browser dashboard, the headless Node runner, and th
                  ┌──────────────────────── app/lib/market-feed.ts (MarketFeedController) ───────────────────────┐
  Gamma REST ───▶ │ discovery (cryptoMarketConfig, feeSchedule, tick, min size) · official resolutions            │
  CLOB REST+WS ─▶ │ order books; price_change deltas checked against server best bid/ask, resynced on drift      │
- RTDS WS ──────▶ │ Chainlink TWAP stream (settlement) + Binance prices; stream-silence watchdog                 │
+ RTDS WS ──────▶ │ Chainlink settlement stream + Binance prices; stream-silence watchdog                        │
  Coinbase WS ──▶ │ underlying ticks                                                                              │
  crypto-price ─▶ │ official price to beat (openPrice) via /api/polymarket/reference or directly in Node          │
                  └──────────────┬───────────────────────────────────────────────────────────────────────────────┘
@@ -15,7 +15,7 @@ One engine, three hosts: the browser dashboard, the headless Node runner, and th
             polymarket-data.ts: snapshotFromLiveMarket ──▶ MarketSnapshot (pure data, JSON-serializable)
                                 ▼
             signal.ts: evaluateSignal(snapshot, params)            ◀── the single decision function
-              gates → pricing.ts fairValue (TWAP distribution, vol band) → shrink to book → fee-curve fill
+              gates → pricing.ts fairValue (settlement distribution, vol band) → shrink to book → fee-curve fill
               → limit price that preserves the edge → side choice
                                 ▼
      ┌───────────────────────────┬──────────────────────────────┬──────────────────────────────┐
@@ -32,8 +32,8 @@ One engine, three hosts: the browser dashboard, the headless Node runner, and th
 | File | Responsibility |
 | --- | --- |
 | `app/lib/num.ts` | Shared numeric/parsing helpers (normal CDF, Wilson interval, tick rounding, base64url). |
-| `app/lib/pricing.ts` | TWAP settlement distribution, `P(UP)`, volatility-band robustness, Polymarket fee curve, EWMA and Garman-Klass volatility, market shrinkage. |
-| `app/lib/feeds.ts` | Tick buffers and the basis-anchored underlying series built from the Chainlink stream and exchange ticks. |
+| `app/lib/pricing.ts` | Settlement distribution (point or averaged window), `P(UP)`, volatility-band robustness, Polymarket fee curve, EWMA and Garman-Klass volatility, market shrinkage. |
+| `app/lib/feeds.ts` | Tick buffers and the underlying series anchored to the Chainlink stream (median basis against exchange ticks lagged 1 s). |
 | `app/lib/signal.ts` | `evaluateSignal`, `evaluateExit`, depth- and fee-aware buy/sell simulation, limit-price solver. |
 | `app/lib/polymarket-data.ts` | Zod-validated Gamma/CLOB/official-price parsing, discovery, books, resolutions, LiveMarket assembly. |
 | `app/lib/market-feed.ts` | `MarketFeedController`: REST refresh, three WebSockets with backoff and watchdogs, book integrity resyncs, reference capture, resolution polling, 250 ms batched change notifications. |

@@ -43,7 +43,7 @@ export function SignalPanel({
     <aside className="panel signal-panel" aria-label="Selected market signal">
       <div className="panel-heading">
         <div>
-          <div className="eyebrow">TWAP SETTLEMENT MODEL</div>
+          <div className="eyebrow">CHAINLINK SETTLEMENT MODEL</div>
           <h3>
             {market.asset} {market.duration}
           </h3>
@@ -63,7 +63,7 @@ export function SignalPanel({
         <div className="signal-confidence">
           <small>price to beat</small>
           <strong>{formatSpot(market.asset, market.reference)}</strong>
-          <small>{market.referenceSource === "CHAINLINK" ? "Chainlink TWAP open" : "pending"}</small>
+          <small>{market.referenceSource === "CHAINLINK" ? "official Chainlink open" : "pending"}</small>
         </div>
       </div>
       <div className="signal-price-checks">
@@ -74,7 +74,7 @@ export function SignalPanel({
         <div className="signal-block-title">
           <span>SETTLEMENT DISTRIBUTION</span>
           <small>
-            {market.twapLookbackSeconds}s TWAP · fee rate {market.feeSchedule.rate} × (p(1−p))^{market.feeSchedule.exponent}
+            point settle (rules say {market.declaredTwapSeconds}s TWAP) · fee rate {market.feeSchedule.rate} × (p(1−p))^{market.feeSchedule.exponent}
           </small>
         </div>
         <div className="signal-metrics">

@@ -1,0 +1,17 @@
+{
+  "note": "Captured live 2026-09-23. RTDS crypto_prices_chainlink prints vs official crypto-price open/close at the 03:00:00Z boundary, plus an outcome check across 56 resolved 5m/15m markets.",
+  "boundary": "2026-09-23T03:00:00Z",
+  "closeVsStreamAtBoundaryBp": { "BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "XRP": 0.0 },
+  "closeVs60sAverageBp": { "BTC": 0.27, "ETH": -1.02, "SOL": 0.37, "XRP": -5.11 },
+  "nextOpenVsCloseBp": { "BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "XRP": 0.0 },
+  "streamVsExchangeResidualSdBp": {
+    "BTC": { "pointLag1s": 0.49, "twap60Lag0": 1.35 },
+    "ETH": { "pointLag1s": 0.56, "twap60Lag0": 1.7 },
+    "SOL": { "pointLag0s": 0.86, "twap60Lag0": 2.25 },
+    "XRP": { "pointLag1s": 1.37, "twap60Lag0": 6.43 }
+  },
+  "outcomeRules": {
+    "closeGeOpen": { "agree": 54, "disagree": 2 },
+    "endTwap60GeOpen": { "agree": 53, "disagree": 3 }
+  }
+}

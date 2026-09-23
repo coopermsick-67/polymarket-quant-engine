@@ -1,7 +1,17 @@
 import type { MarketCandle } from "../lib/polymarket-data";
 import type { ReliabilityBin } from "../lib/replay";
 
-export function Sparkline({ values, color = "#6cf2c4", height = 28 }: { values: number[]; color?: string; height?: number }) {
+export function Sparkline({
+  values,
+  color = "#6cf2c4",
+  height = 28,
+  className = "sparkline",
+}: {
+  values: number[];
+  color?: string;
+  height?: number;
+  className?: string;
+}) {
   const safe = values.length ? values : [0];
   const min = Math.min(...safe);
   const range = Math.max(...safe) - min || 1;
@@ -9,7 +19,7 @@ export function Sparkline({ values, color = "#6cf2c4", height = 28 }: { values: 
     .map((value, index) => `${safe.length === 1 ? 50 : (index / (safe.length - 1)) * 100},${3 + (1 - (value - min) / range) * (height - 7)}`)
     .join(" ");
   return (
-    <svg aria-hidden="true" className="sparkline" viewBox={`0 0 100 ${height}`} preserveAspectRatio="none">
+    <svg aria-hidden="true" className={className} viewBox={`0 0 100 ${height}`} preserveAspectRatio="none">
       <polyline fill="none" points={points} stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" vectorEffect="non-scaling-stroke" />
     </svg>
   );

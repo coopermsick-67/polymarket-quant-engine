@@ -1,6 +1,6 @@
 // Synthetic market generator for replay tests. Paths are zero-drift GBM at
-// 1-second resolution; settlement is the 60 s TWAP at the end vs the 60 s TWAP
-// at the start, exactly like the live contract.
+// 1-second resolution; settlement compares the price at the end with the price
+// at the start, matching what the official open/close prices show live.
 
 import { probabilityUp, settlementDistribution, DEFAULT_FEE_SCHEDULE } from "../app/lib/pricing";
 import type { MarketSnapshot, Side } from "../app/lib/signal";
@@ -15,9 +15,9 @@ const gaussian = (random: () => number) => Math.sqrt(-2 * Math.log(Math.max(1e-1
 export type BookStyle = "fair" | "stale-point";
 
 /**
- * fair:        quotes the true TWAP probability +/- 1c (no edge after fees).
- * stale-point: quotes a point-price model that ignores the TWAP lock-in and
- *              lags spot by 20 s, the kind of book the engine should beat.
+ * fair:        quotes the true probability +/- 1c (no edge after fees).
+ * stale-point: quotes the same model on a price 20 s old, the kind of book a
+ *              faster, better-anchored engine should beat.
  */
 export const simulateMarkets = (options: { markets: number; seed: number; style: BookStyle; sigma?: number; step?: number }) => {
   const random = seeded(options.seed);
@@ -37,13 +37,8 @@ export const simulateMarkets = (options: { markets: number; seed: number; style:
       prices.push(price);
     }
     const at = (second: number) => prices[second + 60];
-    const twapAt = (second: number) => {
-      let sum = 0;
-      for (let s = second - 59; s <= second; s += 1) sum += at(s);
-      return sum / 60;
-    };
-    const reference = twapAt(0);
-    const outcome: Side = twapAt(300) >= reference ? "UP" : "DOWN";
+    const reference = at(0);
+    const outcome: Side = at(300) >= reference ? "UP" : "DOWN";
     const marketId = `sim-${options.seed}-${market}`;
     outcomes.set(marketId, outcome);
     for (let second = step; second < 300; second += step) {
@@ -53,7 +48,7 @@ export const simulateMarkets = (options: { markets: number; seed: number; style:
         .map((s) => ({ timestamp: start + s * 1000, price: at(s) }));
       const spot = at(second);
       const truth = probabilityUp(
-        settlementDistribution({ spot, now, endTime: end, sigmaPerSqrtSecond: sigma, spec: { lookbackSeconds: 60 }, ticks }),
+        settlementDistribution({ spot, now, endTime: end, sigmaPerSqrtSecond: sigma, spec: { lookbackSeconds: 0 }, ticks }),
         reference,
       );
       let quoted = truth;
@@ -82,7 +77,7 @@ export const simulateMarkets = (options: { markets: number; seed: number; style:
         basisBps: 0,
         ticks,
         sigmaPerSqrtSecond: sigma,
-        twapLookbackSeconds: 60,
+        settlementLookbackSeconds: 0,
         feeSchedule: DEFAULT_FEE_SCHEDULE,
         tickSize: 0.01,
         minOrderSize: 5,

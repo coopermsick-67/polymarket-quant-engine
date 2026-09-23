@@ -363,7 +363,7 @@ export const replayCsvTemplate =
 
 /**
  * Minimal CSV import for externally collected data. CSV rows carry no tick
- * history, so the observed TWAP window is approximated as flat at `spot` and
+ * history, so any averaging window is approximated as flat at `spot` and
  * rows are marked EXCHANGE-sourced (the engine demands extra edge for that).
  */
 export const parseReplayCsv = (text: string): ReplayDataset => {
@@ -405,7 +405,7 @@ export const parseReplayCsv = (text: string): ReplayDataset => {
     const downBid = numberAt(values, "down_bid");
     const downAsk = numberAt(values, "down_ask");
     const depth = numberAt(values, "depth_shares") ?? 1_000;
-    const lookback = numberAt(values, "twap_lookback_seconds") ?? 60;
+    const lookback = numberAt(values, "settlement_lookback_seconds") ?? 0;
     if (
       !Number.isFinite(timestamp) ||
       !Number.isFinite(endTime) ||
@@ -437,7 +437,7 @@ export const parseReplayCsv = (text: string): ReplayDataset => {
       basisBps: null,
       ticks,
       sigmaPerSqrtSecond: sigma,
-      twapLookbackSeconds: lookback,
+      settlementLookbackSeconds: lookback,
       feeSchedule: DEFAULT_FEE_SCHEDULE,
       tickSize: 0.01,
       minOrderSize: 5,

@@ -29,7 +29,7 @@ describe("Gamma normalization (real captured payloads)", () => {
   });
   it("reads the TWAP config, fee schedule, tick size and min size from Gamma", () => {
     const btc = markets.find((market) => market?.asset === "BTC" && market.duration === "5m")!;
-    assert.equal(btc.twapLookbackSeconds, 60);
+    assert.equal(btc.declaredTwapSeconds, 60);
     assert.deepEqual(btc.feeSchedule, { rate: 0.07, exponent: 1, takerOnly: true, rebateRate: 0.2 });
     assert.ok(btc.tickSize > 0 && btc.minOrderSize === 5);
     assert.equal(btc.endTime - btc.startTime, 300_000);
@@ -119,15 +119,18 @@ describe("order books", () => {
 });
 
 describe("feeds", () => {
-  it("anchors exchange ticks to the TWAP stream via the basis", () => {
+  it("anchors exchange ticks to the settlement stream with a 1 s lag and a median basis", () => {
     const now = 1_000_000;
     const exchange = Array.from({ length: 300 }, (_, index) => ({ timestamp: now - (299 - index) * 1000, price: 100 + index * 0.01 }));
-    const trailingMean = exchange.slice(-60).reduce((sum, tick) => sum + tick.price, 0) / 60;
-    const stream = [{ timestamp: now, price: trailingMean + 0.05 }];
+    const at = new Map(exchange.map((tick) => [tick.timestamp, tick.price]));
+    // The stream prints the exchange price from one second earlier plus a 0.05 basis, with one outlier.
+    const stream = exchange
+      .slice(-60)
+      .map((tick, index) => ({ timestamp: tick.timestamp, price: (at.get(tick.timestamp - 1000) ?? tick.price) + (index === 10 ? 5 : 0.05) }));
     const feed = deriveFeed({ asset: "BTC", stream, exchange, exchangeAlt: [] }, now);
     assert.equal(feed.spotSource, "ANCHORED");
     assert.ok(Math.abs(feed.spot! - (exchange[exchange.length - 1].price + 0.05)) < 1e-9);
-    assert.ok(Math.abs(feed.basisBps! - (0.05 / stream[0].price) * 10_000) < 1e-9);
+    assert.ok(Math.abs(feed.basisBps! - (0.05 / stream[stream.length - 1].price) * 10_000) < 1e-9);
   });
   it("falls back to exchange-only and then stream-only, and reports missing", () => {
     const now = 1_000_000;
@@ -163,5 +166,22 @@ describe("resolution fetch", () => {
     await fetchResolutions(ids, undefined, fetcher as typeof fetch);
     assert.equal(urls.length, 2);
     assert.ok(urls[0].includes("limit=40") && urls[1].includes("limit=5"));
+  });
+});
+
+describe("settlement semantics (captured live)", () => {
+  const evidence = JSON.parse(readFileSync(new URL("./fixtures/settlement-verification.json", import.meta.url), "utf8"));
+  it("official close equals the stream print at the boundary, not a 60 s average", () => {
+    for (const bp of Object.values(evidence.closeVsStreamAtBoundaryBp) as number[]) assert.equal(bp, 0);
+    assert.ok((Object.values(evidence.closeVs60sAverageBp) as number[]).some((bp) => Math.abs(bp) > 1));
+  });
+  it("the stream tracks the point exchange price better than a 60 s average", () => {
+    for (const row of Object.values(evidence.streamVsExchangeResidualSdBp) as Record<string, number>[]) {
+      const point = row.pointLag1s ?? row.pointLag0s;
+      assert.ok(point < row.twap60Lag0);
+    }
+  });
+  it("close >= open explains official outcomes better than an end-TWAP rule", () => {
+    assert.ok(evidence.outcomeRules.closeGeOpen.agree > evidence.outcomeRules.endTwap60GeOpen.agree);
   });
 });

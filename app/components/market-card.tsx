@@ -29,9 +29,7 @@ export function MarketCard({
           <span className={`asset-token ${assetTone(market.asset)}`}>{market.asset.slice(0, 1)}</span>
           <span>
             <strong>{market.asset}</strong>
-            <small>
-              {market.duration} · {market.twapLookbackSeconds ? `${market.twapLookbackSeconds}s TWAP` : "point"} settle
-            </small>
+            <small>{market.duration} · Chainlink settle</small>
           </span>
         </div>
         <span className={`action-pill ${actionTone}`}>{signal.action === "PASS" ? `PASS · ${signal.gate}` : `${signal.tier} ${signal.action}`}</span>
@@ -45,14 +43,16 @@ export function MarketCard({
         <div className="market-spot">
           <small>UNDERLYING · {feed?.spotSource ?? "MISSING"}</small>
           <strong>{formatSpot(market.asset, feed?.spot)}</strong>
-          <small className="market-reference" title="Official price to beat: the Chainlink TWAP-stream value at the window start.">
+          <small className="market-reference" title="Official price to beat: the Chainlink stream print at the window start.">
             {market.reference === null
               ? "price to beat pending"
               : `beat ${formatSpot(market.asset, market.reference)}${distanceBps === null ? "" : ` · ${distanceBps >= 0 ? "+" : ""}${distanceBps.toFixed(1)}bp`}`}
           </small>
         </div>
       </div>
-      {recent.length > 2 ? <Sparkline values={recent} color={distanceBps !== null && distanceBps < 0 ? "#ff7d8a" : "#6cf2c4"} height={22} /> : null}
+      {recent.length > 2 ? (
+        <Sparkline className="market-sparkline" values={recent} color={distanceBps !== null && distanceBps < 0 ? "#ff7d8a" : "#6cf2c4"} height={22} />
+      ) : null}
       <div className="book-grid">
         <div>
           <span>UP</span>

@@ -381,6 +381,8 @@ export async function POST(request: Request) {
   for (const [key, at] of recentRequestKeys) if (Date.now() - at > 5 * 60_000) recentRequestKeys.delete(key);
 
   const now = Date.now();
+  // Only an error after an order is sent leaves the account state unknown.
+  let submitted = false;
   try {
     const [loaded, balance, positions] = await Promise.all([
       loadMarket(marketId, now),
@@ -419,6 +421,7 @@ export async function POST(request: Request) {
       if (!exit.shouldExit || exit.limitPrice === null) return json(pass(exit.reason, { exit }));
       recentRequestKeys.set(requestKey, now);
       const startedAt = Date.now();
+      submitted = true;
       // Never retried: a lost response may still have filled on the exchange.
       const response = (await client.createAndPostMarketOrder(
         { tokenID, amount: round(shares, 2), side: ClobSide.SELL, price: exit.limitPrice, orderType: OrderType.FAK },
@@ -464,6 +467,7 @@ export async function POST(request: Request) {
     recentRequestKeys.set(requestKey, now);
     const updated = await dayCookie({ ...day, orders: [...day.orders, { key: requestKey, at: now }] }, secure);
     const startedAt = Date.now();
+    submitted = true;
     // FAK with a limit: fills only at prices that keep the required edge after fees. Never retried.
     const response = (await client.createAndPostMarketOrder(
       { tokenID, amount: sizing.stakeUsd, side: ClobSide.BUY, price: chosen.limitPrice!, orderType: OrderType.FAK, userUSDCBalance: balance },
@@ -492,6 +496,7 @@ export async function POST(request: Request) {
       updated ? [updated] : [],
     );
   } catch (error) {
+    if (!submitted) return json({ ok: false, error: `No order was sent: ${errorMessage(error)}` }, 502);
     // Keep the request key: an unknown submission outcome must be reconciled, never blindly retried.
     return json({ ok: false, uncertain: true, error: `Execution state is uncertain; reconcile before retrying. ${errorMessage(error)}` }, 502);
   }

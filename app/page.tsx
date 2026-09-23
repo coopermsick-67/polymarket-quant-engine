@@ -747,12 +747,12 @@ export default function Home() {
               POLYMARKET / 5M + 15M CRYPTO
             </div>
             <h1>Decision terminal</h1>
-            <p>Chainlink TWAP settlement model · official price to beat · fee-curve limit orders · official resolutions.</p>
+            <p>Chainlink-anchored settlement model · official price to beat · fee-curve limit orders · official resolutions.</p>
           </div>
           <div className="topbar-right">
             <div className="connection-strip">
               <StatusDot label="BOOKS" status={status.clob === "LIVE" ? "READY" : "WARN"} detail="CLOB market WebSocket with delta integrity checks" />
-              <StatusDot label="CHAINLINK" status={status.rtds === "LIVE" ? "READY" : "WARN"} detail="Polymarket RTDS: Chainlink TWAP stream + Binance" />
+              <StatusDot label="CHAINLINK" status={status.rtds === "LIVE" ? "READY" : "WARN"} detail="Polymarket RTDS: Chainlink settlement stream + Binance" />
               <StatusDot label="EXCHANGE" status={status.coinbase === "LIVE" ? "READY" : "WARN"} detail="Coinbase ticker for the underlying" />
               <StatusDot label="ANCHORED" status={anchoredAssets ? "READY" : "WARN"} detail={`${anchoredAssets} assets anchored to the settlement stream`} />
               <StatusDot label="LIVE" status={liveSession?.connected ? "READY" : "LOCKED"} detail="Owner-authenticated live session" />

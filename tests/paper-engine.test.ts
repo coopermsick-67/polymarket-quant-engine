@@ -19,7 +19,7 @@ const market = (overrides: Partial<LiveMarket> = {}): LiveMarket => ({
   upTokenId: "up",
   downTokenId: "down",
   sourceUrl: "",
-  twapLookbackSeconds: 60,
+  declaredTwapSeconds: 60,
   feeSchedule: DEFAULT_FEE_SCHEDULE,
   tickSize: 0.01,
   minOrderSize: 5,

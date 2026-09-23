@@ -1,7 +1,7 @@
 // The single decision function used by the browser terminal, the live order
 // route, the headless runner, and the replay backtester.
 //
-// Pipeline: data-quality gates -> TWAP-aware fair value with a volatility band
+// Pipeline: data-quality gates -> settlement-distribution fair value with a volatility band
 // -> shrink toward the market-implied probability -> depth-walked, fee-curve
 // execution cost -> limit price that preserves the required edge -> side choice.
 
@@ -14,7 +14,7 @@ export type BookLevel = { price: number; size: number };
 export type SnapshotBook = { bids: BookLevel[]; asks: BookLevel[]; timestamp: number | null };
 export type ReferenceSource = "CHAINLINK" | "ESTIMATE" | "MISSING";
 /**
- * ANCHORED: exchange ticks shifted onto the Chainlink TWAP stream (best).
+ * ANCHORED: exchange ticks shifted onto the Chainlink settlement stream (best).
  * EXCHANGE: exchange ticks without a stream anchor.
  * STREAM:   only the averaged Chainlink stream (degraded).
  */
@@ -35,12 +35,13 @@ export type MarketSnapshot = {
   spotSource: SpotSource;
   /** Latest stream value minus the trailing exchange mean; a feed-health breaker. */
   basisBps: number | null;
-  /** Basis-adjusted 1 Hz underlying ticks; must cover the TWAP window for late entries. */
+  /** Basis-adjusted 1 Hz underlying ticks (also used for any averaged-settlement window). */
   ticks: PriceTick[];
   sigmaPerSqrtSecond: number | null;
   /** 1 s returns behind sigma; undefined for imported data. */
   volSamples?: number;
-  twapLookbackSeconds: number;
+  /** Averaging window of the settlement value; 0 = point (what the published prices show). */
+  settlementLookbackSeconds: number;
   feeSchedule: FeeSchedule;
   tickSize: number;
   minOrderSize: number;
@@ -71,6 +72,11 @@ export type SignalParams = {
   requireAnchoredFeed: boolean;
   /** Minimum 1 s tick returns before trading (startup trades were the worst in live runs). */
   minVolSamples: number;
+  /**
+   * Probability that the official outcome disagrees with the published open/close prices.
+   * Measured 2/56 in live data; pulls extreme probabilities toward 50%.
+   */
+  resolutionNoise: number;
   strongEdgeMultiple: number;
 };
 
@@ -90,6 +96,7 @@ export const DEFAULT_SIGNAL_PARAMS: SignalParams = {
   allowEstimatedReference: false,
   requireAnchoredFeed: true,
   minVolSamples: 300,
+  resolutionNoise: 0.02,
   strongEdgeMultiple: 2,
 };
 
@@ -113,6 +120,7 @@ export const normalizeSignalParams = (input: Partial<SignalParams> | null | unde
     allowEstimatedReference: typeof input?.allowEstimatedReference === "boolean" ? input.allowEstimatedReference : d.allowEstimatedReference,
     requireAnchoredFeed: typeof input?.requireAnchoredFeed === "boolean" ? input.requireAnchoredFeed : d.requireAnchoredFeed,
     minVolSamples: num(input?.minVolSamples, d.minVolSamples, 0, 3_600),
+    resolutionNoise: num(input?.resolutionNoise, d.resolutionNoise, 0, 0.2),
     strongEdgeMultiple: num(input?.strongEdgeMultiple, d.strongEdgeMultiple, 1, 10),
   };
 };
@@ -283,7 +291,7 @@ export const evaluateSignal = (snapshot: MarketSnapshot, inputParams: Partial<Si
   }
   if (snapshot.referenceSource === "ESTIMATE") {
     if (!params.allowEstimatedReference)
-      return pass("REFERENCE", "Only an estimated price to beat is available; entries require the Chainlink opening TWAP.", base);
+      return pass("REFERENCE", "Only an estimated price to beat is available; entries require the official Chainlink open.", base);
     requiredEdge += 0.03;
   }
   if (snapshot.spot === null || !(snapshot.spot > 0) || snapshot.spotTimestamp === null || snapshot.spotSource === "MISSING")
@@ -310,17 +318,19 @@ export const evaluateSignal = (snapshot: MarketSnapshot, inputParams: Partial<Si
   const bookAge = (book: SnapshotBook) => (book.timestamp === null ? 0 : snapshot.now - book.timestamp);
   if (Math.max(bookAge(snapshot.up), bookAge(snapshot.down)) > params.maxBookAgeMs) return pass("STALE_BOOK", "Order book snapshot is stale.", base);
 
-  const fair = fairValue({
+  const rawFair = fairValue({
     reference: snapshot.reference,
     spot: snapshot.spot,
     now: snapshot.now,
     endTime: snapshot.endTime,
     sigmaPerSqrtSecond: snapshot.sigmaPerSqrtSecond,
-    spec: { lookbackSeconds: snapshot.twapLookbackSeconds },
+    spec: { lookbackSeconds: snapshot.settlementLookbackSeconds },
     ticks: snapshot.ticks,
     volUncertainty: params.volUncertainty,
   });
-  if (snapshot.twapLookbackSeconds > 0 && fair.distribution.observedSeconds > 5 && fair.distribution.observedCoverage < 0.8) {
+  const noisy = (p: number) => params.resolutionNoise + (1 - 2 * params.resolutionNoise) * p;
+  const fair: FairValue = { ...rawFair, pUp: noisy(rawFair.pUp), pUpLowVol: noisy(rawFair.pUpLowVol), pUpHighVol: noisy(rawFair.pUpHighVol) };
+  if (snapshot.settlementLookbackSeconds > 0 && fair.distribution.observedSeconds > 5 && fair.distribution.observedCoverage < 0.8) {
     requiredEdge += 0.02;
   }
   const pUpMarket = marketImpliedUp(snapshot);

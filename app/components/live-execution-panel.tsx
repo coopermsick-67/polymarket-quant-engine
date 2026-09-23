@@ -124,7 +124,7 @@ export default function LiveExecutionPanel({
             <div className="gate-list">
               <div>
                 <Check size={15} />
-                <span>Official price to beat + TWAP settlement model</span>
+                <span>Official price to beat + Chainlink-anchored settlement model</span>
                 <b className="gate-pass">ON</b>
               </div>
               <div>

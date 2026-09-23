@@ -98,7 +98,7 @@ describe("TWAP settlement distribution", () => {
     close(probabilityUp(d, reference), above / paths, 0.015, "TWAP P(UP)");
   });
 
-  it("is far more certain than the old point model late in the window", () => {
+  it("an averaged settlement window is far more certain than a point settlement late in the window (math check)", () => {
     const reference = spot;
     const current = spot * 1.0002; // 2bp above the price to beat, 30s left
     const endTime = 300_000;

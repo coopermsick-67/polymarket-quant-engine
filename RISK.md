@@ -6,14 +6,14 @@ Nothing here guarantees a profit. These controls bound losses and stop the engin
 
 | Gate | Blocks an entry when |
 | --- | --- |
-| `REFERENCE` | The official price to beat (Chainlink TWAP-stream value at the window start) is not known. Estimated references are never traded by default. |
+| `REFERENCE` | The official price to beat (the Chainlink stream print at the window start) is not known. Estimated references are never traded by default. |
 | `SPOT` / `STALE_SPOT` | No price feed, or the exchange tick is older than 4 s. |
 | `UNANCHORED` | Exchange ticks are not anchored to the Chainlink stream. Unanchored feeds carry a several-bp basis error, larger than a minute of BTC volatility. |
 | `DIVERGENCE` | Stream-vs-exchange basis exceeds 30 bp (feed fault). |
 | `VOLATILITY` / `WARMUP` | No volatility estimate, or fewer than 300 one-second returns behind it. |
 | `TIME` | Less than 15 s remain. |
 | `STALE_BOOK` | The order book is older than 15 s. |
-| `EDGE` | No side clears the edge floor after slippage and the fee curve, using the worst case over a ±30% volatility band, blended with the book. |
+| `EDGE` | No side clears the edge floor after slippage and the fee curve, using the worst case over a ±30% volatility band, a 2% resolution-noise allowance, and a blend with the book. |
 | `TAIL` | The fill would be below 5¢ (no lottery tickets). |
 | `SPREAD` | The chosen side's spread exceeds 6¢. |
 

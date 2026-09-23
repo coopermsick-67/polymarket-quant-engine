@@ -3,7 +3,8 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Polymarket Quant Engine",
-  description: "TWAP-settlement pricing, paper/shadow trading, replay backtests, and limit-priced live execution for Polymarket 5m/15m crypto Up/Down markets.",
+  description:
+    "Chainlink-anchored pricing, paper/shadow trading, replay backtests, and limit-priced live execution for Polymarket 5m/15m crypto Up/Down markets.",
   other: {
     "codex-preview": "development",
   },

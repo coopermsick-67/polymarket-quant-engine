@@ -611,7 +611,6 @@ button { color: inherit; }
 .breakdown-row { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; }
 .walk-forward-panel { padding: 16px; margin-bottom: 14px; }
 .closed-row td { opacity: 0.72; }
-.market-card .sparkline { margin: 6px 0 2px; }
 @media (max-width: 760px) {
   .replay-charts, .breakdown-grid { grid-template-columns: 1fr; }
 }

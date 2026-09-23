@@ -33,7 +33,7 @@ export const makeSnapshot = (
     basisBps: 1,
     ticks,
     sigmaPerSqrtSecond: 0.0001, // ~7.7bp per minute
-    twapLookbackSeconds: 60,
+    settlementLookbackSeconds: 0,
     feeSchedule: DEFAULT_FEE_SCHEDULE,
     tickSize: 0.01,
     minOrderSize: 5,

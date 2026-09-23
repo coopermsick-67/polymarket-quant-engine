@@ -40,7 +40,8 @@ export type MarketDefinition = {
   upTokenId: string;
   downTokenId: string;
   sourceUrl: string;
-  twapLookbackSeconds: number;
+  /** TWAP window Gamma declares in cryptoMarketConfig (display only; see SETTLEMENT_LOOKBACK_SECONDS). */
+  declaredTwapSeconds: number;
   feeSchedule: FeeSchedule;
   tickSize: number;
   minOrderSize: number;
@@ -197,7 +198,7 @@ export const normalizeMarket = (raw: unknown, now = Date.now()): MarketDefinitio
   if (!upTokenId || !downTokenId || upTokenId === downTokenId) return null;
 
   const config = cryptoConfigSchema.safeParse(row.cryptoMarketConfig);
-  const twapLookbackSeconds = config.success && config.data.twapEnabled ? clamp(config.data.twapLookbackSeconds ?? 60, 0, 3_600) : 0;
+  const declaredTwapSeconds = config.success && config.data.twapEnabled ? clamp(config.data.twapLookbackSeconds ?? 60, 0, 3_600) : 0;
   const fee = feeScheduleSchema.safeParse(row.feeSchedule);
 
   return {
@@ -212,7 +213,7 @@ export const normalizeMarket = (raw: unknown, now = Date.now()): MarketDefinitio
     upTokenId,
     downTokenId,
     sourceUrl: `https://polymarket.com/event/${row.slug}`,
-    twapLookbackSeconds,
+    declaredTwapSeconds,
     feeSchedule: fee.success ? fee.data : DEFAULT_FEE_SCHEDULE,
     tickSize: row.orderPriceMinTickSize && row.orderPriceMinTickSize > 0 ? row.orderPriceMinTickSize : 0.01,
     minOrderSize: row.orderMinSize && row.orderMinSize > 0 ? row.orderMinSize : 5,
@@ -361,7 +362,7 @@ export async function fetchResolutions(marketIds: string[], signal?: AbortSignal
 }
 
 // ---------------------------------------------------------------------------
-// Official price to beat: the Chainlink TWAP-stream value at the window start.
+// Official price to beat: the Chainlink stream print at the window start.
 
 export const officialPriceUrl = (asset: string, startTime: number, duration: Horizon, base = OFFICIAL_PRICE_API) => {
   const url = new URL(base, "https://polymarket.com");
@@ -643,6 +644,15 @@ export const updateLiveMarketBookLevel = (
   return isUp ? withBooks(market, book, market.downBook, now) : withBooks(market, market.upBook, book, now);
 };
 
+/**
+ * Verified live (2026-09-23): the official closePrice equals the Chainlink stream
+ * print at the window end to 0.00bp and differs from a 60 s average by up to 5bp,
+ * and close >= open reproduced 54 of 56 official outcomes (a 60 s end-TWAP rule
+ * did worse, 53/56). Despite the "TWAP" wording in the market rules, the model
+ * therefore treats settlement as a point comparison.
+ */
+export const SETTLEMENT_LOOKBACK_SECONDS = 0;
+
 export const snapshotFromLiveMarket = (market: LiveMarket, feed: DerivedFeed | null, now = polymarketNow()): MarketSnapshot => ({
   marketId: market.id,
   asset: market.asset,
@@ -656,12 +666,10 @@ export const snapshotFromLiveMarket = (market: LiveMarket, feed: DerivedFeed | n
   spotTimestamp: feed?.spotTimestamp ?? null,
   spotSource: feed?.spotSource ?? "MISSING",
   basisBps: feed?.basisBps ?? null,
-  ticks: (feed?.ticks ?? []).filter(
-    (tick) => tick.timestamp > market.endTime - Math.max(60, market.twapLookbackSeconds) * 1000 - 5_000 && tick.timestamp <= now,
-  ),
+  ticks: (feed?.ticks ?? []).filter((tick) => tick.timestamp > now - 90_000 && tick.timestamp <= now),
   sigmaPerSqrtSecond: feed?.sigmaPerSqrtSecond ?? null,
   volSamples: feed?.volSamples ?? 0,
-  twapLookbackSeconds: market.twapLookbackSeconds,
+  settlementLookbackSeconds: SETTLEMENT_LOOKBACK_SECONDS,
   feeSchedule: market.feeSchedule,
   tickSize: market.tickSize,
   minOrderSize: market.minOrderSize,

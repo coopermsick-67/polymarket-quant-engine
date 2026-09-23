@@ -1,101 +1,38 @@
 # Polymarket Quant Engine
 
-Polymarket Quant Engine is a paper-first terminal for active crypto Up/Down markets. It discovers 5m and 15m markets, shows public books and Coinbase chart context, produces UP/DOWN/PASS decisions, records a complete market ledger, and keeps the Paper Trader and Paper Lab on one shared account.
+Pricing, paper/shadow trading, replay backtesting, and limit-priced live execution for Polymarket's 5-minute and 15-minute crypto Up/Down markets (BTC, ETH, SOL, XRP, DOGE, BNB, HYPE, ZEC).
 
-## Included
+**No strategy here is proven profitable.** The engine is built to find out honestly: every decision is recorded, graded on official outcomes, and scored against the order book's own probability. Read `STRATEGY.md` before risking money.
 
-- Public Gamma discovery for active crypto 5m/15m markets, public CLOB order books, and public Coinbase spot/candle data.
-- Every discovered market remains visible, including PASS decisions caused by missing data, weak edge, stale candles, or wide spreads.
-- One-second countdowns plus Coinbase and Polymarket market WebSocket updates with REST recovery refreshes.
-- Transparent chart signal fields: model P(UP), UP/DOWN asks, net edge, 5m/15m trends, confidence, liquidity, and reason.
-- One shared paper account for manual Paper Trader entries, automatic entries, timeframe tests, balance, open positions, closed positions, realized P&L, and resolution payouts.
-- Resolution-aware paper settlement: winning shares pay $1, losing shares pay $0 when an expired market outcome is available; realized cash flows into the same balance used by newly opened markets.
-- Browser-local decision ledger for all active markets with UP/DOWN/PASS, outcomes, timestamps, sizing, and CSV export.
-- Timeframe paper tests with a chosen starting balance and duration, Telegram test/report delivery, and Sunday 9 PM Eastern browser-assisted scheduling.
-- Optional owner-authenticated Polymarket account reads and live execution gates in the hosted Site, with balance checks, risk limits, fractional Kelly sizing, duration filters, pause, and cancel-all controls.
-- Model-aware cashouts for paper positions and an opt-in live exit policy: the current executable bid must clear the model fair probability, minimum dollar/percentage profit, remaining-time, and repeated-confirmation checks before a sell is attempted. The server revalidates the position and market immediately before submitting a non-retried FAK sell.
+## What it does
 
-The model is heuristic and uncalibrated. Nothing in the interface guarantees a profit or a fill. Live orders use real funds and must be independently tested with paper data first.
+- **Settlement-accurate pricing.** Uses the official price to beat and the Chainlink stream that markets settle on, verified live against Polymarket's published open/close prices (see `STRATEGY.md`). Exchange ticks are anchored to that stream, volatility comes from 1 s returns, and fair value is taken as the worst case over a volatility band, blended with the book.
+- **Real costs.** Depth-walked fills, slippage, and each market's fee curve (`rate × (p(1 − p))^exponent`, matching the official client).
+- **One decision function** (`evaluateSignal`) shared by the dashboard, the headless runner, the live order route, and the backtester.
+- **Paper/shadow engine.** Decides now, fills after a simulated latency at the decision's limit price, settles only on official resolutions, and enforces daily-loss and drawdown halts.
+- **Replay backtester.** Runs recorded sessions through the live code with latency and depth limits. Reports EV, realized vs predicted edge, markouts, Sharpe, Wilson intervals, calibration against the book, and a walk-forward split.
+- **Live execution** (opt-in, owner-only). Fill-and-kill limit orders; the server rebuilds the market itself; Kelly sizing on all-in cost; one position per market; exposure, correlated-window, daily-loss, and rate limits; a server-held key option; submissions are never retried.
+- **24/7 headless runner.** No browser tab needed. Persists state atomically, records replayable JSONL, and sends Telegram alerts.
 
-## Clone this repository
+## Quick start
 
 ```bash
-git clone https://github.com/coopermsick-67/polymarket-quant-engine.git
-cd polymarket-quant-engine
-```
-
-The repository is private. Your GitHub account must have access to clone it.
-
-## Run locally
-
-Requirements: Node.js 22.13+ and pnpm 11.25.0.
-
-```bash
-corepack enable
-corepack prepare pnpm@11.25.0 --activate
+corepack enable && corepack prepare pnpm@11.25.0 --activate
 pnpm install
-pnpm run dev
+pnpm run check                               # typecheck, lint, prettier, 75 tests
+pnpm run dev                                 # dashboard
+pnpm run headless -- --auto --record         # paper engine + recorder, no browser
+pnpm run replay -- data/replay-*.jsonl --walk-forward
 ```
 
-Open the local URL printed by the terminal. For a production-style local worker:
+Supervised 24/7: `bash scripts/run_forever.sh headless` (or `scripts/run_forever.ps1 headless` on Windows).
 
-```bash
-pnpm run build
-pnpm run start -- --port 8787
-```
+## Documentation
 
-Then open `http://127.0.0.1:8787`.
+- `STRATEGY.md`: the settlement evidence, the model, where edge can and cannot come from, and current evidence.
+- `RISK.md`: every gate and limit.
+- `ARCHITECTURE.md`: modules and data flow.
+- `API.md`: server routes.
+- `SETUP.md`: environment variables and the checklist before trading live.
 
-## Keep it running on an old Windows computer
-
-Run these once from the project root:
-
-```powershell
-corepack enable
-corepack prepare pnpm@11.25.0 --activate
-pnpm install
-pnpm run build
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_forever.ps1
-```
-
-The supervisor restarts the local server if it exits. Open `http://127.0.0.1:8787` in Chrome and keep that tab open and awake. The browser tab performs public market scanning, paper fills, market-resolution settlement, ledger persistence, and the Telegram weekly check; running only the server is not a background trading process.
-
-To start it after every Windows logon, create a Task Scheduler task that runs:
-
-```text
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\to\polymarket-quant-engine\scripts\run_forever.ps1
-```
-
-Keep the computer plugged in, disable sleep while connected to power, and configure Chrome to reopen the local tab after reboot. Never put a wallet private key, Telegram bot token, or API secret in GitHub or a committed `.env` file.
-
-## Linux/macOS supervisor
-
-```bash
-pnpm install
-pnpm run build
-bash scripts/run_forever.sh
-```
-
-Use `systemd`, `launchd`, or a login service to start that script after reboot. The browser tab requirement still applies for the client-side market loop.
-
-## Local environment
-
-Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by production live execution.
-
-Live linking retries transient Polymarket credential, balance, and open-order reads. If the upstream socket is reset, the request returns a readable error and no order is retried or assumed successful; reconcile the Account view before trying any uncertain execution again.
-
-For live execution on a trusted localhost machine, explicitly opt in to the loopback-only gate and provide a 32-byte session secret:
-
-```text
-POLYMARKET_LIVE_ALLOW_LOCALHOST=true
-POLYMARKET_LIVE_SESSION_SECRET=<64 hexadecimal characters>
-POLYMARKET_TELEGRAM_SESSION_SECRET=<another 64 hexadecimal characters>
-```
-
-Generate each session secret with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, restart the server, and then link the wallet or Telegram bot in the local dashboard. Local live and Telegram sessions are encrypted and bound to loopback requests. This flag must remain `false` on shared or production deployments.
-
-## Safety and live integration boundary
-
-The official Polymarket APIs separate Gamma market metadata, CLOB books/orders, the Data API for positions/activity, Relayer wallet transactions, and public/authenticated WebSocket channels. Before enabling live trading, independently verify market selection, wallet/account type, L1/L2 signing, balance reconciliation, order/fill reconciliation after restart, stale-data halts, fees, slippage, and exposure limits.
-
-See `SETUP.md`, `ARCHITECTURE.md`, `STRATEGY.md`, `RISK.md`, and `API.md` for project details.
+Never commit keys or tokens. `.env*` and `data/` are git-ignored.
