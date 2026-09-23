@@ -11,6 +11,31 @@ import { listRecordingFiles, openRecordingFile, RecordingStore } from "../script
 const count = (db: DatabaseSync, table: string) => (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
 
 describe("SQLite recording store", () => {
+  it("keeps resolved rolling calibration observations across day rotations and process restarts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pqe-calibration-test-"));
+    const dayOne = Date.UTC(2026, 0, 1, 23, 59, 59);
+    const dayTwo = Date.UTC(2026, 0, 2, 0, 0, 1);
+    const store = await RecordingStore.open(root, dayOne);
+    store.recordCalibrationCheckpoint({ marketId: "cal-1", at: dayOne, remainingSeconds: 60, posteriorProbability: 0.8, bookProbability: 0.5 });
+    store.recordResolution({ marketId: "cal-1", outcome: "UP", resolvedAt: dayTwo });
+    store.recordCalibrationCheckpoint({ marketId: "cal-2", at: dayTwo, remainingSeconds: 60, posteriorProbability: 0.2, bookProbability: 0.5 });
+    store.recordResolution({ marketId: "cal-2", outcome: "DOWN", resolvedAt: dayTwo + 300_000 });
+    await store.waitForCompression();
+    store.close();
+
+    const reopened = await RecordingStore.open(root, dayTwo);
+    try {
+      const rolling = reopened.rollingCalibration(1);
+      assert.equal(rolling.markets, 1);
+      assert.ok(Math.abs(rolling.posteriorBrier! - 0.04) < 1e-9);
+      assert.ok(Math.abs(rolling.bookBrier! - 0.25) < 1e-9);
+      assert.ok(Math.abs(rolling.brierDifferencePosteriorMinusBook! + 0.21) < 1e-9);
+    } finally {
+      reopened.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("persists raw feeds, venue ticks, snapshots, decisions, fills, events, resolutions and official prices", async () => {
     const root = await mkdtemp(join(tmpdir(), "pqe-store-test-"));
     const at = Date.UTC(2026, 0, 1, 12);

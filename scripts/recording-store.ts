@@ -61,6 +61,7 @@ export class RecordingStore {
   private readonly dataDir: string;
   readonly directory: string;
   private db: DatabaseSync;
+  private readonly calibrationDb: DatabaseSync;
   private activeDay: string;
   private activePath: string;
   private compressionTasks = new Set<Promise<void>>();
@@ -73,6 +74,10 @@ export class RecordingStore {
     this.activeDay = day;
     this.activePath = databasePath(dataDir, day);
     this.db = this.openDay(this.activePath);
+    this.calibrationDb = new DatabaseSync(join(this.directory, "calibration.sqlite"));
+    this.calibrationDb.exec(
+      "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; CREATE TABLE IF NOT EXISTS calibration_observations (market_id TEXT PRIMARY KEY, decision_at INTEGER NOT NULL, remaining_seconds REAL NOT NULL, posterior_probability REAL NOT NULL, book_probability REAL, outcome TEXT, resolved_at INTEGER); CREATE INDEX IF NOT EXISTS calibration_resolved_at ON calibration_observations(resolved_at DESC)",
+    );
   }
 
   static async open(dataDir: string, now = Date.now()): Promise<RecordingStore> {
@@ -198,6 +203,37 @@ export class RecordingStore {
         "INSERT INTO resolutions (market_id, resolved_at, outcome, payload_json) VALUES (?, ?, ?, ?) ON CONFLICT(market_id) DO UPDATE SET resolved_at=excluded.resolved_at, outcome=excluded.outcome, payload_json=excluded.payload_json",
       )
       .run(resolution.marketId, resolution.resolvedAt, resolution.outcome, asJson(resolution));
+    this.calibrationDb
+      .prepare("UPDATE calibration_observations SET outcome = ?, resolved_at = ? WHERE market_id = ?")
+      .run(resolution.outcome, resolution.resolvedAt, resolution.marketId);
+  }
+
+  recordCalibrationCheckpoint(record: {
+    marketId: string;
+    at: number;
+    remainingSeconds: number;
+    posteriorProbability: number;
+    bookProbability: number | null;
+  }) {
+    if (!Number.isFinite(record.posteriorProbability) || record.posteriorProbability < 0 || record.posteriorProbability > 1) return;
+    if (record.bookProbability !== null && (!Number.isFinite(record.bookProbability) || record.bookProbability < 0 || record.bookProbability > 1)) return;
+    this.calibrationDb
+      .prepare(
+        "INSERT OR IGNORE INTO calibration_observations (market_id, decision_at, remaining_seconds, posterior_probability, book_probability) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(record.marketId, record.at, record.remainingSeconds, record.posteriorProbability, record.bookProbability);
+  }
+
+  rollingCalibration(limit = 500) {
+    const rows = this.calibrationDb
+      .prepare(
+        "SELECT posterior_probability, book_probability, outcome FROM calibration_observations WHERE outcome IN ('UP', 'DOWN') AND book_probability IS NOT NULL ORDER BY resolved_at DESC LIMIT ?",
+      )
+      .all(Math.max(1, Math.floor(limit))) as { posterior_probability: number; book_probability: number; outcome: "UP" | "DOWN" }[];
+    if (!rows.length) return { markets: 0, posteriorBrier: null, bookBrier: null, brierDifferencePosteriorMinusBook: null };
+    const posteriorBrier = rows.reduce((sum, row) => sum + (row.posterior_probability - Number(row.outcome === "UP")) ** 2, 0) / rows.length;
+    const bookBrier = rows.reduce((sum, row) => sum + (row.book_probability - Number(row.outcome === "UP")) ** 2, 0) / rows.length;
+    return { markets: rows.length, posteriorBrier, bookBrier, brierDifferencePosteriorMinusBook: posteriorBrier - bookBrier };
   }
 
   recordOfficialPrice(record: RecordedOfficialPrice) {
@@ -226,6 +262,7 @@ export class RecordingStore {
 
   close() {
     this.closeDatabase();
+    this.calibrationDb.close();
   }
 }
 

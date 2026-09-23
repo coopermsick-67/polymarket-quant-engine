@@ -39,7 +39,8 @@ One engine, three hosts: the browser dashboard, the headless Node runner, and th
 | `app/lib/market-feed.ts`     | `MarketFeedController`: REST refresh, three WebSockets with backoff and watchdogs, book integrity resyncs, reference capture, resolution polling, 250 ms batched change notifications. |
 | `app/lib/engines.ts`         | Paper account: fills, depth-walked exits, official-only settlement, daily and drawdown halts, exposure checks.                                                                         |
 | `app/lib/paper-engine.ts`    | One paper/shadow step: settle, fill due orders at their limits, halts, confirmed exits, queue one new order.                                                                           |
-| `app/lib/replay.ts`          | Replay backtester, walk-forward split, calibration and reliability, JSONL/CSV import.                                                                                                  |
+| `app/lib/replay.ts`          | Replay backtester, daily/market-level walk-forward splits, calibration and reliability, JSONL/CSV import.                                                                              |
+| `app/lib/evidence-report.ts` | Paired market-cluster bootstrap intervals, reliability bins, and conservative G1–G6 evaluation.                                                                                        |
 | `app/lib/live-risk.ts`       | Live Kelly sizing, balance parsing, Data API position parsing, portfolio risk checks.                                                                                                  |
 | `app/lib/decision-ledger.ts` | Per-market ledger graded on the first entry, with a fixed 120 s calibration checkpoint.                                                                                                |
 | `app/api/polymarket/*`       | `live` (read-only account actions and cancel-all; new order submission is hard-disabled), `account` (read-only account data), `reference` (official price proxy).                      |
@@ -47,6 +48,7 @@ One engine, three hosts: the browser dashboard, the headless Node runner, and th
 | `scripts/recording-store.ts` | Daily SQLite files for raw messages, venue ticks, snapshots, decisions, paper fills, events, resolutions and official prices; gzip rotation.                                           |
 | `scripts/venue-feeds.ts`     | Binance, Bybit and OKX spot/perpetual trade WebSockets captured alongside the Polymarket and Coinbase streams.                                                                         |
 | `scripts/backfill.ts`        | Backfills official outcomes from Gamma and open/close prices into plain or compressed SQLite recordings.                                                                               |
+| `scripts/nightly-report.ts`  | Writes walk-forward evidence reports to `data/reports/` and sends a Telegram summary when configured.                                                                                  |
 | `scripts/replay.ts`          | CLI replay and walk-forward over JSONL or SQLite recordings.                                                                                                                           |
 
 ## State and persistence

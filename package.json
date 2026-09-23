@@ -18,7 +18,8 @@
     "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm test",
     "headless": "node --import tsx scripts/headless.ts",
     "replay": "node --import tsx scripts/replay.ts",
-    "backfill": "node --import tsx scripts/backfill.ts"
+    "backfill": "node --import tsx scripts/backfill.ts",
+    "report": "node --import tsx scripts/nightly-report.ts"
   },
   "dependencies": {
     "@polymarket/clob-client-v2": "1.1.0",

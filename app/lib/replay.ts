@@ -77,6 +77,8 @@ export type ReplayReport = {
   dailySharpe: number | null;
   equityCurve: { timestamp: number; equity: number }[];
   calibration: { model: ScoreSet; posterior: ScoreSet; market: ScoreSet; reliability: ReliabilityBin[]; rows: number };
+  /** Per-checkpoint rows are preserved so audits can bootstrap paired scores by market. */
+  calibrationRows: CalibrationRow[];
   byAsset: Record<string, { trades: number; pnl: number }>;
   byDuration: Record<string, { trades: number; pnl: number }>;
   byHourUtc: Record<string, { trades: number; pnl: number }>;
@@ -293,11 +295,78 @@ export const runReplay = (input: MarketSnapshot[], outcomes: Map<string, Side>, 
       reliability: reliability(rowsFor("model")),
       rows: calibrationRows.length,
     },
+    calibrationRows,
     byAsset,
     byDuration,
     byHourUtc,
     tradesNeededForSignificance: avgRealizedEdge !== null && avgRealizedEdge > 0 && edgeSd ? Math.ceil(((1.96 * edgeSd) / avgRealizedEdge) ** 2) : null,
   };
+};
+
+export type WalkForwardFold = {
+  dayStart: number;
+  trainMarkets: number;
+  testMarkets: number;
+  testDays: number;
+  testResolvedMarkets: number;
+  chosen: Partial<SignalParams> | null;
+  train: ReplayReport | null;
+  test: ReplayReport | null;
+  candidates: { params: Partial<SignalParams>; trades: number; evPerTrade: number | null }[];
+};
+
+const utcDayStart = (timestamp: number) => {
+  const date = new Date(timestamp);
+  date.setUTCHours(0, 0, 0, 0);
+  return date.getTime();
+};
+
+/**
+ * Expanding walk-forward by UTC day. Each candidate is fitted only on markets
+ * that started before the test day's midnight; each test day is excluded from
+ * its own fit and appears in exactly one out-of-sample fold.
+ */
+export const walkForwardByDay = (
+  snapshots: MarketSnapshot[],
+  outcomes: Map<string, Side>,
+  grid: Partial<SignalParams>[],
+  options: Partial<ReplayOptions> = {},
+  minTrainTrades = 30,
+): WalkForwardFold[] => {
+  const config = { ...DEFAULT_REPLAY_OPTIONS, ...options };
+  const days = [...new Set(snapshots.map((snapshot) => utcDayStart(snapshot.startTime)))].sort((left, right) => left - right);
+  const folds: WalkForwardFold[] = [];
+  for (let index = 1; index < days.length; index += 1) {
+    const dayStart = days[index];
+    const trainSnapshots = snapshots.filter((snapshot) => snapshot.startTime < dayStart);
+    const testSnapshots = snapshots.filter((snapshot) => utcDayStart(snapshot.startTime) === dayStart);
+    const trainMarketIds = new Set(trainSnapshots.map((snapshot) => snapshot.marketId));
+    const testMarketIds = new Set(testSnapshots.map((snapshot) => snapshot.marketId));
+    const testResolvedMarkets = [...testMarketIds].filter((marketId) => outcomes.has(marketId)).length;
+    const candidates = grid.map((params) => ({
+      params,
+      report: runReplay(trainSnapshots, outcomes, { ...config, params: { ...config.params, ...params } }),
+    }));
+    const chosen = candidates
+      .filter((candidate) => candidate.report.settled >= minTrainTrades)
+      .sort((left, right) => (right.report.evPerTrade ?? -Infinity) - (left.report.evPerTrade ?? -Infinity))[0];
+    folds.push({
+      dayStart,
+      trainMarkets: trainMarketIds.size,
+      testMarkets: testMarketIds.size,
+      testDays: new Set(testSnapshots.map((snapshot) => new Date(snapshot.startTime).toISOString().slice(0, 10))).size,
+      testResolvedMarkets,
+      chosen: chosen?.params ?? null,
+      train: chosen?.report ?? null,
+      test: chosen ? runReplay(testSnapshots, outcomes, { ...config, params: { ...config.params, ...chosen.params } }) : null,
+      candidates: candidates.map((candidate) => ({
+        params: candidate.params,
+        trades: candidate.report.settled,
+        evPerTrade: candidate.report.evPerTrade,
+      })),
+    });
+  }
+  return folds;
 };
 
 /** Tune on the earliest `trainFraction` of markets and report untouched out-of-sample results. */

@@ -12,7 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { accountEquity, createPaperAccount, migratePaperAccount } from "../app/lib/engines";
+import { accountEquity, createPaperAccount, haltState, migratePaperAccount } from "../app/lib/engines";
 import { MarketFeedController } from "../app/lib/market-feed";
 import { createEngineState, normalizePaperConfig, stepPaperEngine, type PaperEngineState } from "../app/lib/paper-engine";
 import { fetchOfficialPrice, officialKey, snapshotFromLiveMarket, type OfficialPrice } from "../app/lib/polymarket-data";
@@ -116,6 +116,9 @@ const knownOfficialPrices = new Map<string, string>();
 let lastRecord = 0;
 let lastPersist = 0;
 let lastStatus = 0;
+let lastStatusResyncs = 0;
+let lastHealthAlertAt = 0;
+let lastHealthAlertKey = "";
 const startedAt = Date.now();
 
 const tick = () => {
@@ -132,6 +135,19 @@ const tick = () => {
   state = step.state;
   if (recorder) {
     for (const [marketId, signal] of step.decisions) recorder.recordDecision(marketId, now, signal);
+    for (const [marketId, signal] of step.decisions) {
+      const market = controller.markets.get(marketId);
+      const remainingSeconds = market ? (market.endTime - now) / 1000 : Infinity;
+      if (remainingSeconds <= 75 && remainingSeconds > 45 && signal.pUpPosterior !== null && signal.pUpMarket !== null) {
+        recorder.recordCalibrationCheckpoint({
+          marketId,
+          at: now,
+          remainingSeconds,
+          posteriorProbability: signal.pUpPosterior,
+          bookProbability: signal.pUpMarket,
+        });
+      }
+    }
     for (const fill of state.account.fills) {
       if (knownFills.has(fill.id)) continue;
       recorder.recordPaperFill(fill);
@@ -189,23 +205,74 @@ const tick = () => {
     const feeds = Object.fromEntries(
       [...controller.feeds.keys()].map((asset) => {
         const feed = controller.derived(asset, now);
+        const ageMs = feed.spotTimestamp === null ? null : Math.max(0, now - feed.spotTimestamp);
         return [
           asset,
-          `${feed.spotSource}${feed.basisBps === null ? "" : ` basis ${feed.basisBps.toFixed(1)}bp`}${feed.sigmaPerSqrtSecond ? ` vol ${(feed.sigmaPerSqrtSecond * Math.sqrt(60) * 10_000).toFixed(1)}bp/min` : ""}`,
+          {
+            status: ageMs === null ? "MISSING" : ageMs > 10_000 ? "STALE" : "LIVE",
+            ageMs,
+            source: feed.spotSource,
+            basisBps: feed.basisBps,
+            volBpPerMinute: feed.sigmaPerSqrtSecond ? feed.sigmaPerSqrtSecond * Math.sqrt(60) * 10_000 : null,
+          },
         ];
       }),
     );
+    const staleFeeds = Object.entries(feeds)
+      .filter(([, feed]) => feed.status !== "LIVE")
+      .map(([asset]) => asset);
+    const activeMarkets = [...controller.markets.values()].filter((market) => market.startTime <= now && market.endTime > now);
+    const staleBooks = activeMarkets.filter((market) => {
+      const timestamps = [market.upBook?.timestamp, market.downBook?.timestamp].filter(
+        (timestamp): timestamp is number => timestamp !== null && timestamp !== undefined,
+      );
+      return timestamps.length < 2 || timestamps.some((timestamp) => now - timestamp > 15_000);
+    }).length;
+    const resyncsLastMinute = Math.max(0, controller.status.bookResyncs - lastStatusResyncs);
+    lastStatusResyncs = controller.status.bookResyncs;
+    const equity = accountEquity(state.account, controller.markets);
+    const dailyPnlUsd = equity - state.account.dayStartEquity;
+    const risk = haltState(state.account, equity, { dailyLossPct: config.dailyLossPct, maxDrawdownPct: config.maxDrawdownPct });
+    const calibrationWindow = recorder?.rollingCalibration(500) ?? {
+      markets: 0,
+      posteriorBrier: null,
+      bookBrier: null,
+      brierDifferencePosteriorMinusBook: null,
+    };
+    const healthAlerts = [
+      staleFeeds.length ? `stale feeds: ${staleFeeds.join(", ")}` : "",
+      staleBooks > 0 ? `stale books: ${staleBooks}/${activeMarkets.length}` : "",
+      resyncsLastMinute >= 10 ? `book resyncs: ${resyncsLastMinute}/min` : "",
+      dailyPnlUsd <= -state.account.dayStartEquity * 0.03 ? `daily paper P&L: $${dailyPnlUsd.toFixed(2)}` : "",
+      risk.halted || state.halt ? `halt: ${state.halt?.reason ?? risk.reason}` : "",
+      calibrationWindow.markets >= 500 && (calibrationWindow.brierDifferencePosteriorMinusBook ?? 0) > 0.01
+        ? `rolling-500 posterior Brier trails book by ${(calibrationWindow.brierDifferencePosteriorMinusBook! * 100).toFixed(2)}pt`
+        : "",
+    ].filter(Boolean);
+    const healthAlertKey = healthAlerts.join("; ");
+    if (healthAlertKey && (healthAlertKey !== lastHealthAlertKey || now - lastHealthAlertAt >= 15 * 60_000)) {
+      lastHealthAlertKey = healthAlertKey;
+      lastHealthAlertAt = now;
+      void telegram(`Health alert\n${healthAlertKey}`);
+    } else if (!healthAlertKey) {
+      lastHealthAlertKey = "";
+    }
     log("status", {
       markets: controller.markets.size,
       sockets: `${controller.status.clob}/${controller.status.rtds}/${controller.status.coinbase}`,
       resyncs: controller.status.bookResyncs,
-      equity: accountEquity(state.account, controller.markets).toFixed(2),
+      resyncsLastMinute,
+      staleBooks: `${staleBooks}/${activeMarkets.length}`,
+      equity: equity.toFixed(2),
+      dailyPnlUsd: dailyPnlUsd.toFixed(2),
+      dailyPnlPct: (risk.dailyPnlPct * 100).toFixed(2),
       positions: state.account.positions.length,
       pending: state.pending.length,
       halted: state.halt?.reason ?? null,
       entries,
       passGates: passCounts,
       feeds,
+      rollingCalibration500: calibrationWindow,
     });
   }
   if (minutes > 0 && now - startedAt >= minutes * 60_000) void shutdown();

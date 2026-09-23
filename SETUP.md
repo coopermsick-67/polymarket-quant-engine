@@ -8,6 +8,7 @@ pnpm run check        # typecheck + lint + prettier + tests
 pnpm run dev          # dashboard
 pnpm run headless -- --auto            # 24/7 paper/shadow engine and SQLite recorder, no browser
 pnpm run backfill -- --data-dir data   # fill official outcomes and boundary prices into recordings
+pnpm run report -- --data-dir data     # daily OOS calibration, edge/markout CIs, and gate status
 pnpm run replay -- data/recordings/recording-YYYY-MM-DD.sqlite.gz --walk-forward
 ```
 
@@ -29,3 +30,5 @@ Generate secrets with `node -e "console.log(require('crypto').randomBytes(32).to
 The API rejects new buys and sells with HTTP 423. Linking a wallet, viewing balances and positions, and cancelling open orders remain available. Do not set up this app to place real orders: the current measured strategy loses to the book and the CLOB order path has not passed integration or canary tests.
 
 Keep the headless runner recording continuously. Data is stored under `data/recordings/` in daily SQLite databases; closed days are gzip-compressed. Backfill official market outcomes and prices with `pnpm run backfill -- --data-dir data`. Review `STRATEGY.md` for the current G1–G6 counts and results. All six gates are required before enabling any real-money mode; at least 7 days and 3,000 resolved markets are required before promoting B or C research.
+
+Run `pnpm run report -- --data-dir data` nightly (for example, from the same host's scheduler). It writes Markdown and JSON to `data/reports/`, uses expanding daily walk-forward fits, clusters bootstrap intervals by market, and never treats dry-run/canary gates as passed. Telegram delivery uses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` when configured.

@@ -23,6 +23,7 @@ pnpm run check                               # typecheck, lint, prettier, 81 tes
 pnpm run dev                                 # dashboard
 pnpm run headless -- --auto                  # paper engine + daily SQLite recorder, no browser
 pnpm run backfill -- --data-dir data         # official outcomes and open/close prices
+pnpm run report -- --data-dir data           # walk-forward report, CIs, gates, optional Telegram
 pnpm run replay -- data/recordings/recording-*.sqlite* --walk-forward
 ```
 
