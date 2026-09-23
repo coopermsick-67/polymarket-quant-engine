@@ -176,7 +176,7 @@ test("dashboard renders markets and explicit live evidence gates without page er
     await page.getByRole("tab", { name: "Live executor" }).click();
     await page.getByRole("heading", { name: "Live order submission is disabled" }).waitFor();
     await page.getByText("out-of-sample strategy and execution safety evidence gates pass").waitFor();
-    await page.getByText("DISABLED", { exact: true }).waitFor();
+    assert.match(await page.locator(".live-executor").innerText(), /Buys and sells remain blocked/i);
     assert.equal(await page.getByRole("button", { name: /START LIVE|RUNNING/ }).count(), 0);
     assert.deepEqual(pageErrors, []);
   } finally {
