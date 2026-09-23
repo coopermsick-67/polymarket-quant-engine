@@ -17,6 +17,7 @@ import { MarketFeedController } from "../app/lib/market-feed";
 import { createEngineState, normalizePaperConfig, stepPaperEngine, type PaperEngineState } from "../app/lib/paper-engine";
 import { fetchOfficialPrice, officialKey, snapshotFromLiveMarket, type OfficialPrice } from "../app/lib/polymarket-data";
 import { RecordingStore } from "./recording-store";
+import { writeRunnerHeartbeat, type RunnerHeartbeat } from "./runner-health";
 import { VenueFeedRecorder } from "./venue-feeds";
 
 const args = process.argv.slice(2);
@@ -33,6 +34,7 @@ const autoTrade = flag("auto");
 const recording = !flag("no-record");
 mkdirSync(dataDir, { recursive: true });
 const statePath = join(dataDir, "paper-state.json");
+const heartbeatPath = join(dataDir, "runner-heartbeat.json");
 const recorder = recording ? await RecordingStore.open(dataDir) : null;
 
 const config = normalizePaperConfig({ latencyMs: Number(option("latency", "750")) });
@@ -120,6 +122,39 @@ let lastStatusResyncs = 0;
 let lastHealthAlertAt = 0;
 let lastHealthAlertKey = "";
 const startedAt = Date.now();
+let lastTickAt: number | null = null;
+let lastTickDurationMs: number | null = null;
+let lastHeartbeatWriteAt = 0;
+
+const writeHeartbeat = (heartbeatState: RunnerHeartbeat["state"], at = Date.now()) => {
+  const heartbeat: RunnerHeartbeat = {
+    version: 1,
+    pid: process.pid,
+    startedAt,
+    heartbeatAt: at,
+    lastTickAt,
+    lastTickDurationMs,
+    state: heartbeatState,
+    markets: controller.markets.size,
+    feeds: {
+      polymarket: {
+        clob: controller.status.clob,
+        rtds: controller.status.rtds,
+        coinbase: controller.status.coinbase,
+        lastMessageAt: controller.status.lastMessageAt,
+        lastRestAt: controller.status.lastRestAt,
+        lastError: controller.status.lastError,
+      },
+      venues: venueFeeds?.health(at) ?? {},
+    },
+  };
+  try {
+    writeRunnerHeartbeat(heartbeatPath, heartbeat);
+    lastHeartbeatWriteAt = at;
+  } catch (error) {
+    console.error("Could not update runner heartbeat:", error instanceof Error ? error.message : String(error));
+  }
+};
 
 const tick = () => {
   const now = Date.now();
@@ -275,22 +310,33 @@ const tick = () => {
       rollingCalibration500: calibrationWindow,
     });
   }
+  const completedAt = Date.now();
+  lastTickAt = completedAt;
+  lastTickDurationMs = completedAt - now;
+  if (completedAt - lastHeartbeatWriteAt >= 5_000) writeHeartbeat("running", completedAt);
   if (minutes > 0 && now - startedAt >= minutes * 60_000) void shutdown();
 };
 
 let loop: ReturnType<typeof setInterval> | null = null;
 let shuttingDown = false;
-const shutdown = async () => {
+const shutdown = async (exitCode = 0) => {
   if (shuttingDown) return;
   shuttingDown = true;
   if (loop) clearInterval(loop);
-  controller.stop();
-  venueFeeds?.stop();
-  persist();
-  recorder?.close();
-  await recorder?.waitForCompression();
-  console.log("Stopped; state saved to", statePath);
-  process.exit(0);
+  writeHeartbeat("stopping");
+  try {
+    controller.stop();
+    venueFeeds?.stop();
+    persist();
+    recorder?.close();
+    await recorder?.waitForCompression();
+    writeHeartbeat("stopped");
+    console.log("Stopped; state saved to", statePath);
+  } catch (error) {
+    console.error("Error while stopping the paper runner:", error instanceof Error ? error.message : String(error));
+    exitCode = 1;
+  }
+  process.exit(exitCode);
 };
 process.on("SIGINT", () => void shutdown());
 // Persist state before dying on an unexpected error; the supervisor restarts the process.
@@ -300,9 +346,13 @@ process.on("uncaughtException", (error) => {
   } catch {
     console.error(error);
   }
-  void shutdown();
+  void shutdown(1);
 });
 process.on("SIGTERM", () => void shutdown());
+process.on("unhandledRejection", (error) => {
+  console.error("Unhandled rejection in the paper runner:", error instanceof Error ? (error.stack ?? error.message) : String(error));
+  void shutdown(1);
+});
 
 log("start", {
   autoTrade,
@@ -313,4 +363,13 @@ log("start", {
 });
 controller.start();
 venueFeeds?.start();
-loop = setInterval(tick, 1_000);
+writeHeartbeat("starting");
+loop = setInterval(() => {
+  if (shuttingDown) return;
+  try {
+    tick();
+  } catch (error) {
+    console.error("Paper loop failed:", error instanceof Error ? (error.stack ?? error.message) : String(error));
+    void shutdown(1);
+  }
+}, 1_000);

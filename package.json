@@ -18,6 +18,8 @@
     "format:check": "prettier --check \"app/**/*.{ts,tsx}\" \"scripts/*.ts\" \"tests/**/*.ts\"",
     "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm test",
     "headless": "node --import tsx scripts/headless.ts",
+    "headless:supervised": "node --import tsx scripts/headless-supervisor.ts",
+    "runner:status": "node --import tsx scripts/runner-status.ts",
     "replay": "node --import tsx scripts/replay.ts",
     "backfill": "node --import tsx scripts/backfill.ts",
     "report": "node --import tsx scripts/nightly-report.ts"

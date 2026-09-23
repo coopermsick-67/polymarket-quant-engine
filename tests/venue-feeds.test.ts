@@ -24,6 +24,10 @@ class FakeSocket {
     this.onclose?.({});
   }
 
+  fail() {
+    this.onerror?.({});
+  }
+
   open() {
     this.readyState = 1;
     this.onopen?.({});
@@ -72,7 +76,27 @@ describe("secondary exchange recorder", () => {
       ticks.map((tick) => [tick.venue, tick.marketType, tick.asset, tick.price]),
       [["bybit", "spot", "BTC", 64_000]],
     );
+    assert.equal(feed.health(Date.now())["bybit:spot"].messages, 1);
+    assert.equal(feed.health(Date.now())["bybit:spot"].parsedTicks, 1);
+    assert.equal(feed.health(Date.now() + 61_000)["binance:spot"].status, "STALE");
     feed.stop();
     assert.ok(FakeSocket.instances.every((socket) => socket.readyState === 3));
+  });
+
+  it("closes a failed socket and schedules reconnection instead of leaving it stuck", () => {
+    FakeSocket.instances = [];
+    const feed = new VenueFeedRecorder({
+      WebSocketImpl: FakeSocket,
+      onRaw: () => undefined,
+      onTick: () => undefined,
+    });
+    feed.start();
+    const socket = FakeSocket.instances[0];
+    socket.open();
+    socket.fail();
+    assert.equal(socket.readyState, 3);
+    assert.equal(feed.health()["binance:spot"].status, "DOWN");
+    assert.equal(feed.health()["binance:spot"].lastError, "websocket error");
+    feed.stop();
   });
 });

@@ -32,6 +32,16 @@ export type VenueFeedOptions = {
   onStatus?: (source: VenueSource, status: "CONNECTING" | "LIVE" | "DOWN", detail?: string) => void;
 };
 
+export type VenueConnectionHealth = {
+  status: "CONNECTING" | "LIVE" | "STALE" | "DOWN";
+  lastMessageAt: number | null;
+  lastMessageAgeMs: number | null;
+  messages: number;
+  parsedTicks: number;
+  reconnectAttempt: number;
+  lastError: string | null;
+};
+
 const cleanAsset = (symbol: string) =>
   symbol
     .toUpperCase()
@@ -126,7 +136,14 @@ type Connection = {
   socket: SocketLike | null;
   retryTimer: ReturnType<typeof setTimeout> | null;
   heartbeatTimer: ReturnType<typeof setInterval> | null;
+  watchdogTimer: ReturnType<typeof setInterval> | null;
   attempt: number;
+  connectedAt: number | null;
+  lastMessageAt: number | null;
+  messages: number;
+  parsedTicks: number;
+  status: "CONNECTING" | "LIVE" | "DOWN";
+  lastError: string | null;
 };
 
 export class VenueFeedRecorder {
@@ -139,7 +156,20 @@ export class VenueFeedRecorder {
     if (!WebSocketImpl) throw new Error("This Node runtime does not provide WebSocket support.");
     this.Socket = WebSocketImpl;
     const assets = options.assets ?? RECORDED_ASSETS;
-    this.connections = makeSpecs(assets).map((spec) => ({ spec, socket: null, retryTimer: null, heartbeatTimer: null, attempt: 0 }));
+    this.connections = makeSpecs(assets).map((spec) => ({
+      spec,
+      socket: null,
+      retryTimer: null,
+      heartbeatTimer: null,
+      watchdogTimer: null,
+      attempt: 0,
+      connectedAt: null,
+      lastMessageAt: null,
+      messages: 0,
+      parsedTicks: 0,
+      status: "DOWN",
+      lastError: null,
+    }));
   }
 
   start() {
@@ -153,39 +183,90 @@ export class VenueFeedRecorder {
     for (const connection of this.connections) {
       if (connection.retryTimer) clearTimeout(connection.retryTimer);
       if (connection.heartbeatTimer) clearInterval(connection.heartbeatTimer);
+      if (connection.watchdogTimer) clearInterval(connection.watchdogTimer);
       connection.retryTimer = null;
       connection.heartbeatTimer = null;
+      connection.watchdogTimer = null;
       if (connection.socket) {
         connection.socket.onclose = null;
         connection.socket.close();
         connection.socket = null;
       }
       this.options.onStatus?.(connection.spec.source, "DOWN", "stopped");
+      connection.status = "DOWN";
     }
+  }
+
+  health(now = Date.now()): Record<string, VenueConnectionHealth> {
+    return Object.fromEntries(
+      this.connections.map((connection) => {
+        const lastMessageAt = connection.lastMessageAt ?? connection.connectedAt;
+        const lastMessageAgeMs = lastMessageAt === null ? null : Math.max(0, now - lastMessageAt);
+        const isOpen = connection.socket?.readyState === 1;
+        const status =
+          connection.status !== "LIVE" || !isOpen
+            ? connection.status === "CONNECTING"
+              ? "CONNECTING"
+              : "DOWN"
+            : lastMessageAgeMs !== null && lastMessageAgeMs > 60_000
+              ? "STALE"
+              : "LIVE";
+        return [
+          connection.spec.source,
+          {
+            status,
+            lastMessageAt: connection.lastMessageAt,
+            lastMessageAgeMs,
+            messages: connection.messages,
+            parsedTicks: connection.parsedTicks,
+            reconnectAttempt: connection.attempt,
+            lastError: connection.lastError,
+          },
+        ];
+      }),
+    );
   }
 
   private connect(connection: Connection) {
     if (this.stopped) return;
     const { spec } = connection;
     this.options.onStatus?.(spec.source, "CONNECTING");
+    connection.status = "CONNECTING";
     try {
       const socket = new this.Socket(spec.url);
       connection.socket = socket;
       socket.onopen = () => {
-        connection.attempt = 0;
+        connection.connectedAt = Date.now();
+        connection.lastMessageAt = null;
+        connection.lastError = null;
+        connection.status = "LIVE";
         this.options.onStatus?.(spec.source, "LIVE");
         if (spec.subscribe) socket.send(spec.subscribe);
         if (spec.heartbeat && spec.heartbeatMs) {
           connection.heartbeatTimer = setInterval(() => {
-            if (socket.readyState === 1) socket.send(spec.heartbeat!);
+            if (socket.readyState !== 1) return;
+            try {
+              socket.send(spec.heartbeat!);
+            } catch (error) {
+              this.failConnection(connection, error instanceof Error ? error.message : String(error));
+            }
           }, spec.heartbeatMs);
         }
+        connection.watchdogTimer = setInterval(() => {
+          const lastActivityAt = connection.lastMessageAt ?? connection.connectedAt;
+          if (lastActivityAt !== null && Date.now() - lastActivityAt > 60_000) {
+            this.failConnection(connection, "no websocket messages for 60 seconds");
+          }
+        }, 15_000);
       };
       socket.onmessage = (event) => {
         const data =
           typeof event.data === "string" ? event.data : event.data instanceof ArrayBuffer ? Buffer.from(event.data).toString("utf8") : String(event.data);
         const receivedAt = Date.now();
+        connection.lastMessageAt = receivedAt;
+        connection.messages += 1;
         const ticks = parseVenueTicks(spec.source, data, receivedAt);
+        connection.parsedTicks += ticks.length;
         this.options.onRaw({
           receivedAt,
           source: spec.source,
@@ -196,18 +277,49 @@ export class VenueFeedRecorder {
         });
         for (const tick of ticks) this.options.onTick(tick);
       };
-      socket.onerror = () => this.options.onStatus?.(spec.source, "DOWN", "websocket error");
+      socket.onerror = () => this.failConnection(connection, "websocket error");
       socket.onclose = () => {
+        const connectedFor = connection.connectedAt === null ? 0 : Date.now() - connection.connectedAt;
+        if (connectedFor >= 60_000) connection.attempt = 0;
         if (connection.heartbeatTimer) clearInterval(connection.heartbeatTimer);
+        if (connection.watchdogTimer) clearInterval(connection.watchdogTimer);
         connection.heartbeatTimer = null;
+        connection.watchdogTimer = null;
         connection.socket = null;
+        connection.connectedAt = null;
+        connection.status = "DOWN";
         this.options.onStatus?.(spec.source, "DOWN", "websocket closed");
         this.scheduleReconnect(connection);
       };
     } catch (error) {
+      connection.status = "DOWN";
+      connection.lastError = error instanceof Error ? error.message : String(error);
       this.options.onStatus?.(spec.source, "DOWN", error instanceof Error ? error.message : String(error));
       this.scheduleReconnect(connection);
     }
+  }
+
+  private failConnection(connection: Connection, detail: string) {
+    if (this.stopped || connection.status === "DOWN") return;
+    connection.status = "DOWN";
+    connection.lastError = detail;
+    this.options.onStatus?.(connection.spec.source, "DOWN", detail);
+    if (connection.heartbeatTimer) clearInterval(connection.heartbeatTimer);
+    if (connection.watchdogTimer) clearInterval(connection.watchdogTimer);
+    connection.heartbeatTimer = null;
+    connection.watchdogTimer = null;
+    const socket = connection.socket;
+    connection.socket = null;
+    connection.connectedAt = null;
+    if (socket) {
+      socket.onclose = null;
+      try {
+        socket.close();
+      } catch {
+        // Reconnect even when a failing socket refuses to close cleanly.
+      }
+    }
+    this.scheduleReconnect(connection);
   }
 
   private scheduleReconnect(connection: Connection) {
