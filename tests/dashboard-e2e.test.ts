@@ -8,7 +8,8 @@ import { test } from "node:test";
 import { chromium, type Page, type Route } from "playwright";
 
 const runBrowserTest = process.env.RUN_DASHBOARD_E2E === "1";
-const origin = "http://127.0.0.1:5173";
+const port = 5_187;
+const origin = `http://127.0.0.1:${port}`;
 const fixtureUrl = new URL("./fixtures/gamma-open-markets.json", import.meta.url);
 
 const makeOpenMarkets = async () => {
@@ -123,7 +124,7 @@ const installSocketStub = async (page: Page) =>
   });
 
 const startDevServer = () =>
-  spawn(process.execPath, ["scripts/run-framework.mjs", "dev", "--host", "127.0.0.1"], {
+  spawn(process.execPath, ["scripts/run-framework.mjs", "dev", "--host", "127.0.0.1", "--port", String(port)], {
     cwd: process.cwd(),
     env: { ...process.env, CI: "1" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -137,7 +138,7 @@ const waitForDevServer = async (server: ChildProcess) => {
   while (Date.now() < deadline) {
     if (server.exitCode !== null) throw new Error(`Dashboard server exited early:\n${output.join("").slice(-6000)}`);
     const status = await new Promise<number>((resolve) => {
-      const request = httpRequest(origin, { timeout: 1_000 }, (response) => {
+      const request = httpRequest(origin, { agent: false, timeout: 1_000 }, (response) => {
         response.resume();
         resolve(response.statusCode ?? 0);
       });
