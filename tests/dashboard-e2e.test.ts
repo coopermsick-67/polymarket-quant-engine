@@ -87,36 +87,6 @@ const relayRequest = async (route: Route, markets: Record<string, unknown>[]) =>
   await route.continue();
 };
 
-const installSocketStub = (page: Page) =>
-  page.addInitScript(`
-    class FixtureWebSocket {
-      static CONNECTING = 0;
-      static OPEN = 1;
-      static CLOSING = 2;
-      static CLOSED = 3;
-      constructor(url) {
-        this.url = url;
-        this.readyState = FixtureWebSocket.CONNECTING;
-        this.onopen = null;
-        this.onmessage = null;
-        this.onerror = null;
-        this.onclose = null;
-        window.setTimeout(() => {
-          if (this.readyState !== FixtureWebSocket.CONNECTING) return;
-          this.readyState = FixtureWebSocket.OPEN;
-          this.onopen?.(new Event("open"));
-        }, 0);
-      }
-      send(data) { void data; }
-      close() {
-        if (this.readyState === FixtureWebSocket.CLOSED) return;
-        this.readyState = FixtureWebSocket.CLOSED;
-        this.onclose?.(new CloseEvent("close"));
-      }
-    }
-    Object.defineProperty(window, "WebSocket", { configurable: true, writable: true, value: FixtureWebSocket });
-  `);
-
 const startDevServer = () =>
   spawn(process.execPath, ["scripts/run-framework.mjs", "dev", "--host", "127.0.0.1", "--port", String(port)], {
     cwd: process.cwd(),
@@ -159,7 +129,7 @@ test("dashboard renders markets and explicit live evidence gates without page er
     const page = await browser.newPage();
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.message));
-    await installSocketStub(page);
+    await page.routeWebSocket(/^wss:\/\//, (socket) => socket.onMessage(() => undefined));
     await page.route("**/*", (route) => relayRequest(route, markets));
     await page.goto(origin, { waitUntil: "domcontentloaded" });
 
