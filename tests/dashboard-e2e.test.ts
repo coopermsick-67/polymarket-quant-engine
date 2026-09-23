@@ -14,7 +14,7 @@ const fixtureUrl = new URL("./fixtures/gamma-open-markets.json", import.meta.url
 
 const makeOpenMarkets = async () => {
   const input = JSON.parse(await readFile(fixtureUrl, "utf8")) as { markets: Record<string, unknown>[] };
-  const start = Math.floor(Date.now() / 300_000) * 300_000;
+  const start = Math.floor((Date.now() - 60_000) / 1_000) * 1_000;
   return input.markets.slice(0, 3).map((market, index) => {
     const slug = String(market.slug).replace(/-\d{10}$/, `-${Math.floor(start / 1000)}`);
     const duration = slug.includes("-15m-") ? 900_000 : 300_000;
