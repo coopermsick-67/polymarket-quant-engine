@@ -1,0 +1,23 @@
+[Unit]
+Description=Polymarket Quant Engine nightly backfill and evidence report
+After=network-online.target pqe-paper.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pqe
+Group=pqe
+WorkingDirectory=/opt/polymarket-quant-engine
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=TZ=UTC
+Environment=PQE_DATA_DIR=/var/lib/pqe
+EnvironmentFile=-/etc/pqe-paper.env
+ExecStart=/usr/bin/env bash scripts/nightly-job.sh
+UMask=0077
+StateDirectory=pqe
+StateDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pqe

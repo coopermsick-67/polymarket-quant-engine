@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
-import { chromium, type Page, type Route } from "playwright";
+import { chromium, type Route } from "playwright";
 
 const runBrowserTest = process.env.RUN_DASHBOARD_E2E === "1";
 const port = 5_187;

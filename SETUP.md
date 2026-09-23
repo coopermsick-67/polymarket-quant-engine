@@ -6,7 +6,8 @@ Requirements: Node.js 22.13+ and pnpm 11.25.0 (`corepack enable && corepack prep
 pnpm install
 pnpm run check        # typecheck + lint + prettier + tests
 pnpm run dev          # dashboard
-pnpm run headless -- --auto            # 24/7 paper/shadow engine and SQLite recorder, no browser
+pnpm run headless:supervised           # paper/shadow engine, SQLite recorder, heartbeat watchdog
+pnpm run runner:status                 # check process heartbeat and core feed health
 pnpm run backfill -- --data-dir data   # fill official outcomes and boundary prices into recordings
 pnpm run report -- --data-dir data     # daily OOS calibration, edge/markout CIs, and gate status
 pnpm run replay -- data/recordings/recording-YYYY-MM-DD.sqlite.gz --walk-forward
@@ -36,3 +37,22 @@ The API rejects new buys and sells with HTTP 423. Linking a wallet, viewing bala
 Keep the headless runner recording continuously. Data is stored under `data/recordings/` in daily SQLite databases; closed days are gzip-compressed. Backfill official market outcomes and prices with `pnpm run backfill -- --data-dir data`. Review `STRATEGY.md` for the current G1–G6 counts and results. All six gates are required before enabling any real-money mode; at least 7 days and 3,000 resolved markets are required before promoting B or C research.
 
 Run `pnpm run report -- --data-dir data` nightly (for example, from the same host's scheduler). It writes Markdown and JSON to `data/reports/`, uses expanding daily walk-forward fits, clusters bootstrap intervals by market, and never treats dry-run/canary gates as passed. Telegram delivery uses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` when configured.
+
+## Unattended 24/7 paper recording (Linux)
+
+The Node runner needs persistent local disk for SQLite and long-lived outbound WebSockets. Deploy it on an always-on Linux host; the Cloudflare dashboard deployment does not keep this Node process alive. The supervisor restarts a crashed process, checks `data/runner-heartbeat.json`, and terminates/restarts the child if heartbeat writes or one-second paper ticks stop for 30 seconds. Startup has a 90-second grace period, and repeated failures back off up to 30 seconds. The heartbeat includes feed connection state and age so a live process with disconnected feeds is visible as degraded.
+
+The checked-in unit assumes the repository is at `/opt/polymarket-quant-engine`, the service account is `pqe`, and Node/Corepack/pnpm are on `/usr/local/bin:/usr/bin:/bin`. Adjust those paths to the host's installation. Then install and start it:
+
+```bash
+sudo useradd --system --create-home --home-dir /var/lib/pqe --shell /usr/sbin/nologin pqe
+sudo install -d -o pqe -g pqe /opt/polymarket-quant-engine /var/lib/pqe
+sudo cp deploy/systemd/pqe-paper.service deploy/systemd/pqe-nightly.service deploy/systemd/pqe-nightly.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pqe-paper.service pqe-nightly.timer
+systemctl status pqe-paper.service
+pnpm run runner:status -- --data-dir /var/lib/pqe
+journalctl -u pqe-paper.service -f
+```
+
+Install the checkout and dependencies in `/opt/polymarket-quant-engine` before starting the service. Optional Telegram variables can be placed in `/etc/pqe-paper.env` with root-only permissions. This runner needs no Polymarket private key and never submits live orders. The nightly timer backfills official market data and writes evidence reports under `/var/lib/pqe/reports/`. A heartbeat only proves the local process loop is alive; it does not prove feed completeness, edge, or any evidence gate.
