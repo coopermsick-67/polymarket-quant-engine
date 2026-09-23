@@ -1,36 +1,32 @@
-export type Horizon = "5m" | "15m";
-export type Asset = string;
+// Market discovery, order books, official references, resolutions, and
+// exchange candles. Everything a signal needs is carried on `LiveMarket`, and
+// `snapshotFromLiveMarket` converts it into the pure `MarketSnapshot` the
+// decision function consumes.
 
-export type BookLevel = {
-  price: number;
-  size: number;
-};
+import { z } from "zod";
+import { clamp, epochMs, finiteNumber, jsonArray, text } from "./num";
+import type { DerivedFeed } from "./feeds";
+import { DEFAULT_FEE_SCHEDULE, type Candle, type FeeSchedule, type PriceTick } from "./pricing";
+import type { BookLevel, Horizon, MarketSnapshot, ReferenceSource, Side } from "./signal";
+
+export type { BookLevel, Horizon } from "./signal";
+export type Asset = string;
+export type MarketCandle = Candle;
+export type MarketPriceTick = PriceTick;
 
 export type OrderBook = {
   tokenId: string;
+  /** Sorted best (highest) first. */
   bids: BookLevel[];
+  /** Sorted best (lowest) first. */
   asks: BookLevel[];
   timestamp: number | null;
   minOrderSize: number | null;
+  tickSize: number | null;
   hash: string | null;
 };
 
-export type MarketCandle = {
-  timestamp: number;
-  low: number;
-  high: number;
-  open: number;
-  close: number;
-  volume: number;
-};
-
-export type MarketPriceTick = { timestamp: number; price: number };
-
-export type CandleHistory = {
-  fiveMinute: MarketCandle[];
-  fifteenMinute: MarketCandle[];
-  updatedAt: number;
-};
+export type CandleHistory = { fiveMinute: MarketCandle[]; fifteenMinute: MarketCandle[]; updatedAt: number };
 
 export type MarketDefinition = {
   id: string;
@@ -39,53 +35,52 @@ export type MarketDefinition = {
   question: string;
   asset: Asset;
   duration: Horizon;
-  startTime: number | null;
+  startTime: number;
   endTime: number;
-  reference: number | null;
-  referenceSource: "POLYMARKET" | "COINBASE ESTIMATE" | "MISSING";
   upTokenId: string;
   downTokenId: string;
   sourceUrl: string;
+  twapLookbackSeconds: number;
+  feeSchedule: FeeSchedule;
+  tickSize: number;
+  minOrderSize: number;
+  negRisk: boolean;
 };
+
+export type OfficialPrice = { openPrice: number | null; closePrice: number | null; completed: boolean; fetchedAt: number };
 
 export type LiveMarket = MarketDefinition & {
   remaining: number;
-  countdownEndsAt: number;
-  spot: number | null;
+  reference: number | null;
+  referenceSource: ReferenceSource;
+  officialClose: number | null;
   upBook: OrderBook | null;
   downBook: OrderBook | null;
   upBid: number | null;
   upAsk: number | null;
   downBid: number | null;
   downAsk: number | null;
-  fairUp: number | null;
-  edgeUp: number | null;
-  edgeDown: number | null;
   spread: number | null;
   liquidity: number;
   imbalance: number | null;
-  momentum: number | null;
-  distance: number | null;
-  regime: string;
   sourceTimestamp: number;
   chart5m: MarketCandle[];
   chart15m: MarketCandle[];
   chartUpdatedAt: number | null;
-  spotHistory?: MarketPriceTick[];
 };
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
-const SPOT_API = "https://api.coinbase.com/v2/prices";
-const COINBASE_CANDLES_API = "https://api.exchange.coinbase.com/products";
+const EXCHANGE_API = "https://api.exchange.coinbase.com/products";
+export const OFFICIAL_PRICE_API = "https://polymarket.com/api/crypto/crypto-price";
 const CRYPTO_TAG_ID = "21";
 const GAMMA_PAGE_SIZE = 100;
 const GAMMA_MAX_PAGES = 12;
 const GAMMA_LOOKAHEAD_MS = 2 * 60 * 60 * 1000;
 const DISCOVERY_CACHE_MS = 15_000;
 const POLYMARKET_TIME_CACHE_MS = 15_000;
-const PUBLIC_REQUEST_TIMEOUT_MS = 15_000;
-const CLOB_BATCH_SIZE = 500;
+const PUBLIC_REQUEST_TIMEOUT_MS = 12_000;
+const CLOB_BATCH_SIZE = 100;
 const CANDLE_CACHE_MS = 60_000;
 const CANDLE_LOOKBACK_BARS = 100;
 
@@ -93,297 +88,151 @@ let polymarketClockOffsetMs = 0;
 let polymarketClockSyncedAt = 0;
 const candleHistoryCache = new Map<Asset, CandleHistory>();
 
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+// ---------------------------------------------------------------------------
+// Payload schemas. Gamma is loose, so parse only the fields the engine uses and
+// reject rows that are missing the ones it cannot trade without.
 
-const finiteNumber = (value: unknown): number | null => {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
-  return null;
-};
-
-const jsonArray = (value: unknown): string[] => {
-  if (Array.isArray(value)) return value.map(String);
-  if (typeof value !== "string") return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed.map(String) : [];
-  } catch {
-    return value.split(",").map((item) => item.trim().replace(/^['\"]|['\"]$/g, "")).filter(Boolean);
+const numberish = z.union([z.number(), z.string()]).transform((value, context) => {
+  const parsed = finiteNumber(value);
+  if (parsed === null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "not a number" });
+    return z.NEVER;
   }
-};
+  return parsed;
+});
 
-const epochMs = (value: unknown): number | null => {
-  const numeric = finiteNumber(value);
-  if (numeric !== null) return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
-  if (typeof value === "string") {
-    const parsed = Date.parse(value);
-    return Number.isNaN(parsed) ? null : parsed;
-  }
-  return null;
-};
+const feeScheduleSchema = z
+  .object({ rate: numberish, exponent: numberish, takerOnly: z.boolean().optional(), rebateRate: numberish.optional() })
+  .transform((value): FeeSchedule => ({ rate: value.rate, exponent: value.exponent, takerOnly: value.takerOnly ?? true, rebateRate: value.rebateRate ?? 0 }));
 
-const normalizeText = (value: unknown) => (typeof value === "string" ? value : "");
+const cryptoConfigSchema = z
+  .object({
+    asset: z.string().optional(),
+    duration: z.string().optional(),
+    twapEnabled: z.boolean().optional(),
+    twapLookbackSeconds: numberish.optional(),
+  })
+  .passthrough();
+
+export const gammaMarketSchema = z
+  .object({
+    id: z.union([z.string(), z.number()]).transform(String),
+    conditionId: z.string().nullish(),
+    slug: z.string(),
+    question: z.string().nullish(),
+    clobTokenIds: z.unknown(),
+    outcomes: z.unknown(),
+    outcomePrices: z.unknown().optional(),
+    endDate: z.string().nullish(),
+    eventStartTime: z.string().nullish(),
+    active: z.boolean().nullish(),
+    closed: z.boolean().nullish(),
+    archived: z.boolean().nullish(),
+    acceptingOrders: z.boolean().nullish(),
+    negRisk: z.boolean().nullish(),
+    orderPriceMinTickSize: numberish.nullish(),
+    orderMinSize: numberish.nullish(),
+    feeSchedule: z.unknown().optional(),
+    cryptoMarketConfig: z.unknown().optional(),
+  })
+  .passthrough();
+
+export type GammaMarket = z.infer<typeof gammaMarketSchema>;
+
+export const officialPriceSchema = z
+  .object({
+    openPrice: numberish.nullish(),
+    closePrice: numberish.nullish(),
+    completed: z.boolean().nullish(),
+  })
+  .passthrough();
+
+// ---------------------------------------------------------------------------
 
 const assetAliases: Record<string, Asset> = {
-  ada: "ADA",
-  aave: "AAVE",
-  arb: "ARB",
-  atom: "ATOM",
-  avax: "AVAX",
-  bitcoin: "BTC",
-  bnb: "BNB",
   btc: "BTC",
-  bonk: "BONK",
-  doge: "DOGE",
-  dogecoin: "DOGE",
-  dot: "DOT",
+  bitcoin: "BTC",
   eth: "ETH",
   ethereum: "ETH",
-  fil: "FIL",
-  hype: "HYPE",
-  hyperliquid: "HYPE",
-  inj: "INJ",
-  link: "LINK",
-  ltc: "LTC",
-  near: "NEAR",
-  op: "OP",
-  pepe: "PEPE",
-  pol: "POL",
-  polygon: "POL",
-  matic: "POL",
-  ripple: "XRP",
-  shib: "SHIB",
   sol: "SOL",
   solana: "SOL",
-  sui: "SUI",
-  trx: "TRX",
-  ton: "TON",
-  uni: "UNI",
   xrp: "XRP",
-  wif: "WIF",
-  zcash: "ZEC",
+  ripple: "XRP",
+  doge: "DOGE",
+  dogecoin: "DOGE",
+  bnb: "BNB",
+  hype: "HYPE",
+  hyperliquid: "HYPE",
   zec: "ZEC",
+  zcash: "ZEC",
 };
 
-const assetFor = (text: string, slug: string): Asset | null => {
-  const shortSlug = slug.toLowerCase().match(/^([a-z0-9]+)-(?:updown|up-or-down)(?:-|$)/);
-  const slugAsset = shortSlug ? assetAliases[shortSlug[1]] ?? shortSlug[1].toUpperCase() : null;
-  if (slugAsset) return slugAsset;
+const SLUG_PATTERN = /^([a-z0-9]+)-updown-(5m|15m)-(\d{10})$/;
 
-  const value = text.toLowerCase();
-  for (const [alias, asset] of Object.entries(assetAliases)) {
-    if (new RegExp(`\\b${alias}\\b`, "i").test(value)) return asset;
-  }
-  return null;
-};
+/** Parse one Gamma row into a tradable 5m/15m Up/Down market, or null. */
+export const normalizeMarket = (raw: unknown, now = Date.now()): MarketDefinition | null => {
+  const parsed = gammaMarketSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  const row = parsed.data;
+  const slugMatch = row.slug.toLowerCase().match(SLUG_PATTERN);
+  if (!slugMatch) return null;
+  const asset = assetAliases[slugMatch[1]] ?? slugMatch[1].toUpperCase();
+  const duration = slugMatch[2] as Horizon;
+  const durationMs = duration === "5m" ? 300_000 : 900_000;
+  const slugStart = Number(slugMatch[3]) * 1000;
+  const endTime = epochMs(row.endDate) ?? slugStart + durationMs;
+  if (!(endTime > now)) return null;
+  const eventStart = epochMs(row.eventStartTime);
+  const startTime = eventStart !== null && Math.abs(eventStart - (endTime - durationMs)) <= 15_000 ? eventStart : endTime - durationMs;
+  if (row.active === false || row.closed === true || row.archived === true) return null;
 
-const horizonFromValue = (value: unknown): Horizon | null => {
-  const numeric = finiteNumber(value);
-  if (numeric !== null) {
-    if (numeric >= 240 && numeric <= 360) return "5m";
-    if (numeric >= 840 && numeric <= 960) return "15m";
-  }
-  const normalized = normalizeText(value).toLowerCase();
-  if (/^5\s*(?:m|min|minute|minutes)$/.test(normalized)) return "5m";
-  if (/^15\s*(?:m|min|minute|minutes)$/.test(normalized)) return "15m";
-  return null;
-};
-
-const clockRangeDuration = (text: string): number | null => {
-  const match = text.match(/(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\s*[-–—]\s*(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?/i);
-  if (!match) return null;
-  const startMeridiem = match[3]?.replace(/\./g, "").toLowerCase();
-  const endMeridiem = match[6]?.replace(/\./g, "").toLowerCase() || startMeridiem;
-  if (!startMeridiem && !endMeridiem) return null;
-  const toMinutes = (hourValue: string, minuteValue: string | undefined, meridiem: string | undefined) => {
-    let hour = Number(hourValue);
-    const minute = Number(minuteValue ?? "0");
-    if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour > 12 || minute > 59) return null;
-    if (meridiem === "pm" && hour !== 12) hour += 12;
-    if (meridiem === "am" && hour === 12) hour = 0;
-    return hour * 60 + minute;
-  };
-  const start = toMinutes(match[1], match[2], startMeridiem || endMeridiem);
-  const end = toMinutes(match[4], match[5], endMeridiem);
-  if (start === null || end === null) return null;
-  const minutes = (end - start + 24 * 60) % (24 * 60);
-  return minutes > 0 ? minutes * 60 : null;
-};
-
-const horizonFor = (text: string, slug: string, raw: Record<string, unknown>, startTime: number | null, endTime: number | null): Horizon | null => {
-  const explicitSlug = slug.match(/(?:updown|up-or-down)[-_](5m|15m)(?:[-_]|$)/i)?.[1]?.toLowerCase();
-  if (explicitSlug === "5m" || explicitSlug === "15m") return explicitSlug;
-
-  for (const key of ["duration", "durationSeconds", "duration_seconds", "marketDuration", "market_duration", "eventDuration", "event_duration"]) {
-    const duration = horizonFromValue(raw[key]);
-    if (duration) return duration;
-  }
-
-  const range = clockRangeDuration(text);
-  if (range !== null) {
-    if (range >= 240 && range <= 360) return "5m";
-    if (range >= 840 && range <= 960) return "15m";
-  }
-
-  const duration = startTime !== null && endTime !== null ? (endTime - startTime) / 1000 : null;
-  if (duration !== null && duration >= 240 && duration <= 360) return "5m";
-  if (duration !== null && duration >= 840 && duration <= 960) return "15m";
-  return null;
-};
-
-const referenceFor = (raw: Record<string, unknown>, text: string): number | null => {
-  const directKeys = [
-    "referencePrice", "reference_price", "strikePrice", "strike_price", "targetPrice", "target_price",
-    "startPrice", "start_price", "priceToBeat", "price_to_beat", "threshold",
-  ];
-  for (const key of directKeys) {
-    const candidate = finiteNumber(raw[key]);
-    if (candidate !== null && candidate > 0) return candidate;
-  }
-
-  const description = normalizeText(raw.description);
-  const searchText = description + " " + text;
-  const patterns = [
-    /(?:reference|starting|start|threshold|strike|price\s+to\s+beat)[^$0-9]{0,50}\$?([0-9][0-9,]*(?:\.[0-9]+)?)/i,
-    /(?:above|below)[^$0-9]{0,24}\$?([0-9][0-9,]*(?:\.[0-9]+)?)/i,
-  ];
-  for (const pattern of patterns) {
-    const match = searchText.match(pattern);
-    const candidate = match ? Number(match[1].replace(/,/g, "")) : null;
-    if (candidate !== null && Number.isFinite(candidate) && candidate > 0) return candidate;
-  }
-  return null;
-};
-
-const rawMarkets = (payload: unknown): Record<string, unknown>[] => {
-  if (Array.isArray(payload)) return payload.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"));
-  if (!payload || typeof payload !== "object") return [];
-  const record = payload as Record<string, unknown>;
-  for (const key of ["markets", "items", "data"]) {
-    if (Array.isArray(record[key])) return record[key].filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"));
-  }
-  return [];
-};
-
-const flagIsTrue = (value: unknown) => value === true || value === 1 || value === "1" || (typeof value === "string" && value.toLowerCase() === "true");
-const flagIsFalse = (value: unknown) => value === false || value === 0 || value === "0" || (typeof value === "string" && value.toLowerCase() === "false");
-
-const tokenIdsFor = (raw: Record<string, unknown>): string[] => {
-  const direct = jsonArray(raw.clobTokenIds || raw.clob_token_ids || raw.tokenIds || raw.token_ids);
-  if (direct.length >= 2) return direct;
-
-  const outcomes = raw.outcomes;
-  if (outcomes && typeof outcomes === "object" && !Array.isArray(outcomes)) {
-    const outcomeRecord = outcomes as Record<string, unknown>;
-    const preferred = ["yes", "no", "up", "down", "higher", "lower", "above", "below"];
-    const ordered = preferred.flatMap((key) => {
-      const candidate = outcomeRecord[key];
-      if (!candidate || typeof candidate !== "object") return [];
-      const record = candidate as Record<string, unknown>;
-      const token = normalizeText(record.tokenId || record.token_id || record.assetId || record.asset_id);
-      return token ? [token] : [];
-    });
-    if (ordered.length >= 2) return ordered;
-  }
-
-  return jsonArray(raw.tokens).slice(0, 2);
-};
-
-const outcomeLabelsFor = (raw: Record<string, unknown>): string[] => {
-  if (Array.isArray(raw.outcomes) || typeof raw.outcomes === "string") return jsonArray(raw.outcomes);
-  if (!raw.outcomes || typeof raw.outcomes !== "object") return [];
-  return Object.keys(raw.outcomes as Record<string, unknown>);
-};
-
-const firstEventFor = (raw: Record<string, unknown>): Record<string, unknown> => {
-  const events = raw.events;
-  if (!Array.isArray(events)) return {};
-  const event = events.find((item) => item && typeof item === "object" && !Array.isArray(item));
-  return event && typeof event === "object" ? event as Record<string, unknown> : {};
-};
-
-const intervalStartFor = (raw: Record<string, unknown>, slug: string): number | null => {
-  const event = firstEventFor(raw);
-  const explicit = epochMs(
-    raw.startTime || raw.start_time || raw.eventStartTime || raw.event_start_time
-      || event.startTime || event.start_time || event.eventStartTime || event.event_start_time,
-  );
-  if (explicit !== null) return explicit;
-  const slugTimestamp = slug.match(/(?:^|[-_])(\d{10})(?:$|[-_])/);
-  const fromSlug = epochMs(slugTimestamp?.[1]);
-  if (fromSlug !== null) return fromSlug;
-  return epochMs(raw.startDate || raw.start_date);
-};
-
-const intervalEndFor = (raw: Record<string, unknown>): number | null => {
-  const event = firstEventFor(raw);
-  return epochMs(
-    raw.endTime || raw.end_time || raw.eventEndTime || raw.event_end_time
-      || event.endTime || event.end_time || event.eventEndTime || event.event_end_time
-      || raw.endDate || raw.end_date,
-  );
-};
-
-const normalizeMarket = (raw: Record<string, unknown>, now = Date.now()): MarketDefinition | null => {
-  const question = normalizeText(raw.question || raw.title || raw.eventTitle || raw.description);
-  const slug = normalizeText(raw.slug || raw.marketSlug || raw.market_slug || raw.id);
-  const text = [question, slug, normalizeText(raw.description), normalizeText(raw.outcomes), normalizeText(raw.eventTitle), normalizeText(raw.eventSlug)].join(" ");
-  const asset = assetFor(text, slug);
-  if (!asset) return null;
-
-  const startTime = intervalStartFor(raw, slug);
-  const endTime = intervalEndFor(raw);
-  if (!endTime || endTime <= now) return null;
-  const duration = horizonFor(text, slug, raw, startTime, endTime);
-  if (!duration) return null;
-  const expectedStartTime = endTime - (duration === "5m" ? 300_000 : 900_000);
-  const alignedStartTime = startTime !== null && Math.abs(startTime - expectedStartTime) <= 15_000 ? startTime : expectedStartTime;
-
-  const outcomes = outcomeLabelsFor(raw);
-  const tokenIds = tokenIdsFor(raw);
-  if (tokenIds.length < 2) return null;
-  const lowerOutcomes = outcomes.map((outcome) => outcome.toLowerCase());
-  const upIndex = lowerOutcomes.findIndex((outcome) => /^(up|yes|higher|above)$/.test(outcome));
-  const downIndex = lowerOutcomes.findIndex((outcome) => /^(down|no|lower|below)$/.test(outcome));
-  const upTokenId = tokenIds[upIndex >= 0 ? upIndex : 0];
-  const downTokenId = tokenIds[downIndex >= 0 ? downIndex : 1];
+  const outcomes = jsonArray(row.outcomes).map((outcome) => outcome.toLowerCase());
+  const tokenIds = jsonArray(row.clobTokenIds);
+  if (tokenIds.length < 2 || outcomes.length !== tokenIds.length) return null;
+  const upIndex = outcomes.findIndex((outcome) => outcome === "up");
+  const downIndex = outcomes.findIndex((outcome) => outcome === "down");
+  if (upIndex < 0 || downIndex < 0) return null;
+  const upTokenId = tokenIds[upIndex];
+  const downTokenId = tokenIds[downIndex];
   if (!upTokenId || !downTokenId || upTokenId === downTokenId) return null;
 
-  const active = !flagIsFalse(raw.active) && !flagIsTrue(raw.closed) && !flagIsTrue(raw.archived);
-  if (!active) return null;
+  const config = cryptoConfigSchema.safeParse(row.cryptoMarketConfig);
+  const twapLookbackSeconds = config.success && config.data.twapEnabled ? clamp(config.data.twapLookbackSeconds ?? 60, 0, 3_600) : 0;
+  const fee = feeScheduleSchema.safeParse(row.feeSchedule);
 
-  const id = normalizeText(raw.id || raw.conditionId || raw.condition_id || slug);
-  if (!id) return null;
-  const reference = referenceFor(raw, text);
   return {
-    id,
-    conditionId: normalizeText(raw.conditionId || raw.condition_id) || null,
-    slug,
-    question: question || slug,
+    id: row.id,
+    conditionId: row.conditionId ?? null,
+    slug: row.slug,
+    question: row.question || row.slug,
     asset,
     duration,
-    startTime: alignedStartTime,
+    startTime,
     endTime,
-    reference,
-    referenceSource: reference !== null ? "POLYMARKET" : "MISSING",
     upTokenId,
     downTokenId,
-    sourceUrl: slug ? `https://polymarket.com/market/${slug}` : "https://polymarket.com",
+    sourceUrl: `https://polymarket.com/event/${row.slug}`,
+    twapLookbackSeconds,
+    feeSchedule: fee.success ? fee.data : DEFAULT_FEE_SCHEDULE,
+    tickSize: row.orderPriceMinTickSize && row.orderPriceMinTickSize > 0 ? row.orderPriceMinTickSize : 0.01,
+    minOrderSize: row.orderMinSize && row.orderMinSize > 0 ? row.orderMinSize : 5,
+    negRisk: row.negRisk === true,
   };
 };
 
-const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
+export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
+
+const fetchJson = async <T>(url: string, init?: RequestInit, fetcher: Fetcher = fetch): Promise<T> => {
   const timeoutController = new AbortController();
   const timeoutId = globalThis.setTimeout(() => timeoutController.abort(), PUBLIC_REQUEST_TIMEOUT_MS);
   const upstreamSignal = init?.signal;
   const abortRequest = () => timeoutController.abort();
   if (upstreamSignal?.aborted) timeoutController.abort();
   else upstreamSignal?.addEventListener("abort", abortRequest, { once: true });
-
   try {
-    const response = await fetch(url, { ...init, cache: "no-store", signal: timeoutController.signal });
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-    return response.json() as Promise<T>;
+    const response = await fetcher(url, { ...init, cache: "no-store", signal: timeoutController.signal });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText} from ${new URL(url).hostname}`);
+    return (await response.json()) as T;
   } catch (error) {
     if (timeoutController.signal.aborted && !upstreamSignal?.aborted) throw new Error(`Public request timed out after ${PUBLIC_REQUEST_TIMEOUT_MS / 1000}s`);
     throw error;
@@ -393,17 +242,19 @@ const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
   }
 };
 
-const polymarketNow = () => Date.now() + polymarketClockOffsetMs;
+export const polymarketNow = () => Date.now() + polymarketClockOffsetMs;
+export const polymarketClockOffset = () => polymarketClockOffsetMs;
 
-const fetchPolymarketNow = async (signal?: AbortSignal): Promise<number> => {
+const syncPolymarketClock = async (signal?: AbortSignal): Promise<number> => {
   if (Date.now() - polymarketClockSyncedAt < POLYMARKET_TIME_CACHE_MS) return polymarketNow();
   try {
+    const sentAt = Date.now();
     const payload = await fetchJson<unknown>(`${CLOB_API}/time`, { signal });
     const serverTime = epochMs(payload);
     if (serverTime !== null) {
-      polymarketClockOffsetMs = serverTime - Date.now();
+      // Assume symmetric latency: the server stamped halfway through the round trip.
+      polymarketClockOffsetMs = serverTime + (Date.now() - sentAt) / 2 - Date.now();
       polymarketClockSyncedAt = Date.now();
-      return serverTime;
     }
   } catch (error) {
     if (signal?.aborted) throw error;
@@ -411,18 +262,10 @@ const fetchPolymarketNow = async (signal?: AbortSignal): Promise<number> => {
   return polymarketNow();
 };
 
-const nextCursorFor = (payload: unknown): string | null => {
-  if (!payload || typeof payload !== "object") return null;
-  const record = payload as Record<string, unknown>;
-  const cursor = normalizeText(record.next_cursor || record.nextCursor);
-  return cursor && cursor !== "LTE=" ? cursor : null;
-};
-
-const fetchCryptoMarketRows = async (signal?: AbortSignal): Promise<{ rows: Record<string, unknown>[]; now: number }> => {
-  const rows: Record<string, unknown>[] = [];
+const fetchCryptoMarketRows = async (signal?: AbortSignal): Promise<{ rows: unknown[]; now: number }> => {
+  const rows: unknown[] = [];
   let afterCursor: string | null = null;
-  const now = await fetchPolymarketNow(signal);
-
+  const now = await syncPolymarketClock(signal);
   for (let page = 0; page < GAMMA_MAX_PAGES; page += 1) {
     const url = new URL(`${GAMMA_API}/markets/keyset`);
     url.searchParams.set("tag_id", CRYPTO_TAG_ID);
@@ -436,48 +279,30 @@ const fetchCryptoMarketRows = async (signal?: AbortSignal): Promise<{ rows: Reco
     url.searchParams.set("ascending", "true");
     url.searchParams.set("limit", String(GAMMA_PAGE_SIZE));
     if (afterCursor) url.searchParams.set("after_cursor", afterCursor);
-
     const payload = await fetchJson<unknown>(url.toString(), { signal });
-    const pageRows = rawMarkets(payload);
+    const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+    const pageRows = Array.isArray(payload) ? payload : Array.isArray(record.markets) ? record.markets : [];
     rows.push(...pageRows);
-
-    const nextCursor = nextCursorFor(payload);
-    if (!nextCursor || nextCursor === afterCursor || pageRows.length === 0) break;
+    const nextCursor = text(record.next_cursor);
+    if (!nextCursor || nextCursor === "LTE=" || nextCursor === afterCursor || pageRows.length === 0) break;
     afterCursor = nextCursor;
   }
-
   return { rows, now };
 };
 
 let discoveryCache: { value: MarketDefinition[]; timestamp: number } | null = null;
 let discoveryInFlight: Promise<MarketDefinition[]> | null = null;
 
-const discoverCryptoMarketsFresh = async (signal?: AbortSignal): Promise<MarketDefinition[]> => {
-  const { rows: directMarkets, now } = await fetchCryptoMarketRows(signal);
-  const seen = new Set<string>();
-  return directMarkets
-    .map((row) => normalizeMarket(row, now))
-    .filter((market): market is MarketDefinition => Boolean(market))
-    .filter((market) => {
-      if (seen.has(market.id)) return false;
-      seen.add(market.id);
-      return true;
-    })
-    .sort((left, right) => {
-      const leftStart = left.startTime ?? left.endTime;
-      const rightStart = right.startTime ?? right.endTime;
-      const leftPhase = left.startTime !== null && left.startTime <= now && left.endTime > now ? 0 : left.startTime !== null && left.startTime > now ? 1 : 2;
-      const rightPhase = right.startTime !== null && right.startTime <= now && right.endTime > now ? 0 : right.startTime !== null && right.startTime > now ? 1 : 2;
-      if (leftPhase !== rightPhase) return leftPhase - rightPhase;
-      return leftStart - rightStart || left.endTime - right.endTime || left.asset.localeCompare(right.asset) || left.id.localeCompare(right.id);
-    });
-};
-
 export async function discoverCryptoMarkets(signal?: AbortSignal): Promise<MarketDefinition[]> {
   if (discoveryCache && Date.now() - discoveryCache.timestamp < DISCOVERY_CACHE_MS) return discoveryCache.value;
   if (!discoveryInFlight) {
-    discoveryInFlight = discoverCryptoMarketsFresh(signal)
-      .then((value) => {
+    discoveryInFlight = fetchCryptoMarketRows(signal)
+      .then(({ rows, now }) => {
+        const seen = new Set<string>();
+        const value = rows
+          .map((row) => normalizeMarket(row, now))
+          .filter((market): market is MarketDefinition => market !== null && !seen.has(market.id) && Boolean(seen.add(market.id)))
+          .sort((left, right) => left.startTime - right.startTime || left.endTime - right.endTime || left.asset.localeCompare(right.asset));
         discoveryCache = { value, timestamp: Date.now() };
         return value;
       })
@@ -488,305 +313,366 @@ export async function discoverCryptoMarkets(signal?: AbortSignal): Promise<Marke
   return discoveryInFlight;
 }
 
-const parseBook = (raw: Record<string, unknown>, tokenId: string): OrderBook => {
-  const levels = (value: unknown): BookLevel[] => {
-    if (!Array.isArray(value)) return [];
-    return value.map((level) => {
-      const record = level && typeof level === "object" ? level as Record<string, unknown> : {};
-      return { price: finiteNumber(record.price) ?? 0, size: finiteNumber(record.size) ?? 0 };
-    }).filter((level) => level.price > 0 && level.size > 0);
-  };
-  return {
-    tokenId,
-    bids: levels(raw.bids).sort((left, right) => left.price - right.price),
-    asks: levels(raw.asks).sort((left, right) => left.price - right.price),
-    timestamp: epochMs(raw.timestamp),
-    minOrderSize: finiteNumber(raw.min_order_size || raw.minOrderSize),
-    hash: normalizeText(raw.hash) || null,
-  };
+/** Fetch one market directly by Gamma id (used by the live route; no discovery scan). */
+export async function fetchMarketById(id: string, signal?: AbortSignal, fetcher: Fetcher = fetch): Promise<MarketDefinition | null> {
+  const payload = await fetchJson<unknown>(`${GAMMA_API}/markets?id=${encodeURIComponent(id)}`, { signal }, fetcher);
+  const rows = Array.isArray(payload) ? payload : [];
+  for (const row of rows) {
+    const market = normalizeMarket(row, polymarketNow());
+    if (market && market.id === id) return market;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Resolutions: official Up/Down outcomes from closed Gamma markets.
+
+export type Resolution = { marketId: string; outcome: Side; resolvedAt: number };
+
+export const parseResolution = (raw: unknown): Resolution | null => {
+  const parsed = gammaMarketSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.closed !== true) return null;
+  const outcomes = jsonArray(parsed.data.outcomes).map((outcome) => outcome.toLowerCase());
+  const prices = jsonArray(parsed.data.outcomePrices).map(Number);
+  if (outcomes.length !== prices.length || outcomes.length < 2) return null;
+  const winner = prices.findIndex((price) => price >= 0.999);
+  const loserCount = prices.filter((price) => price <= 0.001).length;
+  if (winner < 0 || loserCount !== prices.length - 1) return null;
+  const label = outcomes[winner];
+  if (label !== "up" && label !== "down") return null;
+  const closedTime = epochMs((parsed.data as Record<string, unknown>).closedTime);
+  return { marketId: parsed.data.id, outcome: label === "up" ? "UP" : "DOWN", resolvedAt: closedTime ?? Date.now() };
 };
 
-export async function fetchOrderBooks(tokenIds: string[], signal?: AbortSignal): Promise<Map<string, OrderBook>> {
-  const uniqueTokenIds = [...new Set(tokenIds)].filter(Boolean);
-  if (!uniqueTokenIds.length) return new Map();
-  const chunks = Array.from({ length: Math.ceil(uniqueTokenIds.length / CLOB_BATCH_SIZE) }, (_, index) => uniqueTokenIds.slice(index * CLOB_BATCH_SIZE, (index + 1) * CLOB_BATCH_SIZE));
-  const books = new Map<string, OrderBook>();
-
-  await Promise.all(chunks.map(async (chunk) => {
-    try {
-      const payload = await fetchJson<unknown>(`${CLOB_API}/books`, {
-        method: "POST",
-        signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(chunk.map((tokenId) => ({ token_id: tokenId }))),
-      });
-      const records = Array.isArray(payload) ? payload : [];
-      for (const record of records) {
-        const item = record && typeof record === "object" ? record as Record<string, unknown> : {};
-        const tokenId = normalizeText(item.asset_id || item.token_id);
-        if (tokenId) books.set(tokenId, parseBook(item, tokenId));
-      }
-    } catch (error) {
-      if (signal?.aborted) throw error;
-      const entries = await Promise.all(chunk.map(async (tokenId) => {
-        try {
-          const payload = await fetchJson<Record<string, unknown>>(`${CLOB_API}/book?token_id=${encodeURIComponent(tokenId)}`, { signal });
-          return [tokenId, parseBook(payload, tokenId)] as const;
-        } catch {
-          return null;
-        }
-      }));
-      for (const entry of entries) if (entry) books.set(entry[0], entry[1]);
+export async function fetchResolutions(marketIds: string[], signal?: AbortSignal, fetcher: Fetcher = fetch): Promise<Map<string, Resolution>> {
+  const resolutions = new Map<string, Resolution>();
+  const unique = [...new Set(marketIds)].filter(Boolean);
+  for (let index = 0; index < unique.length; index += 40) {
+    const chunk = unique.slice(index, index + 40);
+    // Gamma pages at 20 rows by default; without an explicit limit half of a 40-id query is silently dropped.
+    const url = `${GAMMA_API}/markets?closed=true&limit=${chunk.length}&${chunk.map((id) => `id=${encodeURIComponent(id)}`).join("&")}`;
+    const payload = await fetchJson<unknown>(url, { signal }, fetcher);
+    for (const row of Array.isArray(payload) ? payload : []) {
+      const resolution = parseResolution(row);
+      if (resolution) resolutions.set(resolution.marketId, resolution);
     }
-  }));
+  }
+  return resolutions;
+}
 
+// ---------------------------------------------------------------------------
+// Official price to beat: the Chainlink TWAP-stream value at the window start.
+
+export const officialPriceUrl = (asset: string, startTime: number, duration: Horizon, base = OFFICIAL_PRICE_API) => {
+  const url = new URL(base, "https://polymarket.com");
+  url.searchParams.set("symbol", asset.toUpperCase());
+  url.searchParams.set("eventStartTime", new Date(startTime).toISOString().replace(".000Z", "Z"));
+  url.searchParams.set("variant", duration === "5m" ? "fiveminute" : "fifteen");
+  url.searchParams.set("endDate", new Date(startTime + (duration === "5m" ? 300_000 : 900_000)).toISOString().replace(".000Z", "Z"));
+  return url.toString();
+};
+
+export const parseOfficialPrice = (payload: unknown, fetchedAt = Date.now()): OfficialPrice | null => {
+  const parsed = officialPriceSchema.safeParse(payload);
+  if (!parsed.success) return null;
+  const openPrice = parsed.data.openPrice ?? null;
+  const closePrice = parsed.data.closePrice ?? null;
+  if (openPrice !== null && !(openPrice > 0)) return null;
+  return { openPrice, closePrice: closePrice !== null && closePrice > 0 ? closePrice : null, completed: parsed.data.completed === true, fetchedAt };
+};
+
+export async function fetchOfficialPrice(
+  asset: string,
+  startTime: number,
+  duration: Horizon,
+  options: { signal?: AbortSignal; fetcher?: Fetcher; base?: string } = {},
+): Promise<OfficialPrice | null> {
+  const payload = await fetchJson<unknown>(officialPriceUrl(asset, startTime, duration, options.base), { signal: options.signal }, options.fetcher);
+  return parseOfficialPrice(payload);
+}
+
+// ---------------------------------------------------------------------------
+// Order books.
+
+const sortBook = (bids: BookLevel[], asks: BookLevel[]) => ({
+  bids: bids.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => right.price - left.price),
+  asks: asks.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => left.price - right.price),
+});
+
+const parseLevels = (value: unknown): BookLevel[] =>
+  Array.isArray(value)
+    ? value.flatMap((level) => {
+        const item = level && typeof level === "object" ? (level as Record<string, unknown>) : {};
+        const price = finiteNumber(item.price);
+        const size = finiteNumber(item.size);
+        return price !== null && size !== null && price > 0 && size > 0 ? [{ price, size }] : [];
+      })
+    : [];
+
+export const parseBook = (raw: Record<string, unknown>, tokenId: string): OrderBook => ({
+  tokenId,
+  ...sortBook(parseLevels(raw.bids), parseLevels(raw.asks)),
+  timestamp: epochMs(raw.timestamp),
+  minOrderSize: finiteNumber(raw.min_order_size ?? raw.minOrderSize),
+  tickSize: finiteNumber(raw.tick_size ?? raw.tickSize),
+  hash: text(raw.hash) || null,
+});
+
+export async function fetchOrderBooks(tokenIds: string[], signal?: AbortSignal, fetcher: Fetcher = fetch): Promise<Map<string, OrderBook>> {
+  const uniqueTokenIds = [...new Set(tokenIds)].filter(Boolean);
+  const books = new Map<string, OrderBook>();
+  const chunks = Array.from({ length: Math.ceil(uniqueTokenIds.length / CLOB_BATCH_SIZE) }, (_, index) =>
+    uniqueTokenIds.slice(index * CLOB_BATCH_SIZE, (index + 1) * CLOB_BATCH_SIZE),
+  );
+  // Each chunk fails independently: one bad batch must not blank every market.
+  const results = await Promise.allSettled(
+    chunks.map((chunk) =>
+      fetchJson<unknown>(
+        `${CLOB_API}/books`,
+        { method: "POST", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(chunk.map((tokenId) => ({ token_id: tokenId }))) },
+        fetcher,
+      ),
+    ),
+  );
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    for (const item of Array.isArray(result.value) ? result.value : []) {
+      const record = item && typeof item === "object" ? (item as Record<string, unknown>) : {};
+      const tokenId = text(record.asset_id) || text(record.token_id);
+      if (tokenId) books.set(tokenId, parseBook(record, tokenId));
+    }
+  }
+  if (signal?.aborted) throw new Error("aborted");
   return books;
 }
 
-export async function fetchSpotPrices(assets: Asset[], signal?: AbortSignal): Promise<Map<Asset, number>> {
-  const results = await Promise.all(assets.map(async (asset) => {
-    try {
-      const payload = await fetchJson<{ data?: { amount?: string } }>(`${SPOT_API}/${asset}-USD/spot`, { signal });
-      const price = finiteNumber(payload.data?.amount);
-      return price !== null && price > 0 ? ([asset, price] as const) : null;
-    } catch {
-      return null;
-    }
-  }));
-  return new Map(results.filter((result): result is readonly [Asset, number] => Boolean(result)));
-}
-
-const candleProductsFor = (asset: Asset): string[] => {
-  const aliases: Record<string, string[]> = {
-    POL: ["POL", "MATIC"],
-  };
-  return aliases[asset] ?? [asset];
+/** Prefer whichever book is newer, so a REST refresh never clobbers fresher WebSocket state. */
+export const newerBook = (current: OrderBook | null, incoming: OrderBook | null): OrderBook | null => {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  if (current.timestamp !== null && incoming.timestamp !== null && current.timestamp > incoming.timestamp) return current;
+  return incoming;
 };
+
+// ---------------------------------------------------------------------------
+// Exchange data (cold-start volatility and divergence checks only).
+
+export async function fetchExchangeSpots(assets: Asset[], signal?: AbortSignal, fetcher: Fetcher = fetch): Promise<Map<Asset, PriceTick>> {
+  const results = await Promise.all(
+    assets.map(async (asset) => {
+      try {
+        const payload = await fetchJson<{ price?: string; time?: string }>(`${EXCHANGE_API}/${asset}-USD/ticker`, { signal }, fetcher);
+        const price = finiteNumber(payload.price);
+        const timestamp = epochMs(payload.time) ?? Date.now();
+        return price !== null && price > 0 ? ([asset, { price, timestamp }] as const) : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return new Map(results.filter((result): result is readonly [Asset, PriceTick] => result !== null));
+}
 
 const fetchCoinbaseCandles = async (asset: Asset, granularity: 300 | 900, signal?: AbortSignal): Promise<MarketCandle[]> => {
   const now = Math.floor(Date.now() / 1000);
-  const start = now - granularity * CANDLE_LOOKBACK_BARS;
-
-  for (const product of candleProductsFor(asset)) {
-    const url = new URL(`${COINBASE_CANDLES_API}/${encodeURIComponent(`${product}-USD`)}/candles`);
-    url.searchParams.set("granularity", String(granularity));
-    url.searchParams.set("start", new Date(start * 1000).toISOString());
-    url.searchParams.set("end", new Date(now * 1000).toISOString());
-    try {
-      const payload = await fetchJson<unknown>(url.toString(), { signal });
-      if (!Array.isArray(payload)) continue;
-      const candles = payload.flatMap((row): MarketCandle[] => {
+  const url = new URL(`${EXCHANGE_API}/${encodeURIComponent(`${asset}-USD`)}/candles`);
+  url.searchParams.set("granularity", String(granularity));
+  url.searchParams.set("start", new Date((now - granularity * CANDLE_LOOKBACK_BARS) * 1000).toISOString());
+  url.searchParams.set("end", new Date(now * 1000).toISOString());
+  try {
+    const payload = await fetchJson<unknown>(url.toString(), { signal });
+    if (!Array.isArray(payload)) return [];
+    return payload
+      .flatMap((row): MarketCandle[] => {
         if (!Array.isArray(row) || row.length < 5) return [];
-        const [timeValue, lowValue, highValue, openValue, closeValue, volumeValue] = row;
-        const timestampSeconds = finiteNumber(timeValue);
-        const low = finiteNumber(lowValue);
-        const high = finiteNumber(highValue);
-        const open = finiteNumber(openValue);
-        const close = finiteNumber(closeValue);
-        const volume = finiteNumber(volumeValue) ?? 0;
-        if (timestampSeconds === null || low === null || high === null || open === null || close === null) return [];
-        if (Math.min(low, high, open, close) <= 0 || high < low || volume < 0) return [];
-        return [{ timestamp: timestampSeconds * 1000, low, high, open, close, volume }];
-      });
-      return candles.sort((left, right) => left.timestamp - right.timestamp);
-    } catch (error) {
-      if (signal?.aborted) throw error;
-    }
+        const [time, low, high, open, close, volume] = row.map((value) => finiteNumber(value));
+        if (time === null || low === null || high === null || open === null || close === null) return [];
+        if (Math.min(low, high, open, close) <= 0 || high < low) return [];
+        return [{ timestamp: time * 1000, low, high, open, close, volume: volume ?? 0 }];
+      })
+      .sort((left, right) => left.timestamp - right.timestamp);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return [];
   }
-  return [];
 };
 
 export async function fetchCandleHistories(assets: Asset[], signal?: AbortSignal): Promise<Map<Asset, CandleHistory>> {
-  const uniqueAssets = [...new Set(assets)].filter(Boolean);
   const histories = new Map<Asset, CandleHistory>();
   const now = Date.now();
   const missing: Asset[] = [];
-
-  for (const asset of uniqueAssets) {
+  for (const asset of [...new Set(assets)].filter(Boolean)) {
     const cached = candleHistoryCache.get(asset);
     if (cached && now - cached.updatedAt < CANDLE_CACHE_MS) histories.set(asset, cached);
     else missing.push(asset);
   }
-
   for (let index = 0; index < missing.length; index += 4) {
-    const chunk = missing.slice(index, index + 4);
-    const fetched = await Promise.all(chunk.map(async (asset) => {
-      const [fiveMinute, fifteenMinute] = await Promise.all([
-        fetchCoinbaseCandles(asset, 300, signal),
-        fetchCoinbaseCandles(asset, 900, signal),
-      ]);
-      const history = { fiveMinute, fifteenMinute, updatedAt: Date.now() };
-      candleHistoryCache.set(asset, history);
-      return [asset, history] as const;
-    }));
+    const fetched = await Promise.all(
+      missing.slice(index, index + 4).map(async (asset) => {
+        const [fiveMinute, fifteenMinute] = await Promise.all([fetchCoinbaseCandles(asset, 300, signal), fetchCoinbaseCandles(asset, 900, signal)]);
+        const history = { fiveMinute, fifteenMinute, updatedAt: Date.now() };
+        candleHistoryCache.set(asset, history);
+        return [asset, history] as const;
+      }),
+    );
     for (const [asset, history] of fetched) histories.set(asset, history);
   }
-
   return histories;
 }
 
-const bestBid = (book: OrderBook | null): number | null => book?.bids.length ? Math.max(...book.bids.map((level) => level.price)) : null;
-const bestAsk = (book: OrderBook | null): number | null => book?.asks.length ? Math.min(...book.asks.map((level) => level.price)) : null;
-const depthNotional = (book: OrderBook | null): number => book?.asks.slice(0, 8).reduce((sum, level) => sum + level.price * level.size, 0) ?? 0;
-const topSize = (book: OrderBook | null): number => (book?.asks[0]?.size ?? 0) + (book?.bids[book.bids.length - 1]?.size ?? 0);
+// ---------------------------------------------------------------------------
+// LiveMarket assembly and incremental updates.
 
-const withUpdatedBooks = (market: LiveMarket, upBook: OrderBook | null, downBook: OrderBook | null, now: number): LiveMarket => {
-  const upBid = bestBid(upBook); const upAsk = bestAsk(upBook);
-  const downBid = bestBid(downBook); const downAsk = bestAsk(downBook);
-  const spreads = [upBid !== null && upAsk !== null ? upAsk - upBid : null, downBid !== null && downAsk !== null ? downAsk - downBid : null].filter((value): value is number => value !== null);
-  const upDepth = depthNotional(upBook); const downDepth = depthNotional(downBook); const total = upDepth + downDepth;
-  const spread = spreads.length ? Math.max(...spreads) : null;
-  return { ...market, upBook, downBook, upBid, upAsk, downBid, downAsk, spread, liquidity: total, imbalance: total > 0 ? (upDepth - downDepth) / total : null, edgeUp: market.fairUp !== null && upAsk !== null ? market.fairUp - upAsk : null, edgeDown: market.fairUp !== null && downAsk !== null ? 1 - market.fairUp - downAsk : null, sourceTimestamp: now };
-};
+const bestBidOf = (book: OrderBook | null) => book?.bids[0]?.price ?? null;
+const bestAskOf = (book: OrderBook | null) => book?.asks[0]?.price ?? null;
+const depthNotional = (book: OrderBook | null) => book?.asks.slice(0, 8).reduce((sum, level) => sum + level.price * level.size, 0) ?? 0;
 
-export const replaceLiveMarketBook = (market: LiveMarket, tokenId: string, bids: BookLevel[], asks: BookLevel[], timestamp: number | null, hash: string | null, now = Date.now()): LiveMarket => {
-  const existing = tokenId === market.upTokenId ? market.upBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : tokenId === market.downTokenId ? market.downBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : null;
-  if (!existing) return market;
-  const book: OrderBook = { ...existing, bids: bids.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => right.price - left.price), asks: asks.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => left.price - right.price), timestamp, hash };
-  return tokenId === market.upTokenId ? withUpdatedBooks(market, book, market.downBook, now) : withUpdatedBooks(market, market.upBook, book, now);
-};
-
-export const updateLiveMarketBookLevel = (market: LiveMarket, tokenId: string, side: "BUY" | "SELL", price: number, size: number, now = Date.now()): LiveMarket => {
-  const existing = tokenId === market.upTokenId ? market.upBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : tokenId === market.downTokenId ? market.downBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : null;
-  if (!existing || price <= 0 || !Number.isFinite(price) || !Number.isFinite(size)) return market;
-  const sideKey = side === "BUY" ? "bids" : "asks";
-  const levels = existing[sideKey].filter((level) => level.price !== price);
-  if (size > 0) levels.push({ price, size });
-  const book = { ...existing, [sideKey]: levels.sort((left, right) => side === "BUY" ? right.price - left.price : left.price - right.price), timestamp: now };
-  return tokenId === market.upTokenId ? withUpdatedBooks(market, book, market.downBook, now) : withUpdatedBooks(market, market.upBook, book, now);
-};
-
-const normalCdf = (value: number): number => {
-  const absolute = Math.abs(value);
-  const t = 1 / (1 + 0.2316419 * absolute);
-  const density = 0.3989422804014327 * Math.exp(-0.5 * absolute * absolute);
-  const tail = density * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
-  return value >= 0 ? 1 - tail : tail;
-};
-
-const candleVolatility = (candles: MarketCandle[], durationSeconds: number, now: number): number | null => {
-  const completed = candles.filter((candle) => candle.timestamp + durationSeconds * 1000 <= now && candle.close > 0);
-  if (completed.length < 20) return null;
-  const recent = completed.slice(-21);
-  const returns = recent.slice(1).map((candle, index) => Math.log(candle.close / recent[index].close));
-  if (returns.length < 12) return null;
-  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
-  const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (returns.length - 1);
-  const volatility = Math.sqrt(variance);
-  return Number.isFinite(volatility) && volatility > 0 ? volatility : null;
-};
-
-export const chartFairProbability = (
-  reference: number | null,
-  spot: number | null,
-  remainingSeconds: number,
-  duration: Horizon,
-  candles: MarketCandle[],
-  now: number,
-): number | null => {
-  if (reference === null || spot === null || reference <= 0 || spot <= 0) return null;
-  const barSeconds = duration === "5m" ? 300 : 900;
-  const volatility = candleVolatility(candles, barSeconds, now);
-  if (volatility === null) return null;
-  const remainingBars = Math.max(1 / 60, remainingSeconds / barSeconds);
-  const sigmaRemaining = volatility * Math.sqrt(remainingBars);
-  if (!Number.isFinite(sigmaRemaining) || sigmaRemaining <= 0) return null;
-  const zScore = Math.log(spot / reference) / sigmaRemaining;
-  return clamp(normalCdf(zScore), 0.01, 0.99);
-};
-
-export const estimateFairProbability = (reference: number | null, spot: number | null, remainingSeconds: number): number | null => {
-  if (reference === null || spot === null || reference <= 0 || spot <= 0) return null;
-  const distance = (spot - reference) / reference;
-  const timeScale = Math.sqrt(900 / Math.max(30, remainingSeconds));
-  return clamp(0.5 + distance * 12 * timeScale, 0.04, 0.96);
-};
-
-export const buildLiveMarket = (
-  definition: MarketDefinition,
-  books: Map<string, OrderBook>,
-  spots: Map<Asset, number>,
-  previousSpot: number | null,
-  now = Date.now(),
-  candleHistory: CandleHistory | null = null,
-): LiveMarket => {
-  const upBook = books.get(definition.upTokenId) ?? null;
-  const downBook = books.get(definition.downTokenId) ?? null;
-  const spot = spots.get(definition.asset) ?? null;
-  const remaining = Math.max(0, Math.ceil((definition.endTime - (now + polymarketClockOffsetMs)) / 1000));
-  const chart5m = candleHistory?.fiveMinute ?? [];
-  const chart15m = candleHistory?.fifteenMinute ?? [];
-  const startCandle = definition.startTime === null ? null : chart5m
-    .filter((candle) => Math.abs(candle.timestamp - definition.startTime!) <= 60_000)
-    .sort((left, right) => Math.abs(left.timestamp - definition.startTime!) - Math.abs(right.timestamp - definition.startTime!))[0] ?? null;
-  const reference = definition.reference ?? startCandle?.open ?? null;
-  const referenceSource = definition.reference !== null ? definition.referenceSource : startCandle ? "COINBASE ESTIMATE" : "MISSING";
-  const targetCandles = definition.duration === "5m" ? chart5m : chart15m;
-  const fairUp = chartFairProbability(reference, spot, remaining, definition.duration, targetCandles, now);
-  const upBid = bestBid(upBook);
-  const upAsk = bestAsk(upBook);
-  const downBid = bestBid(downBook);
-  const downAsk = bestAsk(downBook);
-  const edgeUp = fairUp !== null && upAsk !== null ? fairUp - upAsk : null;
-  const edgeDown = fairUp !== null && downAsk !== null ? 1 - fairUp - downAsk : null;
-  const spreadValues = [upBid !== null && upAsk !== null ? upAsk - upBid : null, downBid !== null && downAsk !== null ? downAsk - downBid : null].filter((value): value is number => value !== null);
-  const spread = spreadValues.length ? Math.max(...spreadValues) : null;
+export const withBooks = (market: LiveMarket, upBook: OrderBook | null, downBook: OrderBook | null, now: number): LiveMarket => {
+  const upBid = bestBidOf(upBook);
+  const upAsk = bestAskOf(upBook);
+  const downBid = bestBidOf(downBook);
+  const downAsk = bestAskOf(downBook);
+  const spreads = [upBid !== null && upAsk !== null ? upAsk - upBid : null, downBid !== null && downAsk !== null ? downAsk - downBid : null].filter(
+    (value): value is number => value !== null,
+  );
   const upDepth = depthNotional(upBook);
   const downDepth = depthNotional(downBook);
-  const totalDepth = upDepth + downDepth;
-  const imbalance = totalDepth > 0 ? (upDepth - downDepth) / totalDepth : null;
-  const distance = reference !== null && spot !== null ? (spot - reference) / reference : null;
-  const momentum = previousSpot !== null && spot !== null && previousSpot > 0 ? Math.log(spot / previousSpot) : null;
-  const regime = reference === null ? "REFERENCE MISSING" : distance === null ? "SPOT MISSING" : Math.abs(distance) < 0.0002 ? "NEUTRAL" : distance > 0 ? "UP MOMENTUM" : "DOWN MOMENTUM";
+  const total = upDepth + downDepth;
   return {
-    ...definition,
-    remaining,
-    countdownEndsAt: definition.endTime - polymarketClockOffsetMs,
-    reference,
-    referenceSource,
-    spot,
+    ...market,
     upBook,
     downBook,
     upBid,
     upAsk,
     downBid,
     downAsk,
-    fairUp,
-    edgeUp,
-    edgeDown,
-    spread,
-    liquidity: upDepth + downDepth,
-    imbalance,
-    momentum,
-    distance,
-    regime,
+    spread: spreads.length ? Math.max(...spreads) : null,
+    liquidity: total,
+    imbalance: total > 0 ? (upDepth - downDepth) / total : null,
     sourceTimestamp: now,
-    chart5m,
-    chart15m,
-    chartUpdatedAt: candleHistory?.updatedAt ?? null,
   };
 };
 
-export const updateLiveCandles = (market: LiveMarket, spot: number, now = Date.now()): Pick<LiveMarket, "chart5m" | "chart15m"> => {
-  const update = (history: MarketCandle[], seconds: 300 | 900): MarketCandle[] => {
-    const start = Math.floor(now / (seconds * 1000)) * seconds * 1000;
-    const current = history[history.length - 1];
-    if (current?.timestamp === start) {
-      return [...history.slice(0, -1), { ...current, high: Math.max(current.high, spot), low: Math.min(current.low, spot), close: spot }];
-    }
-    if (current && current.timestamp > start) return history;
-    const open = current?.close ?? spot;
-    return [...history, { timestamp: start, low: Math.min(open, spot), high: Math.max(open, spot), open, close: spot, volume: 0 }].slice(-CANDLE_LOOKBACK_BARS);
-  };
-  return { chart5m: update(market.chart5m, 300), chart15m: update(market.chart15m, 900) };
+export type MarketContext = {
+  books: Map<string, OrderBook>;
+  official: Map<string, OfficialPrice>;
+  /** Stream values recorded at window starts, keyed by `openKey`. */
+  recordedOpens?: Map<string, number>;
+  candles: Map<Asset, CandleHistory>;
 };
 
-export const orderBookFor = (market: LiveMarket, side: "UP" | "DOWN"): OrderBook | null => side === "UP" ? market.upBook : market.downBook;
+/** Official-price cache key; includes duration because 5m and 15m windows share an open but not a close. */
+export const officialKey = (market: Pick<MarketDefinition, "asset" | "startTime" | "duration">) => `${market.asset}:${market.duration}:${market.startTime}`;
+/** Recorded stream opens are duration-independent. */
+export const openKey = (market: Pick<MarketDefinition, "asset" | "startTime">) => `${market.asset}:${market.startTime}`;
 
-export const bestBidFor = (market: LiveMarket, side: "UP" | "DOWN"): number | null => side === "UP" ? market.upBid : market.downBid;
+export const buildLiveMarket = (
+  definition: MarketDefinition,
+  context: MarketContext,
+  now = polymarketNow(),
+  previous: LiveMarket | null = null,
+): LiveMarket => {
+  const official = context.official.get(officialKey(definition)) ?? null;
+  const recorded = context.recordedOpens?.get(openKey(definition)) ?? null;
+  const candles = context.candles.get(definition.asset) ?? null;
+  const reference = official?.openPrice ?? recorded ?? previous?.reference ?? null;
+  const base: LiveMarket = {
+    ...definition,
+    remaining: Math.max(0, (definition.endTime - now) / 1000),
+    reference,
+    referenceSource: reference !== null ? "CHAINLINK" : "MISSING",
+    officialClose: official?.completed ? official.closePrice : (previous?.officialClose ?? null),
+    upBook: null,
+    downBook: null,
+    upBid: null,
+    upAsk: null,
+    downBid: null,
+    downAsk: null,
+    spread: null,
+    liquidity: 0,
+    imbalance: null,
+    sourceTimestamp: now,
+    chart5m: candles?.fiveMinute ?? previous?.chart5m ?? [],
+    chart15m: candles?.fifteenMinute ?? previous?.chart15m ?? [],
+    chartUpdatedAt: candles?.updatedAt ?? previous?.chartUpdatedAt ?? null,
+  };
+  const upBook = newerBook(previous?.upBook ?? null, context.books.get(definition.upTokenId) ?? null);
+  const downBook = newerBook(previous?.downBook ?? null, context.books.get(definition.downTokenId) ?? null);
+  return withBooks(base, upBook, downBook, now);
+};
 
-export const bestAskFor = (market: LiveMarket, side: "UP" | "DOWN"): number | null => side === "UP" ? market.upAsk : market.downAsk;
+/** Attach a verified reference (official API or our own recorded stream tick at the start). */
+export const withReference = (market: LiveMarket, reference: number | null): LiveMarket =>
+  reference === null || market.reference !== null ? market : { ...market, reference, referenceSource: "CHAINLINK" };
 
-export const sideFairProbability = (market: LiveMarket, side: "UP" | "DOWN"): number | null => market.fairUp === null ? null : side === "UP" ? market.fairUp : 1 - market.fairUp;
+const emptyBook = (tokenId: string): OrderBook => ({ tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, tickSize: null, hash: null });
 
-export const bookTopSize = (market: LiveMarket, side: "UP" | "DOWN") => topSize(orderBookFor(market, side));
+export const replaceLiveMarketBook = (
+  market: LiveMarket,
+  tokenId: string,
+  bids: BookLevel[],
+  asks: BookLevel[],
+  timestamp: number | null,
+  hash: string | null,
+  now = Date.now(),
+): LiveMarket => {
+  const isUp = tokenId === market.upTokenId;
+  if (!isUp && tokenId !== market.downTokenId) return market;
+  const existing = (isUp ? market.upBook : market.downBook) ?? emptyBook(tokenId);
+  const book: OrderBook = { ...existing, ...sortBook(bids, asks), timestamp: timestamp ?? now, hash };
+  return isUp ? withBooks(market, book, market.downBook, now) : withBooks(market, market.upBook, book, now);
+};
+
+export const updateLiveMarketBookLevel = (
+  market: LiveMarket,
+  tokenId: string,
+  side: "BUY" | "SELL",
+  price: number,
+  size: number,
+  timestamp: number | null,
+  now = Date.now(),
+): LiveMarket => {
+  const isUp = tokenId === market.upTokenId;
+  if ((!isUp && tokenId !== market.downTokenId) || !(price > 0) || !Number.isFinite(size)) return market;
+  const existing = (isUp ? market.upBook : market.downBook) ?? emptyBook(tokenId);
+  const key = side === "BUY" ? "bids" : "asks";
+  const levels = existing[key].filter((level) => level.price !== price);
+  if (size > 0) levels.push({ price, size });
+  const sorted = key === "bids" ? sortBook(levels, existing.asks) : sortBook(existing.bids, levels);
+  const book: OrderBook = { ...existing, ...sorted, timestamp: timestamp ?? now };
+  return isUp ? withBooks(market, book, market.downBook, now) : withBooks(market, market.upBook, book, now);
+};
+
+export const snapshotFromLiveMarket = (market: LiveMarket, feed: DerivedFeed | null, now = polymarketNow()): MarketSnapshot => ({
+  marketId: market.id,
+  asset: market.asset,
+  duration: market.duration,
+  startTime: market.startTime,
+  endTime: market.endTime,
+  now,
+  reference: market.reference,
+  referenceSource: market.referenceSource,
+  spot: feed?.spot ?? null,
+  spotTimestamp: feed?.spotTimestamp ?? null,
+  spotSource: feed?.spotSource ?? "MISSING",
+  basisBps: feed?.basisBps ?? null,
+  ticks: (feed?.ticks ?? []).filter(
+    (tick) => tick.timestamp > market.endTime - Math.max(60, market.twapLookbackSeconds) * 1000 - 5_000 && tick.timestamp <= now,
+  ),
+  sigmaPerSqrtSecond: feed?.sigmaPerSqrtSecond ?? null,
+  volSamples: feed?.volSamples ?? 0,
+  twapLookbackSeconds: market.twapLookbackSeconds,
+  feeSchedule: market.feeSchedule,
+  tickSize: market.tickSize,
+  minOrderSize: market.minOrderSize,
+  up: { bids: market.upBook?.bids ?? [], asks: market.upBook?.asks ?? [], timestamp: market.upBook?.timestamp ?? null },
+  down: { bids: market.downBook?.bids ?? [], asks: market.downBook?.asks ?? [], timestamp: market.downBook?.timestamp ?? null },
+});
+
+export const bestBidFor = (market: LiveMarket, side: Side) => (side === "UP" ? market.upBid : market.downBid);
+export const bestAskFor = (market: LiveMarket, side: Side) => (side === "UP" ? market.upAsk : market.downAsk);
+export const orderBookFor = (market: LiveMarket, side: Side) => (side === "UP" ? market.upBook : market.downBook);
+export const tokenFor = (market: MarketDefinition, side: Side) => (side === "UP" ? market.upTokenId : market.downTokenId);
+
+/** Symbol used by Polymarket RTDS for Chainlink prices, e.g. "btc/usd". */
+export const chainlinkSymbol = (asset: string) => `${asset.toLowerCase()}/usd`;

@@ -598,3 +598,20 @@ button { color: inherit; }
   .live-status-row { align-items: flex-start; flex-wrap: wrap; }
   .live-status-row span { flex-basis: 100%; }
 }
+
+/* Research lab: calibration and breakdowns */
+.replay-charts { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) 190px; align-items: center; }
+.reliability-chart { width: 180px; height: 180px; display: block; }
+.reliability-frame { fill: var(--panel-deep); stroke: var(--border-bright); }
+.reliability-diagonal { stroke: var(--muted-2); stroke-dasharray: 4 4; }
+.reliability-point { fill: var(--cyan); fill-opacity: 0.8; }
+.breakdown-grid { display: grid; gap: 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 16px; }
+.breakdown { display: grid; gap: 4px; font-family: var(--font-mono); font-size: 11px; }
+.breakdown > strong { color: var(--muted); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+.breakdown-row { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; }
+.walk-forward-panel { padding: 16px; margin-bottom: 14px; }
+.closed-row td { opacity: 0.72; }
+.market-card .sparkline { margin: 6px 0 2px; }
+@media (max-width: 760px) {
+  .replay-charts, .breakdown-grid { grid-template-columns: 1fr; }
+}

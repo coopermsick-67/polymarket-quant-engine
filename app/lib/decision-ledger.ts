@@ -1,156 +1,201 @@
-import type { Horizon } from "./polymarket-data";
-import type { MarketSignal, PaperSide } from "./engines";
+// Every-market decision ledger. Rows record the FIRST entry decision (so a
+// later flip cannot hide a bad call), a fixed pre-expiry checkpoint for honest
+// calibration against the market, and the official Polymarket outcome.
 
-export type LedgerDecision = PaperSide | "PASS";
+import { mean, wilsonInterval } from "./num";
+import type { LiveMarket, Resolution } from "./polymarket-data";
+import type { Side, Signal } from "./signal";
+
+export type LedgerDecision = Side | "PASS";
 export type LedgerResult = "WIN" | "LOSS" | "PENDING" | "NOT TRADED";
+
+export const CHECKPOINT_SECONDS = 120;
 
 export type MarketDecisionRow = {
   id: string;
   marketId: string;
-  observedAt: number;
   firstSeenAt: number;
   lastUpdatedAt: number;
   asset: string;
-  duration: Horizon;
+  duration: string;
   slug: string;
   question: string;
   sourceUrl: string;
+  endTime: number;
   decision: LedgerDecision;
-  initialDecision: LedgerDecision;
-  tier: MarketSignal["tier"];
-  fairUp: number | null;
-  upEdge: number | null;
-  downEdge: number | null;
-  edge: number | null;
-  entryPrice: number | null;
-  upAsk: number | null;
-  downAsk: number | null;
-  reference: number | null;
-  spot: number | null;
-  remainingSeconds: number;
-  outcome: PaperSide | null;
-  result: LedgerResult;
-  outcomeAt: number | null;
-  simulatedStake: number;
-  simulatedUnits: number;
-  signalConfidence: number | null;
-  biasConfidence: number | null;
-  trend5m: string;
-  trend15m: string;
+  gate: string;
   reason: string;
   changeCount: number;
+  /** First non-PASS decision; this is what the ledger is graded on. */
+  entry: { side: Side; at: number; probability: number; costPerShare: number; edge: number; tier: string } | null;
+  /** Model, posterior and market P(UP) at the first observation inside the checkpoint. */
+  checkpoint: { at: number; remaining: number; model: number; posterior: number; market: number } | null;
+  reference: number | null;
+  outcome: Side | null;
+  outcomeAt: number | null;
+  result: LedgerResult;
 };
+
+export const ledgerResultFor = (entry: MarketDecisionRow["entry"], outcome: Side | null): LedgerResult => {
+  if (!entry) return "NOT TRADED";
+  if (!outcome) return "PENDING";
+  return entry.side === outcome ? "WIN" : "LOSS";
+};
+
+export const updateLedgerRow = (previous: MarketDecisionRow | undefined, market: LiveMarket, signal: Signal, now: number): MarketDecisionRow => {
+  const remaining = (market.endTime - now) / 1000;
+  const entry =
+    previous?.entry ??
+    (signal.action !== "PASS" && signal.chosen?.fill
+      ? {
+          side: signal.action,
+          at: now,
+          probability: signal.chosen.conservativeProbability,
+          costPerShare: signal.chosen.fill.costPerShare,
+          edge: signal.chosen.edge ?? 0,
+          tier: signal.tier,
+        }
+      : null);
+  const checkpoint =
+    previous?.checkpoint ??
+    (remaining <= CHECKPOINT_SECONDS &&
+    remaining > CHECKPOINT_SECONDS - 30 &&
+    signal.pUpModel !== null &&
+    signal.pUpPosterior !== null &&
+    signal.pUpMarket !== null
+      ? { at: now, remaining, model: signal.pUpModel, posterior: signal.pUpPosterior, market: signal.pUpMarket }
+      : null);
+  const outcome = previous?.outcome ?? null;
+  return {
+    id: market.id,
+    marketId: market.id,
+    firstSeenAt: previous?.firstSeenAt ?? now,
+    lastUpdatedAt: now,
+    asset: market.asset,
+    duration: market.duration,
+    slug: market.slug,
+    question: market.question,
+    sourceUrl: market.sourceUrl,
+    endTime: market.endTime,
+    decision: signal.action,
+    gate: signal.gate,
+    reason: signal.reason,
+    changeCount: (previous?.changeCount ?? 0) + (previous && previous.decision !== signal.action ? 1 : 0),
+    entry,
+    checkpoint,
+    reference: market.reference,
+    outcome,
+    outcomeAt: previous?.outcomeAt ?? null,
+    result: ledgerResultFor(entry, outcome),
+  };
+};
+
+export const resolveLedgerRow = (row: MarketDecisionRow, resolution: Resolution): MarketDecisionRow =>
+  row.outcome ? row : { ...row, outcome: resolution.outcome, outcomeAt: resolution.resolvedAt, result: ledgerResultFor(row.entry, resolution.outcome) };
 
 export type LedgerMetrics = {
   tracked: number;
-  up: number;
-  down: number;
-  pass: number;
+  entries: number;
   settled: number;
   wins: number;
-  losses: number;
+  winRate: number | null;
+  winRateCi: [number, number] | null;
+  /** Mean of (outcome - all-in cost) per entered share: the edge actually realized. */
+  realizedEdge: number | null;
+  predictedEdge: number | null;
   pending: number;
-  upSettled: number;
-  upWins: number;
-  downSettled: number;
-  downWins: number;
-  combinedWinRate: number | null;
-  upWinRate: number | null;
-  downWinRate: number | null;
-};
-
-const round = (value: number, digits = 6) => Number(value.toFixed(digits));
-const numberOrNull = (value: number | null | undefined) => value === null || value === undefined || !Number.isFinite(value) ? null : round(value);
-
-export const ledgerResultFor = (decision: LedgerDecision, outcome: PaperSide | null): LedgerResult => {
-  if (decision === "PASS") return "NOT TRADED";
-  if (!outcome) return "PENDING";
-  return decision === outcome ? "WIN" : "LOSS";
+  calibrated: number;
+  brierModel: number | null;
+  brierPosterior: number | null;
+  brierMarket: number | null;
 };
 
 export const computeLedgerMetrics = (rows: MarketDecisionRow[]): LedgerMetrics => {
-  const upRows = rows.filter((row) => row.decision === "UP");
-  const downRows = rows.filter((row) => row.decision === "DOWN");
-  const settledRows = rows.filter((row) => row.result === "WIN" || row.result === "LOSS");
-  const wins = settledRows.filter((row) => row.result === "WIN").length;
-  const upSettledRows = upRows.filter((row) => row.result === "WIN" || row.result === "LOSS");
-  const downSettledRows = downRows.filter((row) => row.result === "WIN" || row.result === "LOSS");
-  const rate = (won: number, total: number) => total ? won / total : null;
+  const entered = rows.filter((row) => row.entry);
+  const settled = entered.filter((row) => row.outcome);
+  const wins = settled.filter((row) => row.entry!.side === row.outcome).length;
+  const calibrated = rows.filter((row) => row.checkpoint && row.outcome);
+  const brier = (key: "model" | "posterior" | "market") =>
+    calibrated.length ? mean(calibrated.map((row) => (row.checkpoint![key] - (row.outcome === "UP" ? 1 : 0)) ** 2)) : null;
   return {
     tracked: rows.length,
-    up: upRows.length,
-    down: downRows.length,
-    pass: rows.filter((row) => row.decision === "PASS").length,
-    settled: settledRows.length,
+    entries: entered.length,
+    settled: settled.length,
     wins,
-    losses: settledRows.length - wins,
-    pending: rows.filter((row) => row.result === "PENDING").length,
-    upSettled: upSettledRows.length,
-    upWins: upSettledRows.filter((row) => row.result === "WIN").length,
-    downSettled: downSettledRows.length,
-    downWins: downSettledRows.filter((row) => row.result === "WIN").length,
-    combinedWinRate: rate(wins, settledRows.length),
-    upWinRate: rate(upSettledRows.filter((row) => row.result === "WIN").length, upSettledRows.length),
-    downWinRate: rate(downSettledRows.filter((row) => row.result === "WIN").length, downSettledRows.length),
+    winRate: settled.length ? wins / settled.length : null,
+    winRateCi: wilsonInterval(wins, settled.length),
+    realizedEdge: settled.length ? mean(settled.map((row) => (row.entry!.side === row.outcome ? 1 : 0) - row.entry!.costPerShare)) : null,
+    predictedEdge: settled.length ? mean(settled.map((row) => row.entry!.edge)) : null,
+    pending: entered.filter((row) => !row.outcome).length,
+    calibrated: calibrated.length,
+    brierModel: brier("model"),
+    brierPosterior: brier("posterior"),
+    brierMarket: brier("market"),
   };
 };
 
 const csvCell = (value: unknown) => {
   const text = value === null || value === undefined ? "" : String(value);
-  return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 };
 
 export const decisionLedgerCsv = (rows: MarketDecisionRow[]) => {
-  const metrics = computeLedgerMetrics(rows);
   const headers = [
-    "id", "market_id", "observed_at_utc", "first_seen_at_utc", "last_updated_at_utc", "asset", "duration",
-    "slug", "question", "source_url", "decision", "initial_decision", "tier", "fair_up", "up_edge", "down_edge",
-    "selected_edge", "entry_price", "up_ask", "down_ask", "reference", "spot", "remaining_seconds", "outcome",
-    "result", "outcome_at_utc", "simulated_stake_usd", "simulated_units", "signal_confidence", "bias_confidence",
-    "trend_5m", "trend_15m", "change_count", "reason", "tracked_markets", "settled_markets", "pass_count",
-    "up_win_rate", "down_win_rate", "combined_win_rate",
+    "market_id",
+    "asset",
+    "duration",
+    "slug",
+    "end_time_utc",
+    "first_seen_utc",
+    "reference",
+    "last_decision",
+    "last_gate",
+    "entry_side",
+    "entry_at_utc",
+    "entry_probability",
+    "entry_cost_per_share",
+    "entry_edge",
+    "entry_tier",
+    "checkpoint_remaining_s",
+    "checkpoint_model_up",
+    "checkpoint_posterior_up",
+    "checkpoint_market_up",
+    "outcome",
+    "result",
+    "change_count",
+    "reason",
   ];
-  const lines = rows.slice().sort((left, right) => left.observedAt - right.observedAt).map((row) => [
-    row.id,
-    row.marketId,
-    new Date(row.observedAt).toISOString(),
-    new Date(row.firstSeenAt).toISOString(),
-    new Date(row.lastUpdatedAt).toISOString(),
-    row.asset,
-    row.duration,
-    row.slug,
-    row.question,
-    row.sourceUrl,
-    row.decision,
-    row.initialDecision,
-    row.tier,
-    numberOrNull(row.fairUp),
-    numberOrNull(row.upEdge),
-    numberOrNull(row.downEdge),
-    numberOrNull(row.edge),
-    numberOrNull(row.entryPrice),
-    numberOrNull(row.upAsk),
-    numberOrNull(row.downAsk),
-    numberOrNull(row.reference),
-    numberOrNull(row.spot),
-    row.remainingSeconds,
-    row.outcome ?? "",
-    row.result,
-    row.outcomeAt ? new Date(row.outcomeAt).toISOString() : "",
-    numberOrNull(row.simulatedStake),
-    numberOrNull(row.simulatedUnits),
-    numberOrNull(row.signalConfidence),
-    numberOrNull(row.biasConfidence),
-    row.trend5m,
-    row.trend15m,
-    row.changeCount,
-    row.reason,
-    metrics.tracked,
-    metrics.settled,
-    metrics.pass,
-    metrics.upWinRate,
-    metrics.downWinRate,
-    metrics.combinedWinRate,
-  ].map(csvCell).join(","));
+  const iso = (value: number | null | undefined) => (value ? new Date(value).toISOString() : "");
+  const lines = [...rows]
+    .sort((left, right) => left.endTime - right.endTime)
+    .map((row) =>
+      [
+        row.marketId,
+        row.asset,
+        row.duration,
+        row.slug,
+        iso(row.endTime),
+        iso(row.firstSeenAt),
+        row.reference,
+        row.decision,
+        row.gate,
+        row.entry?.side,
+        iso(row.entry?.at),
+        row.entry?.probability,
+        row.entry?.costPerShare,
+        row.entry?.edge,
+        row.entry?.tier,
+        row.checkpoint?.remaining,
+        row.checkpoint?.model,
+        row.checkpoint?.posterior,
+        row.checkpoint?.market,
+        row.outcome,
+        row.result,
+        row.changeCount,
+        row.reason,
+      ]
+        .map(csvCell)
+        .join(","),
+    );
   return [headers.join(","), ...lines].join("\n") + "\n";
 };

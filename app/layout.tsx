@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "PM5 Predictor Terminal",
-  description: "A terminal-style paper signal monitor for a Polymarket 5-minute Up/Down predictor.",
+  title: "Polymarket Quant Engine",
+  description: "TWAP-settlement pricing, paper/shadow trading, replay backtests, and limit-priced live execution for Polymarket 5m/15m crypto Up/Down markets.",
   other: {
     "codex-preview": "development",
   },

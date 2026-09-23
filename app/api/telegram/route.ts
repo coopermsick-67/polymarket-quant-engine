@@ -17,9 +17,11 @@ const responseHeaders = {
   "X-Content-Type-Options": "nosniff",
 };
 
-const json = (body: unknown, status = 200, extraHeaders: Record<string, string> = {}) => new Response(JSON.stringify(body), { status, headers: { ...responseHeaders, ...extraHeaders } });
-const text = (value: unknown) => typeof value === "string" ? value.trim() : "";
-const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+const json = (body: unknown, status = 200, extraHeaders: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), { status, headers: { ...responseHeaders, ...extraHeaders } });
+const text = (value: unknown) => (typeof value === "string" ? value.trim() : "");
+const record = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 const validBotToken = (value: string) => /^\d{6,12}:[A-Za-z0-9_-]{20,}$/.test(value);
 
 const telegramJson = async (botToken: string, method: string, params?: Record<string, string>) => {
@@ -30,7 +32,11 @@ const telegramJson = async (botToken: string, method: string, params?: Record<st
     const response = await fetch("https://api.telegram.org/bot" + botToken + "/" + method + query, { cache: "no-store", signal: controller.signal });
     const body = await response.text();
     let payload: unknown = null;
-    try { payload = body ? JSON.parse(body) : null; } catch { payload = null; }
+    try {
+      payload = body ? JSON.parse(body) : null;
+    } catch {
+      payload = null;
+    }
     if (!response.ok || record(payload).ok !== true) throw new Error(text(record(payload).description) || "Telegram rejected the request.");
     return record(payload).result;
   } finally {
@@ -65,14 +71,19 @@ const publicSession = (session: TelegramSession) => ({
   expiresAt: session.expiresAt,
 });
 
-const errorMessage = (error: unknown) => error instanceof Error ? error.message.replace(/\d{6,12}:[A-Za-z0-9_-]{20,}/g, "[redacted]").slice(0, 220) : "Telegram request failed.";
+const errorMessage = (error: unknown) =>
+  error instanceof Error ? error.message.replace(/\d{6,12}:[A-Za-z0-9_-]{20,}/g, "[redacted]").slice(0, 220) : "Telegram request failed.";
 
 export async function POST(request: Request) {
   const gate = await ownerGate(request);
   if (gate.response || !gate.user) return gate.response ?? json({ ok: false, error: "Telegram authorization failed." }, 401);
   const secureCookie = !isLoopbackRequest(request);
   let input: { action?: unknown; botToken?: unknown; chatId?: unknown; text?: unknown };
-  try { input = await request.json() as typeof input; } catch { return json({ ok: false, error: "Invalid JSON request." }, 400); }
+  try {
+    input = (await request.json()) as typeof input;
+  } catch {
+    return json({ ok: false, error: "Invalid JSON request." }, 400);
+  }
   const action = text(input.action);
   if (!["connect", "status", "send-test", "send-report", "disconnect"].includes(action)) return json({ ok: false, error: "Unsupported Telegram action." }, 400);
   if (action === "disconnect") return json({ ok: true, status: "DISCONNECTED" }, 200, { "Set-Cookie": clearTelegramSessionCookie(secureCookie) });
@@ -98,14 +109,17 @@ export async function POST(request: Request) {
       };
       const sealed = await sealTelegramSession(session);
       if (!sealed) return json({ ok: false, error: "Telegram session storage is not configured." }, 503);
-      return json({ ok: true, status: "CONNECTED", telegram: publicSession(session) }, 200, { "Set-Cookie": telegramSessionCookie(sealed, TELEGRAM_SESSION_TTL_SECONDS, secureCookie) });
+      return json({ ok: true, status: "CONNECTED", telegram: publicSession(session) }, 200, {
+        "Set-Cookie": telegramSessionCookie(sealed, TELEGRAM_SESSION_TTL_SECONDS, secureCookie),
+      });
     } catch (error) {
       return json({ ok: false, error: errorMessage(error) }, 502);
     }
   }
 
   const session = await readTelegramSession(request, gate.user.userId);
-  if (!session) return json({ ok: false, error: "Telegram link expired. Link the bot again." }, 401, { "Set-Cookie": clearTelegramSessionCookie(secureCookie) });
+  if (!session)
+    return json({ ok: false, error: "Telegram link expired. Link the bot again." }, 401, { "Set-Cookie": clearTelegramSessionCookie(secureCookie) });
   if (action === "status") return json({ ok: true, status: "READY", telegram: publicSession(session) });
 
   const reportText = text(input.text);

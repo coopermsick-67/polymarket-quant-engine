@@ -1,4 +1,5 @@
 import { env } from "cloudflare:workers";
+import { fromBase64Url, toBase64Url } from "./num";
 
 export const TELEGRAM_SESSION_COOKIE = "pm_telegram_session_v1";
 export const TELEGRAM_SESSION_TTL_SECONDS = 90 * 24 * 60 * 60;
@@ -16,18 +17,6 @@ export type TelegramSession = {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-const toBase64Url = (bytes: Uint8Array) => {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-};
-
-const fromBase64Url = (value: string) => {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
-  const decoded = atob(normalized);
-  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
-};
 
 const secretBytes = () => {
   const secret = typeof env.POLYMARKET_TELEGRAM_SESSION_SECRET === "string" ? env.POLYMARKET_TELEGRAM_SESSION_SECRET.trim() : "";
@@ -54,7 +43,11 @@ export const sealTelegramSession = async (session: TelegramSession) => {
 export const readTelegramSession = async (request: Request, userId: string): Promise<TelegramSession | null> => {
   const key = await importKey();
   if (!key) return null;
-  const token = (request.headers.get("cookie") ?? "").split(";").map((part) => part.trim()).find((part) => part.startsWith(TELEGRAM_SESSION_COOKIE + "="))?.slice(TELEGRAM_SESSION_COOKIE.length + 1);
+  const token = (request.headers.get("cookie") ?? "")
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(TELEGRAM_SESSION_COOKIE + "="))
+    ?.slice(TELEGRAM_SESSION_COOKIE.length + 1);
   if (!token) return null;
   const [ivPart, ciphertextPart] = token.split(".");
   if (!ivPart || !ciphertextPart) return null;
@@ -68,5 +61,6 @@ export const readTelegramSession = async (request: Request, userId: string): Pro
   }
 };
 
-export const telegramSessionCookie = (token: string, maxAge = TELEGRAM_SESSION_TTL_SECONDS, secure = true) => TELEGRAM_SESSION_COOKIE + "=" + token + "; Path=/api/telegram; Max-Age=" + maxAge + "; HttpOnly" + (secure ? "; Secure" : "") + "; SameSite=Lax";
+export const telegramSessionCookie = (token: string, maxAge = TELEGRAM_SESSION_TTL_SECONDS, secure = true) =>
+  TELEGRAM_SESSION_COOKIE + "=" + token + "; Path=/api/telegram; Max-Age=" + maxAge + "; HttpOnly" + (secure ? "; Secure" : "") + "; SameSite=Strict";
 export const clearTelegramSessionCookie = (secure = true) => telegramSessionCookie("", 0, secure);

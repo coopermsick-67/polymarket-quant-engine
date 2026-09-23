@@ -1,23 +1,13 @@
 "use client";
 
-import { AlertTriangle, BarChart3, Check, Download, Pause, Play, RefreshCw, Send, ShieldCheck, Trash2, X } from "lucide-react";
+import { AlertTriangle, BarChart3, Check, Download, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
-import { accountDeployed, accountEquity, type PaperAccount } from "../lib/engines";
 import type { LedgerMetrics, MarketDecisionRow } from "../lib/decision-ledger";
+import { accountEquity, type PaperAccount } from "../lib/engines";
+import type { PaperConfig } from "../lib/paper-engine";
+import type { SignalParams } from "../lib/signal";
 import type { LiveMarket } from "../lib/polymarket-data";
-
-export type PaperTestViewState = {
-  status: "IDLE" | "RUNNING" | "PAUSED" | "COMPLETE";
-  startingBalance: number;
-  days: number;
-  startedAt: number | null;
-  endsAt: number | null;
-  balance: number;
-  trades: number;
-  openPositions: number;
-  realizedPnl: number;
-  winRate: number | null;
-};
+import { cents, dollars, percentage, points, signedDollars, timeLeft } from "./format";
 
 export type TelegramViewState = {
   connected: boolean;
@@ -26,98 +16,509 @@ export type TelegramViewState = {
   chatId: string;
   chatTitle: string;
   expiresAt: number | null;
+  alerts: boolean;
   lastStatus: string;
   lastError: string;
 };
 
-type PositionView = {
-  id: string;
-  status: "OPEN" | "CLOSED";
-  timestamp: number;
-  marketLabel: string;
-  asset: string;
-  duration: string;
-  side: "UP" | "DOWN";
-  shares: number;
-  entry: number;
-  mark: number | null;
-  pnl: number | null;
-  detail: string;
-};
+export type PaperConfigPatch = Omit<Partial<PaperConfig>, "signal"> & { signal?: Partial<SignalParams> };
 
 type Props = {
-  paperTest: PaperTestViewState;
-  paperAccount: PaperAccount;
-  paperMarkets: Map<string, LiveMarket>;
+  account: PaperAccount;
+  markets: Map<string, LiveMarket>;
+  config: PaperConfig;
+  halt: { reason: string; at: number } | null;
+  pending: number;
   clock: number;
-  engineRunning: boolean;
-  paused: boolean;
-  startingBalanceInput: string;
-  durationDaysInput: string;
   ledgerRows: MarketDecisionRow[];
   metrics: LedgerMetrics;
   telegram: TelegramViewState;
-  onStartingBalanceChange: (value: string) => void;
-  onDurationDaysChange: (value: string) => void;
-  onStart: () => void;
-  onPause: () => void;
-  onStop: () => void;
-  onReset: () => void;
-  onExport: () => void;
+  onConfigChange: (patch: PaperConfigPatch) => void;
+  onResetAccount: (startingCash: number) => void;
+  onClearHalt: () => void;
+  onExportLedger: () => void;
   onClearLedger: () => void;
   onTelegramConnect: (botToken: string, chatId: string) => Promise<boolean>;
   onTelegramDisconnect: () => void;
   onTelegramTest: () => void;
-  onTelegramRefresh: () => void;
+  onTelegramAlerts: (enabled: boolean) => void;
 };
 
-const money = (value: number) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
-const signedMoney = (value: number) => (value >= 0 ? "+" : "−") + money(Math.abs(value));
-const percent = (value: number | null) => value === null || !Number.isFinite(value) ? "—" : (value * 100).toFixed(1) + "%";
-const cents = (value: number | null) => value === null || !Number.isFinite(value) ? "—" : (value * 100).toFixed(1) + "¢";
-const dateTime = (value: number) => new Date(value).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
-const timeLeft = (seconds: number) => `${Math.floor(Math.max(0, seconds) / 60).toString().padStart(2, "0")}:${(Math.max(0, seconds) % 60).toString().padStart(2, "0")}`;
+const Range = ({
+  label,
+  value,
+  display,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  display: string;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (value: number) => void;
+}) => (
+  <label className="range-control">
+    <span>
+      <b>{label}</b>
+      <em>{display}</em>
+    </span>
+    <input max={max} min={min} onChange={(event) => onChange(Number(event.target.value))} step={step} type="range" value={value} />
+  </label>
+);
 
-const currentMarkFor = (position: { side: "UP" | "DOWN"; marketId: string; mark: number | null }, markets: Map<string, LiveMarket>) => {
-  const market = markets.get(position.marketId);
-  return market ? position.side === "UP" ? market.upBid : market.downBid : position.mark;
-};
-
-export default function PaperLabPanel({ paperTest, paperAccount, paperMarkets, clock, engineRunning, paused, startingBalanceInput, durationDaysInput, ledgerRows, metrics, telegram, onStartingBalanceChange, onDurationDaysChange, onStart, onPause, onStop, onReset, onExport, onClearLedger, onTelegramConnect, onTelegramDisconnect, onTelegramTest, onTelegramRefresh }: Props) {
-  const [filter, setFilter] = useState<"ALL" | "UP" | "DOWN" | "PASS">("ALL");
-  const [positionFilter, setPositionFilter] = useState<"ALL" | "OPEN" | "CLOSED">("ALL");
+export default function PaperLabPanel(props: Props) {
+  const { account, markets, config, halt, pending, clock, ledgerRows, metrics, telegram } = props;
+  const [filter, setFilter] = useState<"ALL" | "ENTERED" | "PASS">("ALL");
+  const [startingCash, setStartingCash] = useState(String(account.startingCash));
   const [botToken, setBotToken] = useState("");
   const [chatId, setChatId] = useState("");
   const [telegramLoading, setTelegramLoading] = useState(false);
-  const visibleRows = useMemo(() => ledgerRows.slice().reverse().filter((row) => filter === "ALL" || row.decision === filter).slice(0, 120), [filter, ledgerRows]);
-  const positionRows = useMemo<PositionView[]>(() => {
-    const open = paperAccount.positions.map((position) => {
-      const mark = currentMarkFor(position, paperMarkets);
-      const pnl = mark === null ? null : (mark - position.avgEntry) * position.shares;
-      return { id: `open-${position.id}`, status: "OPEN" as const, timestamp: position.openedAt, marketLabel: position.marketLabel, asset: position.asset, duration: position.duration, side: position.side, shares: position.shares, entry: position.avgEntry, mark, pnl, detail: `${timeLeft(Math.round((position.endTime - clock) / 1000))} left` };
-    });
-    const closed = paperAccount.closedTrades.map((trade) => ({ id: `closed-${trade.id}`, status: "CLOSED" as const, timestamp: trade.timestamp, marketLabel: trade.marketLabel, asset: trade.asset, duration: trade.duration, side: trade.side, shares: trade.shares, entry: trade.entry, mark: trade.exit, pnl: trade.pnl, detail: trade.reason }));
-    return [...open, ...closed].filter((row) => positionFilter === "ALL" || row.status === positionFilter).sort((left, right) => right.timestamp - left.timestamp).slice(0, 250);
-  }, [clock, paperAccount.closedTrades, paperAccount.positions, paperMarkets, positionFilter]);
-  const equity = accountEquity(paperAccount, paperMarkets);
-  const testPnl = paperTest.balance - paperTest.startingBalance;
-  const isRunning = paperTest.status === "RUNNING";
-  const isPaused = paperTest.status === "PAUSED";
-  const canStart = !isRunning && !isPaused && Number(startingBalanceInput) > 0 && Number(durationDaysInput) > 0;
-
+  const equity = accountEquity(account, markets);
+  const rows = useMemo(
+    () =>
+      [...ledgerRows]
+        .sort((left, right) => right.endTime - left.endTime)
+        .filter((row) => filter === "ALL" || (filter === "ENTERED" ? row.entry : !row.entry))
+        .slice(0, 150),
+    [filter, ledgerRows],
+  );
   const connectTelegram = async () => {
     setTelegramLoading(true);
-    const connected = await onTelegramConnect(botToken.trim(), chatId.trim());
+    const connected = await props.onTelegramConnect(botToken.trim(), chatId.trim());
     setTelegramLoading(false);
     if (connected) setBotToken("");
   };
 
-  return <section className="paper-lab">
-    <div className="section-heading"><div><div className="eyebrow">PAPER RESEARCH LAB</div><h2>Unified paper engine + timeframe tests</h2><p className="section-subtitle">The Paper Trader and Paper Lab now use one shared account, one balance, one position book, and one decision ledger. Manual entries, automatic entries, and timeframe tests cannot drift into separate balances.</p></div><span className="research-badge"><BarChart3 size={14} />{metrics.tracked.toLocaleString()} MARKETS TRACKED</span></div>
-    <div className="paper-test-grid"><article className="panel paper-test-config"><div className="panel-heading"><div><div className="eyebrow">SHARED FORWARD TEST</div><h3>{isRunning ? "Paper test running" : isPaused ? "Paper test paused" : paperTest.status === "COMPLETE" ? "Paper test complete" : "Configure a paper test"}</h3></div><span className={"result-badge " + (isRunning ? "ready" : isPaused ? "waiting" : "ready")}><span className={"status-dot " + (isRunning ? "status-ready" : isPaused ? "status-warning" : "status-sim")} />{paperTest.status}</span></div><div className="paper-test-form"><label><span>Starting shared paper balance</span><input min="1" onChange={(event) => onStartingBalanceChange(event.target.value)} step="10" type="number" value={startingBalanceInput} /></label><label><span>Trading duration (days)</span><input min="1" max="90" onChange={(event) => onDurationDaysChange(event.target.value)} step="1" type="number" value={durationDaysInput} /></label></div><div className="paper-test-actions"><button className="button-primary" disabled={!canStart} onClick={onStart} type="button"><Play fill="currentColor" size={14} />START SHARED TEST</button><button className="button-secondary" disabled={!isRunning} onClick={onPause} type="button"><Pause size={14} />PAUSE</button><button className="button-secondary" disabled={!isPaused} onClick={onPause} type="button"><Play size={14} />RESUME</button><button className="button-danger" disabled={!isRunning && !isPaused} onClick={onStop} type="button"><X size={14} />STOP</button><button className="button-secondary" onClick={onReset} type="button"><RefreshCw size={14} />RESET SHARED ACCOUNT</button></div><div className="paper-test-stats"><span><b>{money(paperTest.balance)}</b> current shared equity</span><span className={testPnl >= 0 ? "text-positive" : "text-negative"}><b>{signedMoney(testPnl)}</b> test P&amp;L</span><span><b>{paperTest.trades}</b> entries taken</span><span><b>{paperTest.openPositions}</b> open positions</span></div><div className="risk-note"><ShieldCheck size={15} /><span>{engineRunning ? paused ? "The shared engine is paused. Existing positions remain visible and will settle when their markets resolve." : "The shared engine is running. Every manual, automatic, and test fill appears in the same account below." : "Starting a test resets the shared paper account to the selected balance. It runs on public live books and candles while this terminal is open."}</span></div></article>
-      <article className="panel paper-metrics-card"><div className="panel-heading"><div><div className="eyebrow">DECISION OUTCOMES</div><h3>UP / DOWN / combined</h3></div><span className="panel-footnote"><ShieldCheck size={13} /> Settled rows only</span></div><div className="paper-metric-grid"><div><span>UP WIN RATE</span><strong>{percent(metrics.upWinRate)}</strong><small>{metrics.upWins}W / {metrics.upSettled} settled</small></div><div><span>DOWN WIN RATE</span><strong>{percent(metrics.downWinRate)}</strong><small>{metrics.downWins}W / {metrics.downSettled} settled</small></div><div><span>COMBINED</span><strong>{percent(metrics.combinedWinRate)}</strong><small>{metrics.wins}W / {metrics.settled} settled</small></div><div><span>PASS</span><strong>{metrics.pass.toLocaleString()}</strong><small>{metrics.pending} directional pending</small></div></div><div className="paper-test-times"><span>{paperAccount.positions.length} open · {paperAccount.closedTrades.length} closed · {paperAccount.fills.filter((fill) => fill.action === "BUY").length} entries</span><span>{money(equity)} shared equity · {money(accountDeployed(paperAccount))} deployed</span>{paperTest.startedAt ? <span>Started {dateTime(paperTest.startedAt)}</span> : <span>No timeframe test started</span>}{paperTest.endsAt ? <span>Ends {dateTime(paperTest.endsAt)}</span> : null}</div></article></div>
-    <article className="panel unified-positions-panel"><div className="panel-heading"><div><div className="eyebrow">ONE SHARED POSITION BOOK</div><h3>All paper positions <span className="heading-muted">/ {paperAccount.positions.length} open · {paperAccount.closedTrades.length} closed</span></h3></div><div className="ledger-actions"><div className="ledger-filters" role="tablist" aria-label="Position filter">{(["ALL", "OPEN", "CLOSED"] as const).map((item) => <button aria-selected={positionFilter === item} className={positionFilter === item ? "filter-tab active" : "filter-tab"} key={item} onClick={() => setPositionFilter(item)} role="tab" type="button">{item}</button>)}</div></div></div>{positionRows.length ? <div className="positions-table-wrap unified-position-table-wrap"><table className="positions-table unified-position-table"><thead><tr><th>STATUS</th><th>TIME</th><th>MARKET</th><th>SIDE</th><th>UNITS</th><th>ENTRY</th><th>MARK / EXIT</th><th>P&amp;L</th><th>DETAIL</th></tr></thead><tbody>{positionRows.map((row) => <tr key={row.id}><td><span className={row.status === "OPEN" ? "position-state open" : "position-state closed"}>{row.status}</span></td><td>{dateTime(row.timestamp)}</td><td><strong>{row.marketLabel}</strong><small>{row.asset} · {row.duration}</small></td><td><span className={"side-chip " + (row.side === "UP" ? "up" : "down")}>{row.side}</span></td><td>{row.shares.toFixed(2)}</td><td>{cents(row.entry)}</td><td>{cents(row.mark)}</td><td className={row.pnl === null ? "text-muted" : row.pnl >= 0 ? "text-positive" : "text-negative"}>{row.pnl === null ? "—" : signedMoney(row.pnl)}</td><td><span title={row.detail}>{row.detail}</span></td></tr>)}</tbody></table></div> : <div className="account-empty-line">No positions match this filter. New manual, automatic, and timeframe-test entries will appear here.</div>}<div className="panel-footnote unified-position-note"><span><span className="status-dot status-ready" />Open positions are marked from current public bids</span><span><span className="status-dot status-sim" />Closed positions are resolved or manually exited</span><span className="footnote-spacer" /><span>Live wallet positions remain in the Account Console.</span></div></article>
-    <article className="panel ledger-panel"><div className="panel-heading"><div><div className="eyebrow">ALL ACTIVE SHORT MARKETS</div><h3>Decision ledger <span className="heading-muted">/ {ledgerRows.length.toLocaleString()} rows</span></h3></div><div className="ledger-actions"><div className="ledger-filters" role="tablist" aria-label="Decision filter">{(["ALL", "UP", "DOWN", "PASS"] as const).map((item) => <button aria-selected={filter === item} className={filter === item ? "filter-tab active" : "filter-tab"} key={item} onClick={() => setFilter(item)} role="tab" type="button">{item}</button>)}</div><button className="button-secondary" disabled={!ledgerRows.length} onClick={onExport} type="button"><Download size={14} />DOWNLOAD CSV</button><button className="button-danger" disabled={!ledgerRows.length} onClick={onClearLedger} type="button"><Trash2 size={14} />CLEAR LEDGER</button></div></div>{visibleRows.length ? <div className="positions-table-wrap ledger-table-wrap"><table className="positions-table ledger-table"><thead><tr><th>TIME</th><th>MARKET</th><th>DECISION</th><th>EDGE</th><th>ASK</th><th>RESULT</th><th>DETAIL</th></tr></thead><tbody>{visibleRows.map((row) => <tr key={row.id}><td>{dateTime(row.observedAt)}</td><td><strong>{row.asset} {row.duration}</strong><small>{row.question}</small></td><td><span className={"side-chip " + (row.decision === "UP" ? "up" : row.decision === "DOWN" ? "down" : "pass")}>{row.decision}</span><small>{row.tier} · {row.changeCount ? row.changeCount + " changes" : "first read"}</small></td><td>{percent(row.edge)}</td><td>{row.entryPrice === null ? "—" : (row.entryPrice * 100).toFixed(1) + "¢"}</td><td className={row.result === "WIN" ? "text-positive" : row.result === "LOSS" ? "text-negative" : row.result === "PENDING" ? "text-warning" : "text-muted"}>{row.result}{row.outcome ? " · " + row.outcome : ""}</td><td><span title={row.reason}>{row.reason}</span></td></tr>)}</tbody></table></div> : <div className="account-empty-line">No ledger rows yet. The terminal will record all discovered markets as the public feed refreshes.</div>}<div className="panel-footnote"><span><span className="status-dot status-ready" />{metrics.up} UP</span><span><span className="status-dot status-warning" />{metrics.down} DOWN</span><span><span className="status-dot status-locked" />{metrics.pass} PASS</span><span className="footnote-spacer" /><span>CSV includes IDs, UTC timestamps, crypto, duration, prices, outcomes, simulated sizing, PASS status, and UP/DOWN/combined win rates.</span></div></article>
-    <article className="panel telegram-panel"><div className="panel-heading"><div><div className="eyebrow">WEEKLY REPORTS</div><h3>Telegram updates</h3></div><Send size={17} className="heading-icon" /></div>{!telegram.connected ? <><p className="panel-copy">Link a Telegram bot and chat to receive the shared paper-account summary, UP/DOWN win rates, PASS count, tracked markets, and recent ledger activity every Sunday at 9:00 PM Eastern while this terminal is open.</p><div className="telegram-form"><label><span>Bot token</span><input autoComplete="new-password" onChange={(event) => setBotToken(event.target.value)} placeholder="123456:AA…" spellCheck={false} type="password" value={botToken} /></label><label><span>Chat ID or @channel</span><input autoComplete="off" onChange={(event) => setChatId(event.target.value)} placeholder="123456789 or @channel" spellCheck={false} value={chatId} /></label></div><div className="telegram-actions"><button className="button-primary" disabled={telegramLoading || !botToken.trim() || !chatId.trim()} onClick={() => void connectTelegram()} type="button">{telegramLoading ? <RefreshCw className="spin" size={14} /> : <Check size={14} />}LINK &amp; VERIFY TELEGRAM</button><span className="panel-footnote"><ShieldCheck size={13} /> Token is never stored in localStorage</span></div></> : <><div className="telegram-connected"><div><span className="metric-label">BOT</span><strong>@{telegram.botUsername || telegram.botName}</strong><small>{telegram.botName} · {telegram.chatTitle} · {telegram.chatId}</small></div><span className="result-badge ready"><span className="status-dot status-ready" />LINKED</span></div><div className="telegram-actions"><button className="button-secondary" onClick={onTelegramTest} type="button"><Send size={14} />SEND TEST REPORT</button><button className="button-secondary" onClick={onTelegramRefresh} type="button"><RefreshCw size={14} />REFRESH</button><button className="button-danger" onClick={onTelegramDisconnect} type="button"><X size={14} />UNLINK</button></div><div className="risk-note"><AlertTriangle size={15} /><span>Automatic weekly delivery is browser-assisted because this Site has no persistent scheduler binding. Keep the terminal open around Sunday 9:00 PM Eastern for delivery.</span></div></>}{telegram.lastError ? <div className="data-alert"><AlertTriangle size={15} /><div><strong>Telegram status</strong><span>{telegram.lastError}</span></div></div> : telegram.lastStatus ? <div className="account-empty-line"><span className="status-dot status-ready" />{telegram.lastStatus}</div> : null}</article>
-  </section>;
+  return (
+    <section className="paper-lab">
+      <div className="section-heading">
+        <div>
+          <div className="eyebrow">PAPER / SHADOW ENGINE</div>
+          <h2>Latency-aware paper trading</h2>
+          <p className="section-subtitle">
+            Orders are decided on the current snapshot and filled {config.latencyMs}ms later at the decision&apos;s limit price, against whatever the book is
+            then. Positions settle only on official Polymarket resolutions. The headless runner uses this exact engine without a browser tab.
+          </p>
+        </div>
+        <span className="research-badge">
+          <BarChart3 size={14} />
+          {metrics.tracked.toLocaleString()} MARKETS TRACKED
+        </span>
+      </div>
+      {halt ? (
+        <div className="critical-banner">
+          <AlertTriangle size={17} />
+          <span>
+            <strong>RISK HALT</strong> — {halt.reason}
+          </span>
+          <button onClick={props.onClearHalt} type="button">
+            Acknowledge and resume
+          </button>
+        </div>
+      ) : null}
+      <div className="paper-test-grid">
+        <article className="panel live-risk-card">
+          <div className="panel-heading">
+            <div>
+              <div className="eyebrow">ENGINE SETTINGS</div>
+              <h3>Edge, sizing, and limits</h3>
+            </div>
+            <SlidersHorizontal size={17} className="heading-icon" />
+          </div>
+          <div className="risk-controls">
+            <Range
+              label="Edge floor after fees"
+              value={config.signal.minEdge}
+              display={points(config.signal.minEdge)}
+              min={0.005}
+              max={0.15}
+              step={0.005}
+              onChange={(minEdge) => props.onConfigChange({ signal: { minEdge } })}
+            />
+            <Range
+              label="Model weight vs book"
+              value={config.signal.modelWeight}
+              display={percentage(config.signal.modelWeight, 0)}
+              min={0}
+              max={1}
+              step={0.05}
+              onChange={(modelWeight) => props.onConfigChange({ signal: { modelWeight } })}
+            />
+            <Range
+              label="Vol uncertainty band"
+              value={config.signal.volUncertainty}
+              display={`±${percentage(config.signal.volUncertainty, 0)}`}
+              min={0}
+              max={0.8}
+              step={0.05}
+              onChange={(volUncertainty) => props.onConfigChange({ signal: { volUncertainty } })}
+            />
+            <Range
+              label="Stake per trade"
+              value={config.stakeUsd}
+              display={dollars(config.stakeUsd, 0)}
+              min={5}
+              max={250}
+              step={5}
+              onChange={(stakeUsd) => props.onConfigChange({ stakeUsd })}
+            />
+            <Range
+              label="Simulated latency"
+              value={config.latencyMs}
+              display={`${config.latencyMs}ms`}
+              min={0}
+              max={3000}
+              step={50}
+              onChange={(latencyMs) => props.onConfigChange({ latencyMs })}
+            />
+            <Range
+              label="Daily loss halt"
+              value={config.dailyLossPct}
+              display={percentage(config.dailyLossPct)}
+              min={0.01}
+              max={0.25}
+              step={0.01}
+              onChange={(dailyLossPct) => props.onConfigChange({ dailyLossPct })}
+            />
+            <Range
+              label="Max drawdown halt"
+              value={config.maxDrawdownPct}
+              display={percentage(config.maxDrawdownPct)}
+              min={0.02}
+              max={0.5}
+              step={0.01}
+              onChange={(maxDrawdownPct) => props.onConfigChange({ maxDrawdownPct })}
+            />
+            <Range
+              label="Max open exposure"
+              value={config.maxOpenExposurePct}
+              display={percentage(config.maxOpenExposurePct)}
+              min={0.05}
+              max={1}
+              step={0.05}
+              onChange={(maxOpenExposurePct) => props.onConfigChange({ maxOpenExposurePct })}
+            />
+            <Range
+              label="Min entry price (no tails)"
+              value={config.signal.minEntryPrice}
+              display={cents(config.signal.minEntryPrice)}
+              min={0.01}
+              max={0.3}
+              step={0.01}
+              onChange={(minEntryPrice) => props.onConfigChange({ signal: { minEntryPrice } })}
+            />
+          </div>
+          <div className="paper-test-form">
+            <label>
+              <span>Reset with starting cash</span>
+              <input min="1" onChange={(event) => setStartingCash(event.target.value)} type="number" value={startingCash} />
+            </label>
+            <button className="button-secondary" onClick={() => props.onResetAccount(Number(startingCash))} type="button">
+              <RefreshCw size={14} />
+              RESET PAPER ACCOUNT
+            </button>
+          </div>
+        </article>
+        <article className="panel paper-metrics-card">
+          <div className="panel-heading">
+            <div>
+              <div className="eyebrow">DECISION QUALITY</div>
+              <h3>Graded on first entry + official outcomes</h3>
+            </div>
+            <span className="panel-footnote">
+              <ShieldCheck size={13} /> {metrics.settled} settled
+            </span>
+          </div>
+          <div className="paper-metric-grid">
+            <div>
+              <span>REALIZED EDGE</span>
+              <strong className={metrics.realizedEdge === null ? "" : metrics.realizedEdge >= 0 ? "text-positive" : "text-negative"}>
+                {points(metrics.realizedEdge)}
+              </strong>
+              <small>predicted {points(metrics.predictedEdge)}</small>
+            </div>
+            <div>
+              <span>WIN RATE</span>
+              <strong>{percentage(metrics.winRate)}</strong>
+              <small>
+                {metrics.winRateCi ? `95% CI ${percentage(metrics.winRateCi[0])}–${percentage(metrics.winRateCi[1])}` : `${metrics.entries} entries`}
+              </small>
+            </div>
+            <div>
+              <span>BRIER MODEL</span>
+              <strong>{metrics.brierModel?.toFixed(4) ?? "—"}</strong>
+              <small>posterior {metrics.brierPosterior?.toFixed(4) ?? "—"}</small>
+            </div>
+            <div>
+              <span>BRIER BOOK</span>
+              <strong>{metrics.brierMarket?.toFixed(4) ?? "—"}</strong>
+              <small>{metrics.calibrated} checkpoints @120s</small>
+            </div>
+            <div>
+              <span>EQUITY</span>
+              <strong>{dollars(equity)}</strong>
+              <small>{signedDollars(equity - account.startingCash)} total</small>
+            </div>
+            <div>
+              <span>DAY P&amp;L</span>
+              <strong>{signedDollars(equity - account.dayStartEquity)}</strong>
+              <small>{pending} order(s) in flight</small>
+            </div>
+          </div>
+          <div className="risk-note">
+            <AlertTriangle size={15} />
+            <span>
+              Win rate is not the goal. The model has an edge only if realized edge stays positive and its Brier score beats the book&apos;s over hundreds of
+              markets.
+            </span>
+          </div>
+        </article>
+      </div>
+      <article className="panel unified-positions-panel">
+        <div className="panel-heading">
+          <div>
+            <div className="eyebrow">POSITION BOOK</div>
+            <h3>
+              Paper positions{" "}
+              <span className="heading-muted">
+                / {account.positions.length} open · {account.closedTrades.length} closed
+              </span>
+            </h3>
+          </div>
+        </div>
+        <div className="positions-table-wrap">
+          <table className="positions-table">
+            <thead>
+              <tr>
+                <th>MARKET</th>
+                <th>SIDE</th>
+                <th>SHARES</th>
+                <th>ALL-IN COST</th>
+                <th>MARK / EXIT</th>
+                <th>P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {account.positions.map((position) => {
+                const market = markets.get(position.marketId);
+                const mark = market ? (position.side === "UP" ? market.upBid : market.downBid) : position.mark;
+                const pnl = mark === null ? null : mark * position.shares - position.totalCost;
+                return (
+                  <tr key={position.id}>
+                    <td>
+                      <strong>{position.marketLabel}</strong>
+                      <small>{position.endTime > clock ? `${timeLeft((position.endTime - clock) / 1000)} left` : "awaiting official resolution"}</small>
+                    </td>
+                    <td>
+                      <span className={`side-chip ${position.side === "UP" ? "up" : "down"}`}>{position.side}</span>
+                    </td>
+                    <td>{position.shares.toFixed(2)}</td>
+                    <td>{cents(position.avgEntry)}</td>
+                    <td>{cents(mark)}</td>
+                    <td className={pnl === null ? "text-muted" : pnl >= 0 ? "text-positive" : "text-negative"}>{signedDollars(pnl)}</td>
+                  </tr>
+                );
+              })}
+              {account.closedTrades.slice(0, 60).map((trade) => (
+                <tr key={trade.id} className="closed-row">
+                  <td>
+                    <strong>{trade.marketLabel}</strong>
+                    <small>{trade.reason}</small>
+                  </td>
+                  <td>
+                    <span className={`side-chip ${trade.side === "UP" ? "up" : "down"}`}>{trade.side}</span>
+                  </td>
+                  <td>{trade.shares.toFixed(2)}</td>
+                  <td>{cents(trade.entry)}</td>
+                  <td>{cents(trade.exit)}</td>
+                  <td className={trade.pnl >= 0 ? "text-positive" : "text-negative"}>{signedDollars(trade.pnl)}</td>
+                </tr>
+              ))}
+              {!account.positions.length && !account.closedTrades.length ? (
+                <tr>
+                  <td className="empty-row" colSpan={6}>
+                    No paper positions yet.
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+      </article>
+      <article className="panel ledger-panel">
+        <div className="panel-heading">
+          <div>
+            <div className="eyebrow">EVERY MARKET</div>
+            <h3>
+              Decision ledger <span className="heading-muted">/ {ledgerRows.length.toLocaleString()} rows</span>
+            </h3>
+          </div>
+          <div className="ledger-actions">
+            <div className="ledger-filters" role="tablist" aria-label="Decision filter">
+              {(["ALL", "ENTERED", "PASS"] as const).map((item) => (
+                <button
+                  aria-selected={filter === item}
+                  className={filter === item ? "filter-tab active" : "filter-tab"}
+                  key={item}
+                  onClick={() => setFilter(item)}
+                  role="tab"
+                  type="button"
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+            <button className="text-button" onClick={props.onExportLedger} type="button">
+              <Download size={13} />
+              CSV
+            </button>
+            <button className="text-button" onClick={props.onClearLedger} type="button">
+              <Trash2 size={13} />
+              Clear
+            </button>
+          </div>
+        </div>
+        <div className="positions-table-wrap">
+          <table className="positions-table">
+            <thead>
+              <tr>
+                <th>MARKET</th>
+                <th>FIRST ENTRY</th>
+                <th>@120s MODEL / BOOK</th>
+                <th>LAST</th>
+                <th>OUTCOME</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length ? (
+                rows.map((row) => (
+                  <tr key={row.id}>
+                    <td>
+                      <strong>
+                        {row.asset} {row.duration}
+                      </strong>
+                      <small>{new Date(row.endTime).toLocaleTimeString("en-US", { hour12: false })} close</small>
+                    </td>
+                    <td>{row.entry ? `${row.entry.side} ${cents(row.entry.costPerShare)} · ${points(row.entry.edge)}` : "—"}</td>
+                    <td>{row.checkpoint ? `${percentage(row.checkpoint.model)} / ${percentage(row.checkpoint.market)}` : "—"}</td>
+                    <td title={row.reason}>{row.decision === "PASS" ? `PASS · ${row.gate}` : row.decision}</td>
+                    <td className={row.result === "WIN" ? "text-positive" : row.result === "LOSS" ? "text-negative" : "text-muted"}>
+                      {row.outcome ? `${row.outcome} · ${row.result}` : row.result}
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td className="empty-row" colSpan={5}>
+                    The ledger fills as markets are observed.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </article>
+      <article className="panel telegram-panel">
+        <div className="panel-heading">
+          <div>
+            <div className="eyebrow">ALERTS + WEEKLY REPORTS</div>
+            <h3>Telegram</h3>
+          </div>
+          <Send size={17} className="heading-icon" />
+        </div>
+        {!telegram.connected ? (
+          <>
+            <p className="panel-copy">
+              Link a bot for real-time alerts on halts, fills and settlements, plus the Sunday 9 PM ET summary. For alerts without an open tab, run the headless
+              runner with TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
+            </p>
+            <div className="telegram-form">
+              <label>
+                <span>Bot token</span>
+                <input
+                  autoComplete="new-password"
+                  onChange={(event) => setBotToken(event.target.value)}
+                  placeholder="123456:AA…"
+                  spellCheck={false}
+                  type="password"
+                  value={botToken}
+                />
+              </label>
+              <label>
+                <span>Chat ID or @channel</span>
+                <input
+                  autoComplete="off"
+                  onChange={(event) => setChatId(event.target.value)}
+                  placeholder="123456789 or @channel"
+                  spellCheck={false}
+                  value={chatId}
+                />
+              </label>
+            </div>
+            <div className="telegram-actions">
+              <button
+                className="button-primary"
+                disabled={telegramLoading || !botToken.trim() || !chatId.trim()}
+                onClick={() => void connectTelegram()}
+                type="button"
+              >
+                {telegramLoading ? <RefreshCw className="spin" size={14} /> : <Check size={14} />}LINK &amp; VERIFY
+              </button>
+              <span className="panel-footnote">
+                <ShieldCheck size={13} /> Token is sealed server-side, never in localStorage
+              </span>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="telegram-connected">
+              <div>
+                <span className="metric-label">BOT</span>
+                <strong>@{telegram.botUsername || telegram.botName}</strong>
+                <small>
+                  {telegram.chatTitle} · {telegram.chatId}
+                </small>
+              </div>
+              <span className="result-badge ready">
+                <span className="status-dot status-ready" />
+                LINKED
+              </span>
+            </div>
+            <label className="live-checkbox">
+              <input checked={telegram.alerts} onChange={(event) => props.onTelegramAlerts(event.target.checked)} type="checkbox" />
+              <span>Real-time alerts for halts, fills, settlements, and live runner stops</span>
+            </label>
+            <div className="telegram-actions">
+              <button className="button-secondary" onClick={props.onTelegramTest} type="button">
+                <Send size={14} />
+                SEND TEST REPORT
+              </button>
+              <button className="button-danger" onClick={props.onTelegramDisconnect} type="button">
+                <X size={14} />
+                UNLINK
+              </button>
+            </div>
+          </>
+        )}
+        {telegram.lastError ? (
+          <div className="data-alert">
+            <AlertTriangle size={15} />
+            <div>
+              <strong>Telegram</strong>
+              <span>{telegram.lastError}</span>
+            </div>
+          </div>
+        ) : telegram.lastStatus ? (
+          <div className="account-empty-line">
+            <span className="status-dot status-ready" />
+            {telegram.lastStatus}
+          </div>
+        ) : null}
+      </article>
+    </section>
+  );
 }

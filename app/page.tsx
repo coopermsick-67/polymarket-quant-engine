@@ -1,940 +1,1203 @@
 "use client";
 
-/* eslint-disable react-hooks/set-state-in-effect */
-
 import {
   Activity,
   AlertTriangle,
-  ArrowDownRight,
-  ArrowUpRight,
   BarChart3,
-  Ban,
-  Check,
-  ChevronDown,
   CircleDollarSign,
-  CircleDot,
   Clock3,
-  Copy,
-  Database,
-  Download,
-  FileUp,
   Gauge,
   LayoutDashboard,
   LineChart,
   LoaderCircle,
-  LockKeyhole,
   Pause,
   Play,
   RefreshCw,
-  ScanLine,
-  Settings2,
   ShieldCheck,
-  SlidersHorizontal,
   Target,
   Terminal,
   TrendingDown,
   TrendingUp,
-  Upload,
   Wallet,
-  X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AccountConnectModal, AccountView, RunnerSetupModal, type AccountConnection, type ConnectedAccount } from "./components/account-view";
+import { EquityChart } from "./components/charts";
 import {
-  buildLiveMarket,
-  chartFairProbability,
-  discoverCryptoMarkets,
-  fetchCandleHistories,
-  fetchOrderBooks,
-  fetchSpotPrices,
-  replaceLiveMarketBook,
-  updateLiveMarketBookLevel,
-  updateLiveCandles,
-  type Asset,
-  type Horizon,
-  type LiveMarket,
-  type MarketPriceTick,
-} from "./lib/polymarket-data";
+  cents,
+  dollars,
+  downloadText,
+  formatAge,
+  percentage,
+  readStoredJson,
+  signedDollars,
+  timeLeft,
+  toneFor,
+  writeStoredJson,
+  type Tone,
+} from "./components/format";
+import LiveExecutionPanel, { type LiveExecutionStatus, type LiveSessionState } from "./components/live-execution-panel";
+import { MarketCard } from "./components/market-card";
+import PaperLabPanel, { type TelegramViewState } from "./components/paper-lab-panel";
+import ResearchLab from "./components/research-lab";
+import { SignalPanel } from "./components/signal-panel";
+import { EmptyState, MetricCard, StatusDot } from "./components/ui";
+import { useMarketFeed } from "./hooks/use-market-feed";
+import { computeLedgerMetrics, decisionLedgerCsv, resolveLedgerRow, updateLedgerRow, type MarketDecisionRow } from "./lib/decision-ledger";
 import {
-  accountDeployed,
   accountEquity,
   accountUnrealized,
-  accountWinRate,
   analyzeMarketSignal,
-  backtestCsvTemplate,
-  bestCandidateFor,
   buyPaper,
   closePaperPositions,
   createPaperAccount,
   markAccount,
-  parseBacktestCsv,
-  runBacktest,
-  settleResolvedPaperPositions,
-  type BacktestResult,
-  type BacktestRow,
-  type CostConfig,
+  migratePaperAccount,
+  type MarketSignal,
   type PaperAccount,
-  type PaperSide,
 } from "./lib/engines";
-import LiveExecutionPanel, { type LiveExecutionStatus, type LiveSessionState } from "./components/live-execution-panel";
-import PaperLabPanel, { type PaperTestViewState, type TelegramViewState } from "./components/paper-lab-panel";
-import { computeLedgerMetrics, decisionLedgerCsv, ledgerResultFor, type MarketDecisionRow } from "./lib/decision-ledger";
-import { DEFAULT_PAPER_EARLY_EXIT, evaluateModelAwareExit, normalizeEarlyExitPolicy, type EarlyExitPolicy } from "./lib/early-exit";
-import { normalizeLiveRiskConfig, type LiveRiskConfig } from "./lib/live-risk";
+import { normalizeLiveRiskConfig, type LiveRiskConfig, type LivePosition } from "./lib/live-risk";
+import { createEngineState, normalizePaperConfig, stepPaperEngine, type PaperConfig, type PaperEngineState } from "./lib/paper-engine";
+import { snapshotFromLiveMarket, type LiveMarket } from "./lib/polymarket-data";
+import { serializeResolutionLine, serializeSnapshotLine, type ReplayDataset } from "./lib/replay";
+import { evaluateExit, type MarketSnapshot, type Side } from "./lib/signal";
 
-type View = "overview" | "paper" | "account" | "live" | "backtest";
-type Tone = "positive" | "warning" | "negative" | "neutral";
-type DataStatus = "loading" | "ready" | "error";
-
+type View = "overview" | "paper" | "research" | "account" | "live";
 type LogItem = { id: string; time: string; message: string; detail: string; tone: Tone };
-type Config = EarlyExitPolicy & { minEdge: number; maxTrade: number; maxLoss: number; feeRate: number; slippageBps: number };
-type AccountConnection = { walletAddress: string; privateKey: string; signatureType: string };
-type AccountPosition = { id: string; title: string; slug: string | null; outcome: string; size: number | null; averagePrice: number | null; currentPrice: number | null; currentValue: number | null; unrealizedPnl: number | null; realizedPnl: number | null; percentPnl: number | null; status: string; lastEventAt: number | null };
-type AccountOrder = { id: string; side: string; price: number | null; size: number | null; matched: number | null; status: string; createdAt: number | null };
-type AccountTrade = { id: string; timestamp: number | null; title: string; slug: string | null; side: string; outcome: string; price: number | null; shares: number | null; amount: number | null; status: string; transactionHash: string | null };
-type ConnectedAccount = { walletAddress: string; authenticated: boolean; portfolioValue: number | null; cashBalance: number | null; openPositions: AccountPosition[]; openOrders: AccountOrder[]; recentTrades: AccountTrade[]; pnl: number | null; tradedMarketCount: number | null; fetchedAt: number; warnings: string[] };
-type LivePositionSnapshot = { id: string; tokenID: string | null; conditionId: string | null; title: string; outcome: string; size: number | null; averagePrice: number | null };
 
-const PAPER_STORAGE_KEY = "polymarket-quant-paper-v2";
-const CONFIG_STORAGE_KEY = "polymarket-quant-config-v2";
-const ACCOUNT_WALLET_STORAGE_KEY = "polymarket-quant-account-wallet-v1";
-const LIVE_RISK_STORAGE_KEY = "polymarket-quant-live-risk-v1";
-const LEDGER_STORAGE_KEY = "polymarket-quant-decision-ledger-v1";
-const TELEGRAM_LAST_SENT_KEY = "polymarket-quant-telegram-last-sent-v1";
-const DEFAULT_CONFIG: Config = { minEdge: 0.03, maxTrade: 25, maxLoss: 0.05, feeRate: 0.02, slippageBps: 15, ...DEFAULT_PAPER_EARLY_EXIT };
-const EMPTY_ACCOUNT_CONNECTION: AccountConnection = { walletAddress: "", privateKey: "", signatureType: "3" };
+const PAPER_KEY = "pqe-paper-v3";
+const PAPER_CONFIG_KEY = "pqe-paper-config-v3";
+const LIVE_RISK_KEY = "pqe-live-risk-v3";
+const LEDGER_KEY = "pqe-ledger-v3";
+const WALLET_KEY = "pqe-wallet-v1";
+const TELEGRAM_ALERTS_KEY = "pqe-telegram-alerts-v1";
+const TELEGRAM_LAST_SENT_KEY = "pqe-telegram-weekly-v1";
+const MAX_RECORDED = 20_000;
 
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
-const dollars = (value: number | null, digits = 2) => value === null || !Number.isFinite(value) ? "—" : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value);
-const signedDollars = (value: number | null) => value === null || !Number.isFinite(value) ? "—" : `${value >= 0 ? "+" : "−"}${dollars(Math.abs(value))}`;
-const cents = (value: number | null | undefined) => value === null || value === undefined || !Number.isFinite(value) ? "—" : `${(value * 100).toFixed(1)}¢`;
-const percentage = (value: number | null | undefined, digits = 1) => value === null || value === undefined || !Number.isFinite(value) ? "—" : `${(value * 100).toFixed(digits)}%`;
-const timeLeft = (seconds: number | null) => { if (seconds === null || !Number.isFinite(seconds)) return "—"; const safe = Math.max(0, Math.floor(seconds)); return `${Math.floor(safe / 60).toString().padStart(2, "0")}:${(safe % 60).toString().padStart(2, "0")}`; };
-const formatSpot = (asset: string, value: number | null) => { if (value === null || !Number.isFinite(value)) return "—"; const digits = asset === "BTC" ? 0 : asset === "ETH" ? 1 : 2; return `$${value.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`; };
-const formatTime = (timestamp: number | null) => timestamp ? new Date(timestamp).toLocaleTimeString("en-US", { hour12: false }) : "—";
-const formatAge = (timestamp: number | null, now: number) => timestamp ? `${Math.max(0, now - timestamp)} ms ago` : "waiting";
-const assetTone = (asset: string) => asset === "BTC" ? "asset-btc" : asset === "ETH" ? "asset-eth" : asset === "SOL" ? "asset-sol" : "asset-xrp";
-const quantity = (value: number | null) => value === null || !Number.isFinite(value) ? "—" : value.toFixed(2);
-const marketOutcome = (market: LiveMarket): PaperSide | null => market.reference === null || market.spot === null ? null : market.spot >= market.reference ? "UP" : "DOWN";
+const liveRequest = (body: Record<string, unknown>, confirm = false) =>
+  fetch("/api/polymarket/live", {
+    body: JSON.stringify(body),
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...(confirm ? { "x-polymarket-live-confirm": "1" } : {}) },
+    method: "POST",
+  });
 
-const readStoredJson = <T,>(key: string): T | null => {
-  if (typeof window === "undefined") return null;
-  try { const value = window.localStorage.getItem(key); return value ? JSON.parse(value) as T : null; } catch { return null; }
-};
-
-function Sparkline({ values, color = "#6cf2c4", height = 28 }: { values: number[]; color?: string; height?: number }) {
-  const safeValues = values.length ? values : [0];
-  const min = Math.min(...safeValues); const max = Math.max(...safeValues); const range = max - min || 1;
-  const points = safeValues.map((value, index) => { const x = safeValues.length === 1 ? 50 : (index / (safeValues.length - 1)) * 100; const y = 3 + (1 - (value - min) / range) * (height - 7); return `${x},${y}`; }).join(" ");
-  return <svg aria-hidden="true" className="sparkline" viewBox={`0 0 100 ${height}`} preserveAspectRatio="none"><polyline fill="none" points={points} stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" vectorEffect="non-scaling-stroke" /></svg>;
-}
-
-function PriceSparkline({ values, color }: { values: number[]; color: string }) {
-  if (values.length < 2) return <div className="market-sparkline-empty">Waiting for 5m history</div>;
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min || 1;
-  const points = values.map((value, index) => `${(index / (values.length - 1)) * 100},${3 + (1 - (value - min) / range) * 16}`).join(" ");
-  return <svg aria-hidden="true" className="market-sparkline" viewBox="0 0 100 22" preserveAspectRatio="none"><polyline fill="none" points={points} stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" vectorEffect="non-scaling-stroke" /></svg>;
-}
-
-function CandleChart({ label, candles, trend, rsiValue }: { label: string; candles: LiveMarket["chart5m"]; trend: string; rsiValue: number | null }) {
-  const visible = candles.slice(-24);
-  const tone = trend === "UP" ? "text-positive" : trend === "DOWN" ? "text-negative" : "text-muted";
-  if (!visible.length) return <div className="candle-chart candle-chart-empty"><div><strong>{label}</strong><span className={tone}>{trend}</span></div><small>OHLC history unavailable</small></div>;
-  const low = Math.min(...visible.map((candle) => candle.low));
-  const high = Math.max(...visible.map((candle) => candle.high));
-  const range = high - low || Math.max(high * 0.0001, 0.000001);
-  const width = 280;
-  const height = 74;
-  const step = width / visible.length;
-  const yFor = (price: number) => 8 + (1 - (price - low) / range) * (height - 16);
-  return <div className="candle-chart"><div className="candle-chart-heading"><strong>{label}</strong><span className={tone}>{trend}</span><small>RSI {rsiValue === null ? "—" : rsiValue.toFixed(0)}</small></div><svg role="img" aria-label={`${label} price candles, trend ${trend}`} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
-    {[0.25, 0.5, 0.75].map((ratio) => <line className="candle-grid" key={ratio} x1="0" x2={width} y1={8 + ratio * (height - 16)} y2={8 + ratio * (height - 16)} />)}
-    {visible.map((candle, index) => {
-      const x = step * index + step / 2;
-      const up = candle.close >= candle.open;
-      const color = up ? "#6cf2c4" : "#ff7d8a";
-      const bodyTop = Math.min(yFor(candle.open), yFor(candle.close));
-      const bodyHeight = Math.max(2, Math.abs(yFor(candle.open) - yFor(candle.close)));
-      return <g key={candle.timestamp}><line x1={x} x2={x} y1={yFor(candle.high)} y2={yFor(candle.low)} stroke={color} strokeWidth="1" /><rect x={x - Math.max(1, step * 0.28)} y={bodyTop} width={Math.max(2, step * 0.56)} height={bodyHeight} fill={color} rx="0.5" /></g>;
-    })}
-  </svg></div>;
-}
-
-function EquityChart({ values, color = "#6cf2c4" }: { values: number[]; color?: string }) {
-  const safeValues = values.length ? values : [0]; const min = Math.min(...safeValues) - 1; const max = Math.max(...safeValues) + 1; const range = max - min || 1;
-  const points = safeValues.map((value, index) => { const x = safeValues.length === 1 ? 310 : (index / (safeValues.length - 1)) * 620; const y = 178 - ((value - min) / range) * 150; return `${x.toFixed(1)},${y.toFixed(1)}`; }).join(" ");
-  return <svg className="equity-chart" viewBox="0 0 620 190" preserveAspectRatio="none" role="img" aria-label="Paper equity curve"><defs><linearGradient id="equity-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity="0.25" /><stop offset="100%" stopColor={color} stopOpacity="0" /></linearGradient></defs><line className="chart-grid-line" x1="0" x2="620" y1="28" y2="28" /><line className="chart-grid-line" x1="0" x2="620" y1="78" y2="78" /><line className="chart-grid-line" x1="0" x2="620" y1="128" y2="128" /><polygon fill="url(#equity-fill)" points={`0,190 ${points} 620,190`} /><polyline fill="none" points={points} stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" vectorEffect="non-scaling-stroke" /></svg>;
-}
-
-function StatusDot({ label, status, detail }: { label: string; status: "READY" | "PUBLIC" | "WARN" | "LOCKED"; detail: string }) {
-  const statusClass = status === "READY" ? "status-ready" : status === "PUBLIC" ? "status-sim" : status === "WARN" ? "status-warning" : "status-locked";
-  return <div className="status-item" title={detail}><span className={`status-dot ${statusClass}`} /><span className="status-label">{label}</span><span className={`status-value ${statusClass}`}>{status}</span></div>;
-}
-
-function MetricCard({ label, value, delta, deltaTone = "positive", detail, icon, spark }: { label: string; value: string; delta?: string; deltaTone?: Tone; detail: string; icon: ReactNode; spark?: number[] }) {
-  return <article className="metric-card"><div className="metric-topline"><span className="metric-label">{label}</span><span className="metric-icon">{icon}</span></div><div className="metric-value">{value}</div><div className="metric-bottom"><span className={`delta ${deltaTone}`}>{delta}</span><span className="metric-detail">{detail}</span></div>{spark && spark.length > 1 ? <Sparkline values={spark} color={deltaTone === "negative" ? "#ff7d8a" : "#6cf2c4"} /> : null}</article>;
-}
-
-const marketEdge = (market: LiveMarket, config: Config) => bestCandidateFor(market, { feeRate: config.feeRate, slippageBps: config.slippageBps }, config.maxTrade, config.minEdge);
-
-function MarketCard({ market, selected, config, onSelect }: { market: LiveMarket; selected: boolean; config: Config; onSelect: () => void }) {
-  const signal = analyzeMarketSignal(market, { feeRate: config.feeRate, slippageBps: config.slippageBps }, config.maxTrade, config.minEdge);
-  const action: { label: string; tone: Tone } = signal.action === "PASS"
-    ? { label: "PASS", tone: "warning" }
-    : { label: `${signal.tier} ${signal.action}`, tone: signal.action === "UP" ? "positive" : "negative" };
-  const distance = market.distance;
-  const chartValues = market.chart5m.slice(-18).map((candle) => candle.close);
-  return <button className={`market-card ${selected ? "market-card-selected" : ""}`} onClick={onSelect} type="button">
-    <div className="market-card-header"><div className="market-identity"><span className={`asset-token ${assetTone(market.asset)}`}>{market.asset.slice(0, 1)}</span><span><strong>{market.asset}</strong><small>{market.duration} · live book</small></span></div><span className={`action-pill ${action.tone}`}>{action.label}</span></div>
-    <div className="market-question">{market.question}</div>
-    <div className="market-price-row"><div><small>TIME LEFT</small><strong className="countdown">{timeLeft(market.remaining)}</strong></div><div className="market-spot"><small>LIVE SPOT</small><strong>{formatSpot(market.asset, market.spot)}</strong><small className="market-reference" title={market.referenceSource === "COINBASE ESTIMATE" ? "Estimated from the opening of the matching Coinbase 5m candle; Polymarket resolves against Chainlink." : "Polymarket opening reference price."}>{market.reference === null ? "REF unavailable" : `${market.referenceSource === "COINBASE ESTIMATE" ? "REF≈" : "REF"} ${formatSpot(market.asset, market.reference)}`}</small><span className={distance !== null && distance >= 0 ? "text-positive" : "text-negative"}>{distance === null ? "—" : `${distance >= 0 ? "+" : ""}${percentage(distance, 2)}`}</span></div></div>
-    <div className="book-grid"><div><span>UP</span><strong>{cents(market.upAsk)}</strong><small>bid {cents(market.upBid)}</small></div><div><span>DOWN</span><strong>{cents(market.downAsk)}</strong><small>bid {cents(market.downBid)}</small></div><div><span>MODEL P(UP)</span><strong>{percentage(signal.fairUp)}</strong><small>candle model</small></div></div>
-    <div className="entry-signal"><div><small>SIGNAL · CONFIDENCE</small><strong className={signal.bias === "UP" ? "text-positive" : signal.bias === "DOWN" ? "text-negative" : "text-warning"}>{signal.bias}{signal.biasConfidence === null ? "" : ` · ${percentage(signal.biasConfidence, 0)}`}</strong></div><div><small>ENTRY</small><strong className={signal.action === "UP" ? "text-positive" : signal.action === "DOWN" ? "text-negative" : "text-warning"}>{signal.action === "PASS" ? "PASS" : `${signal.action} · ${cents(signal.entryPrice)}`}</strong></div><div className="entry-price-checks"><div><small>UP · P {percentage(signal.fairUp)} / ASK {cents(market.upAsk)}</small><strong className={signal.upEdge === null ? "text-muted" : signal.upEdge >= 0 ? "text-positive" : "text-negative"}>EDGE {signal.upEdge === null ? "—" : percentage(signal.upEdge)}</strong></div><div><small>DOWN · P {percentage(signal.fairUp === null ? null : 1 - signal.fairUp)} / ASK {cents(market.downAsk)}</small><strong className={signal.downEdge === null ? "text-muted" : signal.downEdge >= 0 ? "text-positive" : "text-negative"}>EDGE {signal.downEdge === null ? "—" : percentage(signal.downEdge)}</strong></div></div><div className="entry-trends"><span>5M {signal.trend5m}</span><span>15M {signal.trend15m}</span></div><PriceSparkline values={chartValues} color={signal.bias === "DOWN" ? "#ff7d8a" : "#6cf2c4"} /><small className="entry-reason">{signal.reason}</small></div>
-    <div className="market-footer"><span className="market-edge"><span className="metric-label">NET EDGE</span><strong className={signal.action !== "PASS" ? "text-positive" : "text-muted"}>{signal.edge === null ? "—" : `${signal.edge >= 0 ? "+" : ""}${percentage(signal.edge)}`}</strong></span><span className="market-liquidity"><span className="metric-label">ASK DEPTH</span><strong>{market.liquidity ? dollars(market.liquidity, 0) : "—"}</strong></span></div>
-  </button>;
-}
-
-function EmptyState({ title, detail, action }: { title: string; detail: string; action?: ReactNode }) {
-  return <div className="empty-state"><div className="empty-state-icon"><Database size={18} /></div><strong>{title}</strong><p>{detail}</p>{action}</div>;
-}
-
-function AccountView({ account, loading, error, onConnect, onRefresh, onDisconnect }: { account: ConnectedAccount | null; loading: boolean; error: string; onConnect: () => void; onRefresh: () => void; onDisconnect: () => void }) {
-  return <section className="account-view"><div className="section-heading"><div><div className="eyebrow">ACCOUNT CONSOLE</div><h2>Connected Polymarket account</h2><p className="section-subtitle">Wallet, balance, and execution-session data. Live order controls are isolated in the Live Executor tab.</p></div><div className="account-heading-actions">{account ? <><button className="button-secondary" disabled={loading} onClick={onRefresh} type="button">{loading ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}REFRESH</button><button className="button-secondary" onClick={onConnect} type="button"><Settings2 size={14} />EDIT CONNECTION</button><button className="button-danger" onClick={onDisconnect} type="button"><X size={14} />DISCONNECT</button></> : <button className="button-primary" onClick={onConnect} type="button"><Wallet size={14} />LINK POLYMARKET</button>}</div></div>{error ? <div className="data-alert account-alert"><AlertTriangle size={16} /><div><strong>Account sync failed</strong><span>{error}</span></div><button onClick={onRefresh} type="button">Retry</button></div> : null}{!account ? <EmptyState title="No Polymarket account linked" detail="Enter your wallet address and signer private key once. The app establishes a short-lived encrypted live session, then uses it to fetch balance, positions, open orders, and trades." action={<button className="button-primary" onClick={onConnect} type="button"><Wallet size={14} />Connect account</button>} /> : <><div className="account-identity"><div><span className="metric-label">WALLET</span><strong>{account.walletAddress}</strong></div><div className="account-badges"><span className="result-badge ready"><span className="status-dot status-ready" />PUBLIC DATA</span><span className={"result-badge " + (account.authenticated ? "ready" : "waiting")}><span className={"status-dot " + (account.authenticated ? "status-ready" : "status-warning")} />{account.authenticated ? "CLOB AUTHENTICATED" : "WALLET ONLY"}</span><span className="account-fetched">synced {formatTime(account.fetchedAt)}</span></div></div><div className="account-metrics metric-grid"><MetricCard label="PORTFOLIO VALUE" value={dollars(account.portfolioValue)} delta="Data API" deltaTone="neutral" detail="public wallet value" icon={<CircleDollarSign size={17} />} /><MetricCard label="CASH BALANCE" value={account.authenticated ? dollars(account.cashBalance) : "—"} delta={account.authenticated ? "authenticated" : "link wallet key"} deltaTone={account.authenticated ? "positive" : "warning"} detail="collateral available" icon={<Wallet size={17} />} /><MetricCard label="ACCOUNT P&L" value={signedDollars(account.pnl)} delta="user-pnl" deltaTone={account.pnl !== null && account.pnl >= 0 ? "positive" : "neutral"} detail="latest cumulative point" icon={<TrendingUp size={17} />} /><MetricCard label="POSITIONS" value={String(account.openPositions.length)} delta={account.openOrders.length + " open orders"} deltaTone="neutral" detail="public positions" icon={<BarChart3 size={17} />} /><MetricCard label="RECENT TRADES" value={String(account.recentTrades.length)} delta={account.tradedMarketCount === null ? "—" : String(account.tradedMarketCount) + " markets"} deltaTone="neutral" detail="latest wallet activity" icon={<Activity size={17} />} /></div>{account.warnings.length ? <div className="account-warnings"><AlertTriangle size={15} /><div>{account.warnings.map((warning) => <span key={warning}>{warning}</span>)}</div></div> : null}<div className="account-grid"><article className="panel positions-panel"><div className="panel-heading"><div><div className="eyebrow">PUBLIC POSITIONS</div><h3>Open positions <span className="heading-muted">/ {account.openPositions.length}</span></h3></div><span className="feed-live"><span className="status-dot status-ready" />DATA API</span></div><div className="positions-table-wrap"><table className="positions-table"><thead><tr><th>MARKET</th><th>OUTCOME</th><th>SIZE</th><th>MARK</th><th>P&amp;L</th></tr></thead><tbody>{account.openPositions.length ? account.openPositions.map((position) => <tr key={position.id}><td><strong>{position.title}</strong><small>{position.status} · {formatTime(position.lastEventAt)}</small></td><td>{position.outcome}</td><td>{quantity(position.size)}</td><td>{cents(position.currentPrice)}</td><td className={position.unrealizedPnl === null ? "text-muted" : position.unrealizedPnl >= 0 ? "text-positive" : "text-negative"}>{signedDollars(position.unrealizedPnl)}</td></tr>) : <tr><td className="empty-row" colSpan={5}>No open positions returned for this wallet.</td></tr>}</tbody></table></div></article><article className="panel positions-panel"><div className="panel-heading"><div><div className="eyebrow">ACCOUNT ACTIVITY</div><h3>Recent trades <span className="heading-muted">/ {account.recentTrades.length}</span></h3></div><span className="feed-live"><span className={"status-dot " + (account.authenticated ? "status-ready" : "status-warning")} />{account.authenticated ? "CLOB + DATA" : "DATA API"}</span></div><div className="positions-table-wrap"><table className="positions-table"><thead><tr><th>TIME</th><th>MARKET</th><th>SIDE</th><th>PRICE</th><th>SIZE</th></tr></thead><tbody>{account.recentTrades.length ? account.recentTrades.map((trade) => <tr key={trade.id}><td>{formatTime(trade.timestamp)}</td><td><strong>{trade.title}</strong><small>{trade.status}</small></td><td><span className={"side-chip " + (trade.side.toUpperCase() === "BUY" ? "up" : "down")}>{trade.side}</span></td><td>{cents(trade.price)}</td><td>{quantity(trade.shares)}</td></tr>) : <tr><td className="empty-row" colSpan={5}>No trade activity returned for this wallet.</td></tr>}</tbody></table></div></article></div><article className="panel account-orders-panel"><div className="panel-heading"><div><div className="eyebrow">AUTHENTICATED CLOB</div><h3>Open orders <span className="heading-muted">/ {account.openOrders.length}</span></h3></div><span className="panel-footnote"><LockKeyhole size={13} /> Session-authenticated</span></div>{account.authenticated ? account.openOrders.length ? <div className="positions-table-wrap"><table className="positions-table"><thead><tr><th>SIDE</th><th>PRICE</th><th>SIZE</th><th>MATCHED</th><th>STATUS</th></tr></thead><tbody>{account.openOrders.map((order) => <tr key={order.id}><td>{order.side}</td><td>{cents(order.price)}</td><td>{quantity(order.size)}</td><td>{quantity(order.matched)}</td><td>{order.status}</td></tr>)}</tbody></table></div> : <div className="account-empty-line">No open CLOB orders returned.</div> : <div className="account-empty-line">Link your wallet to read private open orders and collateral balance.</div>}</article></> }</section>;
-}
-
-function AccountConnectModal({ connection, loading, error, onChange, onSubmit, onClose }: { connection: AccountConnection; loading: boolean; error: string; onChange: <K extends keyof AccountConnection>(field: K, value: AccountConnection[K]) => void; onSubmit: () => void; onClose: () => void }) {
-  return <div className="modal-backdrop" onClick={onClose} role="presentation"><div aria-labelledby="account-connect-title" aria-modal="true" className="modal-card account-modal" onClick={(event) => event.stopPropagation()} role="dialog"><button aria-label="Close account connection" className="modal-close" onClick={onClose} type="button"><X size={17} /></button><div className="modal-icon account-modal-icon"><Wallet size={20} /></div><div className="eyebrow">SECURE LIVE CONNECTION</div><h2 id="account-connect-title">Link Polymarket account</h2><p>Enter your Polymarket wallet address and signer private key. The key is used once to derive CLOB credentials, check your balance, and establish a short-lived encrypted session for the live executor.</p><form className="account-form" onSubmit={(event) => { event.preventDefault(); onSubmit(); }}><label><span>Wallet address <em>required</em></span><input autoComplete="off" autoFocus onChange={(event) => onChange("walletAddress", event.target.value)} placeholder="0x…" spellCheck={false} value={connection.walletAddress} /></label><label><span>Wallet / signer type <em>select the Polymarket account type</em></span><select onChange={(event) => onChange("signatureType", event.target.value)} value={connection.signatureType}><option value="3">Polymarket proxy / smart wallet (3)</option><option value="0">EOA signer (0)</option><option value="1">Proxy wallet (1)</option><option value="2">Gnosis Safe (2)</option></select></label><label><span>Signer private key <em>required</em></span><input autoComplete="new-password" onChange={(event) => onChange("privateKey", event.target.value)} placeholder="64 hex characters" spellCheck={false} type="password" value={connection.privateKey} /></label>{error ? <div className="account-form-error"><AlertTriangle size={14} />{error}</div> : null}<div className="account-security-note"><LockKeyhole size={15} /><span>Raw private keys are highly sensitive. Use this only if you trust this deployment. The browser clears the key after linking; it is not stored in localStorage or logs. The encrypted session expires automatically.</span></div><div className="account-docs"><a href="https://docs.polymarket.com/getting-started/api" rel="noreferrer" target="_blank">API authentication docs ↗</a><a href="https://docs.polymarket.com/trading/wallets-auth" rel="noreferrer" target="_blank">Wallet auth docs ↗</a></div><div className="modal-actions"><button className="button-secondary" onClick={onClose} type="button">Cancel</button><button className="button-primary" disabled={loading || !connection.walletAddress.trim() || !connection.privateKey.trim()} type="submit">{loading ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />} {loading ? "Linking…" : "Connect & secure session"}</button></div></form></div></div>;
-}
-
-const RUNNER_COMMAND = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run_forever.ps1";
-
-function RunnerSetupModal({ onClose }: { onClose: () => void }) {
-  const [copied, setCopied] = useState(false);
-  const copyCommand = async () => {
-    try {
-      await navigator.clipboard.writeText(RUNNER_COMMAND);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1800);
-    } catch {
-      setCopied(false);
-    }
-  };
-  return <div className="modal-backdrop" onClick={onClose} role="presentation"><div aria-labelledby="runner-setup-title" aria-modal="true" className="modal-card runner-modal" onClick={(event) => event.stopPropagation()} role="dialog"><button aria-label="Close 24/7 runner setup" className="modal-close" onClick={onClose} type="button"><X size={17} /></button><div className="modal-icon runner-modal-icon"><Terminal size={20} /></div><div className="eyebrow">24/7 PAPER SUPERVISOR</div><h2 id="runner-setup-title">Keep the local terminal alive</h2><p>This supervisor keeps the built local server running and restarts it if it exits. Open http://127.0.0.1:8787 in a browser and keep that tab awake because market scanning, paper fills, resolution settlement, and Telegram scheduling run in the browser.</p><div className="runner-checks"><div><span className="status-dot status-ready" /><span>Unified paper account</span><b className="gate-pass">ON</b></div><div><span className="status-dot status-ready" /><span>Restart local server</span><b className="gate-pass">ON</b></div><div><span className="status-dot status-locked" /><span>Background live orders</span><b className="gate-pending">OFF</b></div></div><div className="runner-command"><div className="runner-command-label"><span>RUN FROM THE PROJECT ROOT</span><button className="text-button" onClick={() => void copyCommand()} type="button"><Copy size={13} />{copied ? "COPIED" : "COPY"}</button></div><code>{RUNNER_COMMAND}</code></div><div className="runner-note"><ShieldCheck size={15} /><span>Use Windows Task Scheduler at logon, disable sleep while plugged in, and keep the browser tab open for continuous paper updates.</span></div><div className="modal-actions"><button className="button-secondary" onClick={onClose} type="button">Close</button><button className="button-primary" onClick={() => void copyCommand()} type="button"><Copy size={14} />{copied ? "COMMAND COPIED" : "COPY 24/7 COMMAND"}</button></div></div></div>;
-}
+const feedPayload = (snapshot: MarketSnapshot, sigma: number | null, volSamples: number) => ({
+  clientNow: snapshot.now,
+  spot: snapshot.spot,
+  spotTimestamp: snapshot.spotTimestamp,
+  spotSource: snapshot.spotSource,
+  basisBps: snapshot.basisBps,
+  sigmaPerSqrtSecond: sigma,
+  volSamples,
+  ticks: snapshot.ticks.slice(-120),
+});
 
 export default function Home() {
-  const [view, setView] = useState<View>("overview"); const [markets, setMarkets] = useState<LiveMarket[]>([]); const [selectedMarketId, setSelectedMarketId] = useState(""); const [durationFilter, setDurationFilter] = useState<"ALL" | Horizon>("ALL");
-  const [account, setAccount] = useState<PaperAccount>(() => createPaperAccount(1000, 0)); const [config, setConfig] = useState<Config>(DEFAULT_CONFIG); const [logs, setLogs] = useState<LogItem[]>([]);
-  const [dataStatus, setDataStatus] = useState<DataStatus>("loading"); const [dataError, setDataError] = useState(""); const [lastUpdated, setLastUpdated] = useState<number | null>(null); const [lastStreamUpdate, setLastStreamUpdate] = useState<number | null>(null); const [clock, setClock] = useState(0); const [refreshing, setRefreshing] = useState(false); const [streamStatus, setStreamStatus] = useState<"CONNECTING" | "LIVE" | "REST FALLBACK">("CONNECTING");
-  const [engineRunning, setEngineRunning] = useState(false); const [paused, setPaused] = useState(false); const [killSwitch, setKillSwitch] = useState(false); const [runnerDialogOpen, setRunnerDialogOpen] = useState(false); const [selectedRange, setSelectedRange] = useState("ALL"); const [startingCashInput, setStartingCashInput] = useState("1000");
-  const [recordedTicks, setRecordedTicks] = useState<BacktestRow[]>([]); const [backtestRows, setBacktestRows] = useState<BacktestRow[]>([]); const [backtestRejected, setBacktestRejected] = useState(0); const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null); const [backtestStartingCash, setBacktestStartingCash] = useState(1000);
-  const [accountConnection, setAccountConnection] = useState<AccountConnection>(() => ({ ...EMPTY_ACCOUNT_CONNECTION, walletAddress: readStoredJson<{ walletAddress?: string }>(ACCOUNT_WALLET_STORAGE_KEY)?.walletAddress ?? "" })); const [connectedAccount, setConnectedAccount] = useState<ConnectedAccount | null>(null); const [accountLoading, setAccountLoading] = useState(false); const [accountError, setAccountError] = useState(""); const [accountDialogOpen, setAccountDialogOpen] = useState(false);
-  const [liveRisk, setLiveRisk] = useState<LiveRiskConfig>(() => normalizeLiveRiskConfig(readStoredJson<Partial<LiveRiskConfig>>(LIVE_RISK_STORAGE_KEY))); const [liveSession, setLiveSession] = useState<LiveSessionState | null>(null); const [liveRunning, setLiveRunning] = useState(false); const [livePaused, setLivePaused] = useState(false); const [liveConsent, setLiveConsent] = useState(false); const [liveStatus, setLiveStatus] = useState<LiveExecutionStatus>({ lastAction: "", lastDetail: "", lastError: "", lastLatencyMs: null });
-  const [ledgerRows, setLedgerRows] = useState<MarketDecisionRow[]>(() => readStoredJson<MarketDecisionRow[]>(LEDGER_STORAGE_KEY) ?? []);
-  const [paperTestStartingBalanceInput, setPaperTestStartingBalanceInput] = useState("1000"); const [paperTestDurationDaysInput, setPaperTestDurationDaysInput] = useState("1");
-  const [paperTest, setPaperTest] = useState<PaperTestViewState>({ status: "IDLE", startingBalance: 1000, days: 1, startedAt: null, endsAt: null, balance: 1000, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null });
-  const [telegram, setTelegram] = useState<TelegramViewState>({ connected: false, botUsername: "", botName: "", chatId: "", chatTitle: "", expiresAt: null, lastStatus: "", lastError: "" });
-  const previousSpots = useRef(new Map<Asset, number>()); const priceHistoryByAsset = useRef(new Map<Asset, MarketPriceTick[]>()); const autoLastFill = useRef(new Map<string, number>()); const dataLogState = useRef(""); const hydrated = useRef(false); const refreshBusy = useRef(false); const paperAutoStarted = useRef(false); const liveBusy = useRef(false); const liveAttempted = useRef(new Map<string, number>()); const liveReason = useRef(""); const paperExitObservations = useRef(new Map<string, { count: number; lastSeen: number }>()); const livePositionsRef = useRef<LivePositionSnapshot[]>([]); const liveExitObservations = useRef(new Map<string, { count: number; lastSeen: number }>()); const livePositionRefreshBusy = useRef(false); const livePositionRefreshedAt = useRef(0);
-  const ledgerSnapshots = useRef(new Map<string, { market: LiveMarket; observedAt: number }>()); const ledgerLastScan = useRef(0); const telegramSendBusy = useRef(false);
+  const [view, setView] = useState<View>("overview");
+  const [logs, setLogs] = useState<LogItem[]>([]);
+  const appendLog = useCallback((message: string, detail: string, tone: Tone = "neutral") => {
+    setLogs((current) =>
+      [{ id: `${Date.now()}-${Math.random()}`, time: new Date().toLocaleTimeString("en-US", { hour12: false }), message, detail, tone }, ...current].slice(
+        0,
+        40,
+      ),
+    );
+  }, []);
+  const onFeedLog = useCallback(
+    (level: "info" | "warn" | "error", message: string) =>
+      appendLog(level === "info" ? "Feed" : "Feed warning", message, level === "info" ? "neutral" : "warning"),
+    [appendLog],
+  );
+  const { controller, version } = useMarketFeed(onFeedLog);
 
-  const appendLog = useCallback((message: string, detail: string, tone: Tone = "neutral") => { setLogs((current) => [{ id: `${Date.now()}-${message}`, time: new Date().toLocaleTimeString("en-US", { hour12: false }), message, detail, tone }, ...current].slice(0, 18)); }, []);
+  const [clock, setClock] = useState(0);
+  const [durationFilter, setDurationFilter] = useState<"ALL" | "5m" | "15m">("ALL");
+  const [selectedMarketId, setSelectedMarketId] = useState("");
+  const [runnerOpen, setRunnerOpen] = useState(false);
 
-  useEffect(() => { if (typeof window === "undefined") return; const rawAccount = readStoredJson<PaperAccount>(PAPER_STORAGE_KEY); const rawConfig = readStoredJson<Partial<Config>>(CONFIG_STORAGE_KEY); if (rawAccount?.startingCash) setAccount(rawAccount); if (rawConfig) setConfig({ ...DEFAULT_CONFIG, ...rawConfig, ...normalizeEarlyExitPolicy(rawConfig, DEFAULT_PAPER_EARLY_EXIT) }); setStartingCashInput(String(rawAccount?.startingCash ?? 1000)); hydrated.current = true; }, []);
-  useEffect(() => { if (hydrated.current && typeof window !== "undefined") window.localStorage.setItem(PAPER_STORAGE_KEY, JSON.stringify(account)); }, [account]);
-  useEffect(() => { if (typeof window !== "undefined") window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config)); }, [config]);
-  useEffect(() => { if (typeof window !== "undefined") window.localStorage.setItem(LIVE_RISK_STORAGE_KEY, JSON.stringify(liveRisk)); }, [liveRisk]);
-  useEffect(() => { if (typeof window !== "undefined") { try { window.localStorage.setItem(LEDGER_STORAGE_KEY, JSON.stringify(ledgerRows)); } catch { /* Keep the in-memory ledger if browser storage is full. */ } } }, [ledgerRows]);
+  // ---- paper engine ------------------------------------------------------
+  const [paperConfig, setPaperConfig] = useState<PaperConfig>(() => normalizePaperConfig(readStoredJson<Partial<PaperConfig>>(PAPER_CONFIG_KEY)));
+  const [engine, setEngine] = useState<PaperEngineState>(() => {
+    const stored = readStoredJson<{ account?: Partial<PaperAccount>; halt?: PaperEngineState["halt"] }>(PAPER_KEY);
+    const account = migratePaperAccount(stored?.account ?? null) ?? createPaperAccount(1000, 0);
+    return { ...createEngineState(account), halt: stored?.halt ?? null };
+  });
+  const [autoTrade, setAutoTrade] = useState(true);
+  const engineRef = useRef(engine);
+  const configRef = useRef(paperConfig);
+  const autoRef = useRef(autoTrade);
   useEffect(() => {
-    if (paperAutoStarted.current || killSwitch) return;
-    paperAutoStarted.current = true; setEngineRunning(true); setPaused(false); setView("paper"); appendLog("Paper engine started automatically", "Paper mode is open. Candle signals and public asks only; no live orders.", "positive");
-  }, [appendLog, killSwitch]);
-  const fetchConnectedAccount = useCallback(async (connection: AccountConnection): Promise<boolean> => {
-    if (!connection.walletAddress.trim()) { setAccountError("Enter a wallet address before connecting."); return false; }
-    setAccountLoading(true); setAccountError("");
-    try {
-      const response = await fetch("/api/polymarket/account", { body: JSON.stringify(connection), cache: "no-store", headers: { "Content-Type": "application/json" }, method: "POST" });
-      const payload = await response.json() as { ok?: boolean; error?: string; account?: ConnectedAccount };
-      if (!response.ok || !payload.ok || !payload.account) throw new Error(payload.error || "The account endpoint did not return a usable snapshot.");
-      setConnectedAccount(payload.account);
-      if (payload.account.authenticated) {
-        const accountSnapshot = payload.account;
-        setLiveSession((current) => current ? { ...current, balance: accountSnapshot.cashBalance ?? current.balance, openOrders: accountSnapshot.openOrders.length } : current);
-      }
-      if (typeof window !== "undefined") window.localStorage.setItem(ACCOUNT_WALLET_STORAGE_KEY, JSON.stringify({ walletAddress: connection.walletAddress.trim() }));
-      appendLog("Polymarket account synchronized", String(payload.account.openPositions.length) + " positions · " + String(payload.account.recentTrades.length) + " recent trades · " + (payload.account.authenticated ? "authenticated CLOB reads" : "public wallet reads"), "positive");
-      return true;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Account request failed.";
-      setAccountError(detail); appendLog("Polymarket account unavailable", detail, "negative"); return false;
-    } finally { setAccountLoading(false); }
-  }, [appendLog]);
+    engineRef.current = engine;
+    writeStoredJson(PAPER_KEY, { account: engine.account, halt: engine.halt });
+  }, [engine]);
+  useEffect(() => {
+    configRef.current = paperConfig;
+    writeStoredJson(PAPER_CONFIG_KEY, paperConfig);
+  }, [paperConfig]);
+  useEffect(() => {
+    autoRef.current = autoTrade;
+  }, [autoTrade]);
 
-  const connectAccount = async () => {
-    const connection = accountConnection;
-    if (!connection.walletAddress.trim() || !connection.privateKey.trim()) { setAccountError("Enter the wallet address and signer private key to establish the live session."); return; }
-    setAccountLoading(true); setAccountError("");
-    try {
-      const response = await fetch("/api/polymarket/live", { body: JSON.stringify({ action: "connect", walletAddress: connection.walletAddress, privateKey: connection.privateKey, signatureType: Number(connection.signatureType) }), cache: "no-store", credentials: "same-origin", headers: { "Content-Type": "application/json" }, method: "POST" });
-      const payload = await response.json() as { ok?: boolean; error?: string; live?: LiveSessionState };
-      if (!response.ok || !payload.ok || !payload.live) throw new Error(payload.error || "The live session could not be established.");
-      setLiveSession({ ...payload.live, connected: true });
-      setAccountConnection((current) => ({ ...current, privateKey: "" }));
-      const accountConnectionWithoutKey = { ...connection, privateKey: "" };
-      const synced = await fetchConnectedAccount(accountConnectionWithoutKey);
-      if (!synced) throw new Error("Live session established, but the account snapshot could not be loaded.");
-      setAccountDialogOpen(false); setView("account"); appendLog("Polymarket live session armed", "Wallet linked; raw key cleared from browser state. Live execution remains opt-in until you confirm the risk notice.", "positive");
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Live account connection failed.";
-      setAccountError(detail); appendLog("Polymarket live session unavailable", detail, "negative");
-    } finally { setAccountLoading(false); }
-  };
-  const disconnectAccount = () => {
-    void fetch("/api/polymarket/live", { body: JSON.stringify({ action: "disconnect" }), cache: "no-store", credentials: "same-origin", headers: { "Content-Type": "application/json" }, method: "POST" }).catch(() => undefined);
-    setLiveRunning(false); setLivePaused(false); setLiveSession(null); setConnectedAccount(null); setAccountConnection(EMPTY_ACCOUNT_CONNECTION); setAccountError(""); setView("overview"); if (typeof window !== "undefined") window.localStorage.removeItem(ACCOUNT_WALLET_STORAGE_KEY); appendLog("Polymarket account disconnected", "Encrypted live session cleared from this browser session.", "neutral");
-  };
-  useEffect(() => { if (!connectedAccount || !accountConnection.walletAddress.trim()) return; const timer = window.setInterval(() => void fetchConnectedAccount(accountConnection), 30000); return () => window.clearInterval(timer); }, [accountConnection, connectedAccount, fetchConnectedAccount]);
-
-  const costs = useMemo<CostConfig>(() => ({ feeRate: config.feeRate, slippageBps: config.slippageBps }), [config.feeRate, config.slippageBps]);
-  const liveMarkets = useMemo(() => markets.map((market) => {
-    const remaining = Math.max(0, Math.ceil((market.countdownEndsAt - clock) / 1000));
-    const fairUp = chartFairProbability(market.reference, market.spot, remaining, market.duration, market.duration === "5m" ? market.chart5m : market.chart15m, clock);
-    return { ...market, remaining, fairUp, edgeUp: fairUp !== null && market.upAsk !== null ? fairUp - market.upAsk : null, edgeDown: fairUp !== null && market.downAsk !== null ? 1 - fairUp - market.downAsk : null };
-  }), [clock, markets]);
-  const marketMap = useMemo(() => new Map(markets.map((market) => [market.id, market])), [markets]); const liveMarketMap = useMemo(() => new Map(liveMarkets.map((market) => [market.id, market])), [liveMarkets]); const selectedMarket = useMemo(() => liveMarkets.find((market) => market.id === selectedMarketId) ?? liveMarkets[0] ?? null, [liveMarkets, selectedMarketId]); const filteredMarkets = useMemo(() => durationFilter === "ALL" ? liveMarkets : liveMarkets.filter((market) => market.duration === durationFilter), [durationFilter, liveMarkets]);
-  const liveTokenMap = useMemo(() => {
-    const next = new Map<string, { market: LiveMarket; side: PaperSide }>();
-    for (const market of liveMarkets) {
-      next.set(market.upTokenId, { market, side: "UP" });
-      next.set(market.downTokenId, { market, side: "DOWN" });
-    }
-    return next;
-  }, [liveMarkets]);
+  // ---- ledger + recorder -------------------------------------------------
+  const [ledger, setLedger] = useState<Map<string, MarketDecisionRow>>(
+    () => new Map((readStoredJson<MarketDecisionRow[]>(LEDGER_KEY) ?? []).filter((row) => row && typeof row.endTime === "number").map((row) => [row.id, row])),
+  );
+  const ledgerRows = useMemo(() => [...ledger.values()], [ledger]);
   const ledgerMetrics = useMemo(() => computeLedgerMetrics(ledgerRows), [ledgerRows]);
+  useEffect(() => writeStoredJson(LEDGER_KEY, [...ledger.values()].sort((left, right) => right.endTime - left.endTime).slice(0, 3000)), [ledger]);
+  const recordingRef = useRef<{ snapshots: MarketSnapshot[]; outcomes: Map<string, Side>; lastAt: number }>({ snapshots: [], outcomes: new Map(), lastAt: 0 });
+  const [recordedCount, setRecordedCount] = useState(0);
+
+  // ---- telegram ----------------------------------------------------------
+  const [telegram, setTelegram] = useState<TelegramViewState>(() => ({
+    connected: false,
+    botUsername: "",
+    botName: "",
+    chatId: "",
+    chatTitle: "",
+    expiresAt: null,
+    alerts: readStoredJson<boolean>(TELEGRAM_ALERTS_KEY) ?? true,
+    lastStatus: "",
+    lastError: "",
+  }));
+  const telegramRef = useRef(telegram);
   useEffect(() => {
-    if (!liveMarkets.length) return;
-    const now = Date.now();
-    if (now - ledgerLastScan.current < 4500) return;
-    ledgerLastScan.current = now;
-    const activeIds = new Set(liveMarkets.map((market) => market.id));
-    for (const market of liveMarkets) ledgerSnapshots.current.set(market.id, { market, observedAt: now });
-    setLedgerRows((current) => {
-      const rows = new Map(current.map((row) => [row.id, row]));
-      let changed = false;
-      for (const market of liveMarkets) {
-        const signal = analyzeMarketSignal(market, costs, config.maxTrade, config.minEdge);
-        const previous = rows.get(market.id);
-        const decision = signal.action;
-        const outcome = previous?.outcome ?? null;
-        const next: MarketDecisionRow = previous ? {
-          ...previous,
-          lastUpdatedAt: now,
-          asset: market.asset,
-          duration: market.duration,
-          slug: market.slug,
-          question: market.question,
-          sourceUrl: market.sourceUrl,
-          decision,
-          tier: signal.tier,
-          fairUp: signal.fairUp,
-          upEdge: signal.upEdge,
-          downEdge: signal.downEdge,
-          edge: signal.edge,
-          entryPrice: signal.entryPrice,
-          upAsk: market.upAsk,
-          downAsk: market.downAsk,
-          reference: market.reference,
-          spot: market.spot,
-          remainingSeconds: market.remaining,
-          result: ledgerResultFor(decision, outcome),
-          simulatedStake: signal.estimatedFill?.totalCost ?? 0,
-          simulatedUnits: signal.estimatedFill?.shares ?? 0,
-          signalConfidence: signal.confidence,
-          biasConfidence: signal.biasConfidence,
-          trend5m: signal.trend5m,
-          trend15m: signal.trend15m,
-          reason: signal.reason,
-          changeCount: previous.changeCount + (previous.decision === decision ? 0 : 1),
-        } : {
-          id: market.id,
-          marketId: market.id,
-          observedAt: now,
-          firstSeenAt: now,
-          lastUpdatedAt: now,
-          asset: market.asset,
-          duration: market.duration,
-          slug: market.slug,
-          question: market.question,
-          sourceUrl: market.sourceUrl,
-          decision,
-          initialDecision: decision,
-          tier: signal.tier,
-          fairUp: signal.fairUp,
-          upEdge: signal.upEdge,
-          downEdge: signal.downEdge,
-          edge: signal.edge,
-          entryPrice: signal.entryPrice,
-          upAsk: market.upAsk,
-          downAsk: market.downAsk,
-          reference: market.reference,
-          spot: market.spot,
-          remainingSeconds: market.remaining,
-          outcome: null,
-          result: ledgerResultFor(decision, null),
-          outcomeAt: null,
-          simulatedStake: signal.estimatedFill?.totalCost ?? 0,
-          simulatedUnits: signal.estimatedFill?.shares ?? 0,
-          signalConfidence: signal.confidence,
-          biasConfidence: signal.biasConfidence,
-          trend5m: signal.trend5m,
-          trend15m: signal.trend15m,
-          reason: signal.reason,
-          changeCount: 0,
-        };
-        if (!previous || JSON.stringify(previous) !== JSON.stringify(next)) { rows.set(market.id, next); changed = true; }
-      }
-      for (const [marketId, snapshot] of ledgerSnapshots.current) {
-        const previous = rows.get(marketId);
-        if (!previous || activeIds.has(marketId) || snapshot.market.countdownEndsAt > now - 1500) continue;
-        const outcome = previous.outcome ?? marketOutcome(snapshot.market);
-        if (!outcome) continue;
-        const next = { ...previous, remainingSeconds: 0, outcome, outcomeAt: previous.outcomeAt ?? now, result: ledgerResultFor(previous.decision, outcome), lastUpdatedAt: now };
-        if (JSON.stringify(previous) !== JSON.stringify(next)) { rows.set(marketId, next); changed = true; }
-        ledgerSnapshots.current.delete(marketId);
-      }
-      return changed ? [...rows.values()].sort((left, right) => right.observedAt - left.observedAt) : current;
-    });
-  }, [config.maxTrade, config.minEdge, costs, liveMarkets]);
-  const equity = useMemo(() => accountEquity(account, marketMap), [account, marketMap]); const unrealized = useMemo(() => accountUnrealized(account, marketMap), [account, marketMap]); const winRate = useMemo(() => accountWinRate(account), [account]); const deployed = useMemo(() => accountDeployed(account), [account]); const todayPnl = equity - account.startingCash;
-  const paperTestView = useMemo<PaperTestViewState>(() => ({ ...paperTest, balance: accountEquity(account, liveMarketMap), trades: account.fills.filter((fill) => fill.action === "BUY").length, openPositions: account.positions.length, realizedPnl: account.realizedPnl, winRate: accountWinRate(account) }), [account, liveMarketMap, paperTest]);
-  const maxDrawdown = useMemo(() => { let peak = 0; let drawdown = 0; for (const point of account.equityHistory) { peak = Math.max(peak, point.equity); if (peak > 0) drawdown = Math.max(drawdown, (peak - point.equity) / peak); } return drawdown; }, [account.equityHistory]); const equitySeries = useMemo(() => account.equityHistory.map((point) => point.equity), [account.equityHistory]); const selectedSignal = selectedMarket ? analyzeMarketSignal(selectedMarket, costs, config.maxTrade, config.minEdge) : null; const currentAction = !selectedSignal || selectedSignal.action === "PASS" ? { label: "PASS", tone: "warning" as Tone } : { label: `${selectedSignal.tier} ${selectedSignal.action}`, tone: selectedSignal.action === "UP" ? "positive" as Tone : "negative" as Tone };
+    telegramRef.current = telegram;
+    writeStoredJson(TELEGRAM_ALERTS_KEY, telegram.alerts);
+  }, [telegram]);
+  const alertQueue = useRef<string[]>([]);
+  const telegramRequest = useCallback(
+    (body: Record<string, unknown>) =>
+      fetch("/api/telegram", {
+        body: JSON.stringify(body),
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      }),
+    [],
+  );
+  const sendTelegram = useCallback(
+    async (text: string) => {
+      const response = await telegramRequest({ action: "send-report", text: text.slice(0, 3900) });
+      const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (!response.ok || !payload.ok) throw new Error(payload.error || "Telegram send failed.");
+    },
+    [telegramRequest],
+  );
+  const alert = useCallback((text: string) => {
+    if (telegramRef.current.connected && telegramRef.current.alerts) alertQueue.current.push(text);
+  }, []);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const next = alertQueue.current.shift();
+      if (next)
+        void sendTelegram(`Polymarket Quant Engine\n${next}`).catch((error) =>
+          setTelegram((current) => ({ ...current, lastError: error instanceof Error ? error.message : "Alert failed." })),
+        );
+    }, 4_000);
+    return () => window.clearInterval(timer);
+  }, [sendTelegram]);
 
-  useEffect(() => { const timer = window.setInterval(() => setClock(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
+  // ---- live execution ----------------------------------------------------
+  const [liveRisk, setLiveRisk] = useState<LiveRiskConfig>(() => normalizeLiveRiskConfig(readStoredJson<Partial<LiveRiskConfig>>(LIVE_RISK_KEY)));
+  const [liveSession, setLiveSession] = useState<LiveSessionState | null>(null);
+  const [liveRunning, setLiveRunning] = useState(false);
+  const [livePaused, setLivePaused] = useState(false);
+  const [liveConsent, setLiveConsent] = useState(false);
+  const [liveStatus, setLiveStatus] = useState<LiveExecutionStatus>({ lastAction: "", lastDetail: "", lastError: "", lastLatencyMs: null });
+  const [serverKeyConfigured, setServerKeyConfigured] = useState(false);
+  useEffect(() => writeStoredJson(LIVE_RISK_KEY, liveRisk), [liveRisk]);
 
-  const refreshMarkets = useCallback(async () => {
-    if (refreshBusy.current) return;
-    refreshBusy.current = true;
-    const controller = new AbortController(); setRefreshing(true);
-    try {
-      const definitions = await discoverCryptoMarkets(controller.signal); const tokenIds = definitions.flatMap((market) => [market.upTokenId, market.downTokenId]); const assets = [...new Set(definitions.map((market) => market.asset))]; const [books, spots, candles] = await Promise.all([fetchOrderBooks(tokenIds, controller.signal), fetchSpotPrices(assets, controller.signal), fetchCandleHistories(assets, controller.signal)]); const timestamp = Date.now(); const nextMarkets = definitions.map((definition) => ({ ...buildLiveMarket(definition, books, spots, previousSpots.current.get(definition.asset) ?? null, timestamp, candles.get(definition.asset) ?? null), spotHistory: priceHistoryByAsset.current.get(definition.asset) ?? [] })).filter((market) => market.remaining !== null && market.remaining > 0);
-      setMarkets(nextMarkets); if (nextMarkets.length) { setDataStatus("ready"); setDataError(""); if (dataLogState.current !== "ready") appendLog("Public market data synchronized", `${nextMarkets.length} eligible crypto markets · Gamma + CLOB + Coinbase candles`, "positive"); dataLogState.current = "ready"; } else { setDataStatus("ready"); setDataError("No active crypto 5m/15m markets were returned by Gamma right now."); if (dataLogState.current !== "empty") appendLog("No eligible public markets", "The engine is holding new trades until Gamma returns a matching market.", "warning"); dataLogState.current = "empty"; }
-      const usableTicks = nextMarkets.filter((market) => market.reference !== null && market.spot !== null && market.upAsk !== null && market.downAsk !== null).map((market) => ({ timestamp, asset: market.asset, duration: market.duration, marketId: market.id, reference: market.reference as number, spot: market.spot as number, upAsk: market.upAsk as number, downAsk: market.downAsk as number, outcome: null, remainingSeconds: market.remaining }));
-      if (usableTicks.length) setRecordedTicks((current) => [...current, ...usableTicks].slice(-5000)); previousSpots.current = new Map(spots); setLastUpdated(timestamp);
-    } catch (error) { if (controller.signal.aborted) return; const detail = error instanceof Error ? error.message : "Public market request failed"; setDataStatus("error"); setDataError(detail); if (dataLogState.current !== "error") appendLog("Public data unavailable", detail, "negative"); dataLogState.current = "error"; } finally { refreshBusy.current = false; setRefreshing(false); }
-  }, [appendLog]);
+  // ---- account -----------------------------------------------------------
+  const [connection, setConnection] = useState<AccountConnection>(() => ({
+    walletAddress: readStoredJson<string>(WALLET_KEY) ?? "",
+    privateKey: "",
+    signatureType: "3",
+    useServerKey: true,
+  }));
+  const [connectedAccount, setConnectedAccount] = useState<ConnectedAccount | null>(null);
+  const [accountDialogOpen, setAccountDialogOpen] = useState(false);
+  const [accountLoading, setAccountLoading] = useState(false);
+  const [accountError, setAccountError] = useState("");
 
   useEffect(() => {
-    void refreshMarkets();
-    const refreshOnWake = () => void refreshMarkets();
-    const handleVisibility = () => { if (document.visibilityState === "visible") refreshOnWake(); };
-    const timer = window.setInterval(refreshOnWake, 15000);
-    window.addEventListener("focus", refreshOnWake);
-    window.addEventListener("online", refreshOnWake);
-    document.addEventListener("visibilitychange", handleVisibility);
-    return () => { window.clearInterval(timer); window.removeEventListener("focus", refreshOnWake); window.removeEventListener("online", refreshOnWake); document.removeEventListener("visibilitychange", handleVisibility); };
-  }, [refreshMarkets]);
-  const streamAssetKey = useMemo(() => [...new Set(markets.map((market) => market.asset))].sort().join(","), [markets]);
-  const streamTokenKey = useMemo(() => [...new Set(markets.flatMap((market) => [market.upTokenId, market.downTokenId]))].sort().join(","), [markets]);
-  const streamAssets = useMemo(() => streamAssetKey ? streamAssetKey.split(",") : [], [streamAssetKey]);
-  const streamTokens = useMemo(() => streamTokenKey ? streamTokenKey.split(",") : [], [streamTokenKey]);
-  useEffect(() => {
-    if (!streamAssetKey || !streamTokenKey) return;
-    let disposed = false;
-    let liveSockets = 0;
-    let fallbackActivated = false;
-    const retries = new Set<number>();
-    const markSocket = (isLive: boolean) => {
-      liveSockets = Math.max(0, liveSockets + (isLive ? 1 : -1));
-      setStreamStatus(liveSockets >= 2 ? "LIVE" : fallbackActivated ? "REST FALLBACK" : "CONNECTING");
-    };
-    const reconnect = (connect: () => void, delay: number) => {
-      const timer = window.setTimeout(() => { retries.delete(timer); if (!disposed) connect(); }, delay);
-      retries.add(timer);
-    };
-    const connectCoinbase = () => {
-      let opened = false;
-      let socket: WebSocket;
-      try { socket = new WebSocket("wss://ws-feed.exchange.coinbase.com"); }
-      catch { reconnect(connectCoinbase, 3000); return; }
-      socket.onopen = () => {
-        opened = true; markSocket(true);
-        socket.send(JSON.stringify({ type: "subscribe", product_ids: streamAssets.map((asset) => `${asset}-USD`), channels: ["ticker"] }));
-      };
-      socket.onmessage = (message) => {
-        try {
-          const tick = JSON.parse(String(message.data)) as { type?: string; product_id?: string; price?: string };
-          if (tick.type !== "ticker" || !tick.product_id || !tick.price) return;
-          const asset = tick.product_id.replace(/-USD$/, ""); const spot = Number(tick.price); const now = Date.now();
-          if (!Number.isFinite(spot) || spot <= 0) return;
-          previousSpots.current.set(asset, spot);
-          const priorHistory = priceHistoryByAsset.current.get(asset) ?? [];
-          const lastPoint = priorHistory[priorHistory.length - 1];
-          const spotHistory = !lastPoint || now - lastPoint.timestamp >= 1000
-            ? [...priorHistory, { timestamp: now, price: spot }].filter((point) => now - point.timestamp <= 120_000).slice(-180)
-            : priorHistory;
-          if (spotHistory !== priorHistory) priceHistoryByAsset.current.set(asset, spotHistory);
-          setMarkets((current) => current.map((market) => {
-            if (market.asset !== asset) return market;
-            const liveCandles = updateLiveCandles(market, spot, now);
-            const openingCandle = market.startTime === null ? null : liveCandles.chart5m.find((candle) => Math.abs(candle.timestamp - market.startTime!) <= 60000) ?? null;
-            const reference = market.reference ?? openingCandle?.open ?? null;
-            const referenceSource = market.reference !== null ? market.referenceSource : openingCandle ? "COINBASE ESTIMATE" : "MISSING";
-            const remaining = Math.max(0, (market.countdownEndsAt - now) / 1000);
-            const chart5m = liveCandles.chart5m; const chart15m = liveCandles.chart15m;
-            const fairUp = chartFairProbability(reference, spot, remaining, market.duration, market.duration === "5m" ? chart5m : chart15m, now);
-            const distance = reference !== null ? (spot - reference) / reference : null;
-            return { ...market, ...liveCandles, spotHistory, reference, referenceSource, spot, fairUp, distance, momentum: market.spot ? Math.log(spot / market.spot) : market.momentum, edgeUp: fairUp !== null && market.upAsk !== null ? fairUp - market.upAsk : null, edgeDown: fairUp !== null && market.downAsk !== null ? 1 - fairUp - market.downAsk : null, regime: reference === null ? "REFERENCE MISSING" : distance === null ? "SPOT MISSING" : Math.abs(distance) < 0.0002 ? "NEUTRAL" : distance > 0 ? "UP MOMENTUM" : "DOWN MOMENTUM", sourceTimestamp: now };
-          }));
-          setLastUpdated(now); setLastStreamUpdate(now);
-        } catch { /* Ignore malformed exchange messages; REST refresh remains available. */ }
-      };
-      socket.onclose = () => { if (opened) markSocket(false); reconnect(connectCoinbase, 1500); };
-      socket.onerror = () => socket.close();
-      sockets.push(socket);
-    };
-    const connectClob = () => {
-      let opened = false;
-      let socket: WebSocket;
-      try { socket = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market"); }
-      catch { reconnect(connectClob, 3000); return; }
-      socket.onopen = () => {
-        opened = true; markSocket(true);
-        socket.send(JSON.stringify({ type: "market", assets_ids: streamTokens, custom_feature_enabled: true }));
-      };
-      socket.onmessage = (message) => {
-        try {
-          const packet = JSON.parse(String(message.data)); const events = Array.isArray(packet) ? packet : [packet]; const now = Date.now();
-          for (const rawEvent of events) {
-            const event = rawEvent.payload && typeof rawEvent.payload === "object" ? { ...rawEvent.payload, event_type: rawEvent.type } : rawEvent;
-            const kind = event.event_type ?? event.type;
-            if (kind === "book") {
-              const tokenId = String(event.asset_id ?? event.token_id ?? event.tokenId ?? "");
-              const parseLevels = (value: unknown) => Array.isArray(value) ? value.flatMap((level: { price?: unknown; size?: unknown }) => { const price = Number(level.price); const size = Number(level.size); return Number.isFinite(price) && Number.isFinite(size) && price > 0 && size > 0 ? [{ price, size }] : []; }) : [];
-              const bids = parseLevels(event.bids); const asks = parseLevels(event.asks);
-              if (!tokenId) continue;
-              setMarkets((current) => current.map((market) => replaceLiveMarketBook(market, tokenId, bids, asks, Number(event.timestamp) || now, String(event.hash ?? "") || null, now)));
-              setLastUpdated(now); setLastStreamUpdate(now);
-              continue;
-            }
-            const updates = kind === "price_change" ? (event.price_changes ?? event.priceChanges ?? []) : [event];
-            if (!Array.isArray(updates)) continue;
-            for (const update of updates) {
-              const tokenId = String(update.asset_id ?? update.token_id ?? update.tokenId ?? "");
-              if (!tokenId) continue;
-              const bidValue = update.best_bid ?? update.bestBid;
-              const askValue = update.best_ask ?? update.bestAsk;
-              const bid = bidValue === null || bidValue === undefined ? null : Number(bidValue);
-              const ask = askValue === null || askValue === undefined ? null : Number(askValue);
-              const price = Number(update.price); const size = Number(update.size);
-              setMarkets((current) => current.map((market) => {
-                if (market.upTokenId !== tokenId && market.downTokenId !== tokenId) return market;
-                if (kind === "price_change" && (update.side === "BUY" || update.side === "SELL") && Number.isFinite(price) && Number.isFinite(size)) return updateLiveMarketBookLevel(market, tokenId, update.side, price, size, now);
-                const isUp = market.upTokenId === tokenId;
-                const upBid = isUp && bidValue !== undefined ? (bid !== null && Number.isFinite(bid) ? bid : null) : market.upBid;
-                const upAsk = isUp && askValue !== undefined ? (ask !== null && Number.isFinite(ask) ? ask : null) : market.upAsk;
-                const downBid = !isUp && bidValue !== undefined ? (bid !== null && Number.isFinite(bid) ? bid : null) : market.downBid;
-                const downAsk = !isUp && askValue !== undefined ? (ask !== null && Number.isFinite(ask) ? ask : null) : market.downAsk;
-                const fairUp = market.fairUp;
-                const spreads = [upBid !== null && upAsk !== null ? upAsk - upBid : null, downBid !== null && downAsk !== null ? downAsk - downBid : null].filter((value): value is number => value !== null);
-                return { ...market, upBid, upAsk, downBid, downAsk, spread: spreads.length ? Math.max(...spreads) : null, edgeUp: fairUp !== null && upAsk !== null ? fairUp - upAsk : null, edgeDown: fairUp !== null && downAsk !== null ? 1 - fairUp - downAsk : null, sourceTimestamp: now };
-              }));
-              setLastUpdated(now); setLastStreamUpdate(now);
-            }
-          }
-        } catch { /* Ignore malformed CLOB messages; REST refresh remains available. */ }
-      };
-      const heartbeat = window.setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send("PING"); }, 10000);
-      socket.onclose = () => { window.clearInterval(heartbeat); if (opened) markSocket(false); reconnect(connectClob, 1500); };
-      socket.onerror = () => socket.close();
-      sockets.push(socket);
-    };
-    const sockets: WebSocket[] = [];
-    connectCoinbase(); connectClob();
-    const fallbackTimer = window.setTimeout(() => { fallbackActivated = true; if (liveSockets < 2) setStreamStatus("REST FALLBACK"); }, 10000);
-    return () => { disposed = true; window.clearTimeout(fallbackTimer); for (const timer of retries) window.clearTimeout(timer); for (const socket of sockets) socket.close(); };
-  }, [streamAssetKey, streamTokenKey, streamAssets, streamTokens]);
-  useEffect(() => { if (markets.length && !markets.some((market) => market.id === selectedMarketId)) setSelectedMarketId(markets[0].id); }, [markets, markets.length, selectedMarketId]);
-  useEffect(() => { setAccount((current) => markAccount(current, marketMap)); }, [marketMap]);
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
-    if (!engineRunning) return;
-    const now = Date.now();
-    const simulationMarkets = new Map(liveMarketMap);
-    for (const [marketId, snapshot] of ledgerSnapshots.current) if (!simulationMarkets.has(marketId)) simulationMarkets.set(marketId, snapshot.market);
-    if (paperTest.status === "RUNNING" && paperTest.endsAt !== null && now >= paperTest.endsAt) {
-      const settled = settleResolvedPaperPositions(account, simulationMarkets, "timeframe test complete", now);
-      const completed = markAccount(settled.account, simulationMarkets, now);
-      setAccount(completed);
-      setPaperTest((current) => ({ ...current, status: "COMPLETE", balance: accountEquity(completed, simulationMarkets), trades: completed.fills.filter((fill) => fill.action === "BUY").length, openPositions: completed.positions.length, realizedPnl: completed.realizedPnl, winRate: accountWinRate(completed) }));
-      setEngineRunning(false); setPaused(true);
-      appendLog("Forward paper test complete", `${paperTest.days} day${paperTest.days === 1 ? "" : "s"} elapsed · ${settled.closed} market${settled.closed === 1 ? "" : "s"} resolved · ${completed.fills.filter((fill) => fill.action === "BUY").length} entries recorded.`, "positive");
-      return;
-    }
-    const settlement = settleResolvedPaperPositions(account, simulationMarkets, "market resolution", now);
-    if (settlement.closed) {
-      setAccount(markAccount(settlement.account, marketMap, now));
-      appendLog("Paper markets resolved", `${settlement.closed} position${settlement.closed === 1 ? "" : "s"} settled · ${signedDollars(settlement.realized)} realized and returned to shared cash.`, settlement.realized >= 0 ? "positive" : "negative");
-      return;
-    }
-    if (!killSwitch && account.positions.length) {
-      const exitIds = new Set<string>();
-      const exitDetails: string[] = [];
-      const activePositionIds = new Set(account.positions.map((position) => position.id));
-      for (const key of paperExitObservations.current.keys()) if (!activePositionIds.has(key)) paperExitObservations.current.delete(key);
-      for (const position of account.positions) {
-        const market = simulationMarkets.get(position.marketId);
-        if (!market || market.fairUp === null) {
-          paperExitObservations.current.delete(position.id);
-          continue;
-        }
-        const currentPrice = position.side === "UP" ? market.upBid : market.downBid;
-        const fairProbability = position.side === "UP" ? market.fairUp : 1 - market.fairUp;
-        const evaluation = evaluateModelAwareExit({ policy: config, entryPrice: position.avgEntry, currentPrice: currentPrice ?? 0, fairProbability, shares: position.shares, feeRate: config.feeRate, remainingSeconds: market.remaining });
-        if (!evaluation.shouldExit) {
-          paperExitObservations.current.delete(position.id);
-          continue;
-        }
-        const previous = paperExitObservations.current.get(position.id);
-        const count = previous && now - previous.lastSeen <= 15_000 ? previous.count + 1 : 1;
-        paperExitObservations.current.set(position.id, { count, lastSeen: now });
-        if (count >= config.earlyExitConfirmations) {
-          exitIds.add(position.id);
-          exitDetails.push(`${position.asset} ${position.duration} ${position.side} ${evaluation.reason}`);
-        }
-      }
-      if (exitIds.size) {
-        const earlyExit = closePaperPositions(account, simulationMarkets, costs, "model-aware early exit", now, exitIds);
-        if (earlyExit.closed) {
-          setAccount(markAccount(earlyExit.account, simulationMarkets, now));
-          for (const id of exitIds) paperExitObservations.current.delete(id);
-          appendLog("Model-aware paper cashout", `${exitDetails.join(" · ")} · ${signedDollars(earlyExit.realized)} realized.`, earlyExit.realized >= 0 ? "positive" : "warning");
-          return;
-        }
-      }
-    } else if (!config.earlyExitEnabled) {
-      paperExitObservations.current.clear();
-    }
-    if (paused || killSwitch || !markets.length) return;
-    if (maxDrawdown >= config.maxLoss) { setEngineRunning(false); setPaused(true); appendLog("Daily loss halt triggered", `Drawdown reached ${percentage(maxDrawdown)} against the ${percentage(config.maxLoss)} guardrail.`, "negative"); return; }
-    const candidates = liveMarkets.map((market) => ({ market, candidate: marketEdge(market, config) })).filter((item): item is { market: LiveMarket; candidate: NonNullable<ReturnType<typeof marketEdge>> } => Boolean(item.candidate && item.candidate.edge >= config.minEdge && item.market.liquidity >= config.maxTrade)); const next = candidates.sort((left, right) => right.candidate.edge - left.candidate.edge)[0]; if (!next || account.cash <= 0 || account.positions.some((position) => position.marketId === next.market.id)) return;
-    const last = autoLastFill.current.get(next.market.id) ?? 0; if (now - last < 15000) return; const result = buyPaper(account, next.market, next.candidate.side, config.maxTrade, costs, "auto engine candidate", now); if (!result.fill) return; autoLastFill.current.set(next.market.id, now); setAccount(markAccount(result.account, marketMap, now)); appendLog(`${next.market.asset} ${next.market.duration} paper fill`, `${next.candidate.side} · ${result.fill.shares.toFixed(2)} shares @ ${cents(result.fill.price)} · edge ${percentage(next.candidate.edge)}`, "positive");
-  }, [account, config, costs, engineRunning, killSwitch, liveMarketMap, liveMarkets, marketMap, markets.length, paused, maxDrawdown, appendLog, paperTest.days, paperTest.endsAt, paperTest.status]);
-
-  const startEngine = () => { if (killSwitch) { appendLog("Start blocked by kill switch", "Reset the paper session before enabling the engine.", "negative"); return; } setEngineRunning(true); setPaused(false); setPaperTest((current) => current.status === "PAUSED" ? { ...current, status: "RUNNING" } : current); setView("paper"); appendLog("Paper engine started", "The Paper Trader and Paper Lab now use the same shared account, positions, and resolution ledger.", "positive"); };
-  const togglePause = () => { const nextPaused = !paused; setPaused(nextPaused); setPaperTest((current) => current.status === "RUNNING" || current.status === "PAUSED" ? { ...current, status: nextPaused ? "PAUSED" : "RUNNING" } : current); appendLog(nextPaused ? "New paper trades paused" : "Paper engine resumed", "Existing shared positions remain marked and will settle from market outcomes.", "warning"); };
-  const cancelOrders = () => { setAccount((current) => ({ ...current, openOrders: 0 })); appendLog("Paper order queue cleared", "Immediate paper fills are already ledgered; there were no live orders to cancel.", "warning"); };
-  const closePositions = () => { const result = closePaperPositions(account, marketMap, costs, "manual close all"); setAccount(markAccount(result.account, marketMap)); appendLog(result.closed ? "Paper positions closed" : "No executable paper exits", `${result.closed} closed · ${result.skipped} held because no current bid was available.`, result.closed ? "positive" : "warning"); };
-  const triggerKillSwitch = () => { setKillSwitch(true); setEngineRunning(false); setPaused(true); setPaperTest((current) => current.status === "RUNNING" ? { ...current, status: "PAUSED" } : current); setAccount((current) => ({ ...current, openOrders: 0 })); appendLog("EMERGENCY KILL SWITCH", "Auto execution disabled and new shared paper orders blocked.", "negative"); };
-  const resetPaperSession = () => { const startingCash = Number(startingCashInput); const next = createPaperAccount(Number.isFinite(startingCash) && startingCash > 0 ? startingCash : 1000); setAccount(next); setPaperTest({ status: "IDLE", startingBalance: next.startingCash, days: 1, startedAt: null, endsAt: null, balance: next.startingCash, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null }); setKillSwitch(false); setEngineRunning(false); setPaused(false); appendLog("Shared paper account reset", `New empty ledger created with ${dollars(next.startingCash)} starting cash.`, "neutral"); };
-  const manualBuy = (side: PaperSide) => { if (!selectedMarket) return; if (selectedSignal?.action !== side) { appendLog(`${side} paper entry blocked`, selectedSignal?.reason ?? "No chart signal is available.", "warning"); return; } const result = buyPaper(account, selectedMarket, side, config.maxTrade, costs, `chart signal ${selectedSignal.tier}`); if (!result.fill) { appendLog(`${side} paper order rejected`, result.error ?? "No executable public ask depth.", "warning"); return; } setAccount(markAccount(result.account, marketMap)); setView("paper"); appendLog(`${selectedMarket.asset} ${selectedMarket.duration} paper fill`, `${side} · ${result.fill.shares.toFixed(2)} shares @ ${cents(result.fill.price)} · ${dollars(result.fill.totalCost)} including fee`, "positive"); };
-  const handleCsvUpload = async (file: File | undefined) => { if (!file) return; const parsed = parseBacktestCsv(await file.text()); setBacktestRows(parsed.rows); setBacktestRejected(parsed.rejected); setBacktestResult(null); appendLog("Backtest dataset loaded", `${parsed.rows.length} valid rows · ${parsed.rejected} rejected rows · ${file.name}`, parsed.rows.length ? "positive" : "warning"); };
-  const useRecordedTicks = () => { setBacktestRows(recordedTicks); setBacktestRejected(0); setBacktestResult(null); appendLog("Recorded public ticks selected", `${recordedTicks.length} rows from this browser session; outcomes are not invented.`, recordedTicks.length ? "positive" : "warning"); };
-  const downloadTemplate = () => { const blob = new Blob([backtestCsvTemplate], { type: "text/csv" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = "polymarket-backtest-template.csv"; anchor.click(); URL.revokeObjectURL(url); };
-  const executeBacktest = () => { if (!backtestRows.length) return; const result = runBacktest(backtestRows, { startingCash: backtestStartingCash, minEdge: config.minEdge, maxTrade: config.maxTrade, feeRate: config.feeRate, slippageBps: config.slippageBps }); setBacktestResult(result); appendLog("Backtest completed", `${result.signals} signals · ${result.settled} settled · ${result.unsettled} unsettled`, result.settled ? "positive" : "warning"); };
-
-  const startPaperTest = () => {
-    const startingBalance = clamp(Number(paperTestStartingBalanceInput), 1, 1_000_000_000);
-    const days = clamp(Math.floor(Number(paperTestDurationDaysInput)), 1, 90);
-    if (!Number.isFinite(startingBalance) || !Number.isFinite(days)) return;
-    if ((account.positions.length || account.fills.length || account.closedTrades.length) && typeof window !== "undefined" && !window.confirm("Starting this test resets the shared Paper Trader and Paper Lab account. Continue?")) return;
-    const now = Date.now();
-    const endsAt = now + days * 24 * 60 * 60 * 1000;
-    setAccount(createPaperAccount(startingBalance, now));
-    setKillSwitch(false); setEngineRunning(true); setPaused(false);
-    setPaperTest({ status: "RUNNING", startingBalance, days, startedAt: now, endsAt, balance: startingBalance, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null });
-    setView("backtest");
-    appendLog("Shared forward paper test started", `${dollars(startingBalance)} shared starting balance · ${days} day${days === 1 ? "" : "s"} · the Paper Trader and Paper Lab are using one account.`, "positive");
-  };
-  const togglePaperTestPause = () => {
-    if (paperTest.status === "RUNNING" || paperTest.status === "PAUSED") togglePause();
-  };
-  const stopPaperTest = () => {
-    if (paperTest.status !== "RUNNING" && paperTest.status !== "PAUSED") return;
-    setPaperTest((current) => ({ ...current, status: "COMPLETE", balance: accountEquity(account, liveMarketMap), trades: account.fills.filter((fill) => fill.action === "BUY").length, openPositions: account.positions.length, realizedPnl: account.realizedPnl, winRate: accountWinRate(account) }));
-    setEngineRunning(false); setPaused(true);
-    appendLog("Shared forward paper test stopped", `${account.fills.filter((fill) => fill.action === "BUY").length} entries recorded before the shared engine stopped.`, "warning");
-  };
-  const resetPaperTest = () => {
-    const startingBalance = clamp(Number(paperTestStartingBalanceInput), 1, 1_000_000_000);
-    if ((account.positions.length || account.fills.length || account.closedTrades.length) && typeof window !== "undefined" && !window.confirm("Resetting the test resets the shared Paper Trader and Paper Lab account. Continue?")) return;
-    const next = createPaperAccount(Number.isFinite(startingBalance) ? startingBalance : 1000);
-    setAccount(next); setKillSwitch(false); setEngineRunning(false); setPaused(false);
-    setPaperTest({ status: "IDLE", startingBalance: next.startingCash, days: Math.max(1, Math.floor(Number(paperTestDurationDaysInput)) || 1), startedAt: null, endsAt: null, balance: next.startingCash, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null });
-    appendLog("Shared paper account reset", "The Paper Trader and Paper Lab were cleared together; the all-market decision ledger was preserved.", "neutral");
-  };
-
-  const exportDecisionLedger = () => {
-    if (typeof window === "undefined" || !ledgerRows.length) return;
-    const blob = new Blob([decisionLedgerCsv(ledgerRows)], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = `polymarket-decision-ledger-${new Date().toISOString().slice(0, 10)}.csv`; anchor.click(); URL.revokeObjectURL(url);
-  };
-  const clearDecisionLedger = () => {
-    if (typeof window !== "undefined" && !window.confirm("Clear the complete browser-local market decision ledger? This cannot be undone.")) return;
-    setLedgerRows([]); ledgerSnapshots.current.clear(); appendLog("Decision ledger cleared", "All browser-local UP, DOWN, PASS, and outcome rows were removed.", "warning");
-  };
-
-  const telegramRequest = useCallback(async (body: Record<string, unknown>) => fetch("/api/telegram", { body: JSON.stringify(body), cache: "no-store", credentials: "same-origin", headers: { "Content-Type": "application/json" }, method: "POST" }), []);
-  const refreshTelegramStatus = useCallback(async () => {
-    try {
-      const response = await telegramRequest({ action: "status" });
-      const payload = await response.json() as { ok?: boolean; error?: string; telegram?: Partial<TelegramViewState> };
-      if (!response.ok || !payload.ok || !payload.telegram) {
-        if (response.status === 401) setTelegram((current) => ({ ...current, connected: false }));
-        throw new Error(payload.error || "Telegram status is unavailable.");
-      }
-      setTelegram((current) => ({ ...current, connected: true, botUsername: payload.telegram?.botUsername ?? "", botName: payload.telegram?.botName ?? "", chatId: payload.telegram?.chatId ?? "", chatTitle: payload.telegram?.chatTitle ?? "", expiresAt: payload.telegram?.expiresAt ?? null, lastError: "", lastStatus: "Telegram link is ready." }));
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Telegram status is unavailable.";
-      if (!detail.includes("expired") && !detail.includes("Sign in")) setTelegram((current) => ({ ...current, lastError: detail }));
-    }
+    void liveRequest({ action: "status" })
+      .then((response) => response.json() as Promise<{ ok?: boolean; serverKeyConfigured?: boolean }>)
+      .then((payload) => setServerKeyConfigured(Boolean(payload.ok && payload.serverKeyConfigured)))
+      .catch(() => setServerKeyConfigured(false));
+    void telegramRequest({ action: "status" })
+      .then((response) => response.json() as Promise<{ ok?: boolean; telegram?: Partial<TelegramViewState> }>)
+      .then((payload) => {
+        if (payload.ok && payload.telegram) setTelegram((current) => ({ ...current, ...payload.telegram, connected: true, lastError: "" }));
+      })
+      .catch(() => undefined);
   }, [telegramRequest]);
-  useEffect(() => { void refreshTelegramStatus(); }, [refreshTelegramStatus]);
-  const connectTelegram = useCallback(async (botToken: string, chatId: string): Promise<boolean> => {
-    try {
-      const response = await telegramRequest({ action: "connect", botToken, chatId });
-      const payload = await response.json() as { ok?: boolean; error?: string; telegram?: Partial<TelegramViewState> };
-      if (!response.ok || !payload.ok || !payload.telegram) throw new Error(payload.error || "Telegram link failed.");
-      setTelegram((current) => ({ ...current, connected: true, botUsername: payload.telegram?.botUsername ?? "", botName: payload.telegram?.botName ?? "", chatId: payload.telegram?.chatId ?? chatId, chatTitle: payload.telegram?.chatTitle ?? chatId, expiresAt: payload.telegram?.expiresAt ?? null, lastStatus: "Telegram linked and verified.", lastError: "" }));
-      appendLog("Telegram reports linked", `Verified ${payload.telegram.botUsername ? "@" + payload.telegram.botUsername : "the Telegram bot"} for ${payload.telegram.chatTitle || chatId}.`, "positive");
-      return true;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Telegram link failed.";
-      setTelegram((current) => ({ ...current, lastError: detail })); appendLog("Telegram link failed", detail, "negative"); return false;
-    }
-  }, [appendLog, telegramRequest]);
-  const disconnectTelegram = () => {
-    void telegramRequest({ action: "disconnect" }).catch(() => undefined);
-    setTelegram({ connected: false, botUsername: "", botName: "", chatId: "", chatTitle: "", expiresAt: null, lastStatus: "Telegram unlinked.", lastError: "" });
-    appendLog("Telegram reports unlinked", "The encrypted Telegram session cookie was cleared.", "neutral");
-  };
-  const telegramReportText = useCallback((label: string) => {
-    const recentRows = ledgerRows.slice().sort((left, right) => right.lastUpdatedAt - left.lastUpdatedAt).slice(0, 8);
-    const testLine = paperTestView.startedAt ? `${paperTestView.status} · ${paperTestView.days}d · ${dollars(paperTestView.balance)} shared balance · ${signedDollars(paperTestView.realizedPnl)} realized · ${paperTestView.openPositions} open` : "No timeframe paper test started";
-    const lines = [
-      `Polymarket Quant Engine · ${label}`,
-      `Eastern time: ${new Date().toLocaleString("en-US", { timeZone: "America/New_York", dateStyle: "medium", timeStyle: "short" })}`,
-      `Tracked: ${ledgerMetrics.tracked} · UP ${ledgerMetrics.up} · DOWN ${ledgerMetrics.down} · PASS ${ledgerMetrics.pass}`,
-      `Settled: ${ledgerMetrics.settled} · combined ${percentage(ledgerMetrics.combinedWinRate)} · UP ${percentage(ledgerMetrics.upWinRate)} · DOWN ${percentage(ledgerMetrics.downWinRate)}`,
-      `Paper test: ${testLine}`,
-      "Recent decisions:",
-      ...recentRows.map((row) => `${row.asset} ${row.duration} · ${row.decision} · ${row.result}${row.outcome ? ` (${row.outcome})` : ""} · ${new Date(row.observedAt).toISOString()}`),
-    ];
-    return lines.join("\n").slice(0, 3900);
-  }, [ledgerMetrics, ledgerRows, paperTestView]);
-  const sendTelegramReport = useCallback(async (label: string): Promise<boolean> => {
-    if (!telegram.connected || telegramSendBusy.current) return false;
-    telegramSendBusy.current = true;
-    try {
-      const response = await telegramRequest({ action: "send-report", text: telegramReportText(label) });
-      const payload = await response.json() as { ok?: boolean; error?: string };
-      if (!response.ok || !payload.ok) throw new Error(payload.error || "Telegram report failed.");
-      setTelegram((current) => ({ ...current, lastStatus: `${label} sent to Telegram.`, lastError: "" }));
-      appendLog("Telegram report sent", label, "positive");
-      return true;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Telegram report failed.";
-      setTelegram((current) => ({ ...current, lastError: detail })); appendLog("Telegram report failed", detail, "negative"); return false;
-    } finally { telegramSendBusy.current = false; }
-  }, [appendLog, telegram.connected, telegramReportText, telegramRequest]);
-  const sendTelegramTest = () => { void sendTelegramReport("Manual test report"); };
-  useEffect(() => {
-    if (!telegram.connected) return;
-    const checkSchedule = () => {
-      const parts = new Intl.DateTimeFormat("en-US", { day: "2-digit", hour: "2-digit", hourCycle: "h23", minute: "2-digit", month: "2-digit", timeZone: "America/New_York", weekday: "short", year: "numeric" }).formatToParts(new Date());
-      const part = (type: string) => parts.find((item) => item.type === type)?.value ?? "";
-      if (part("weekday") !== "Sun" || Number(part("hour")) !== 21 || Number(part("minute")) > 2) return;
-      const weekKey = `${part("year")}-${part("month")}-${part("day")}`;
-      if (readStoredJson<{ weekKey?: string }>(TELEGRAM_LAST_SENT_KEY)?.weekKey === weekKey) return;
-      void sendTelegramReport("Scheduled Sunday 9pm ET report").then((sent) => { if (sent && typeof window !== "undefined") window.localStorage.setItem(TELEGRAM_LAST_SENT_KEY, JSON.stringify({ weekKey })); });
-    };
-    checkSchedule(); const timer = window.setInterval(checkSchedule, 30_000); return () => window.clearInterval(timer);
-  }, [sendTelegramReport, telegram.connected]);
 
-  const liveCandidates = useMemo(() => liveMarkets.map((market) => ({ market, signal: analyzeMarketSignal(market, { feeRate: liveRisk.feeRate, slippageBps: liveRisk.slippageBps }, liveRisk.maxTradeUsd, liveRisk.minEdge) })).filter((item) => item.market.remaining >= 30 && liveRisk.allowedDurations.includes(item.market.duration) && item.signal.action !== "PASS" && (!liveRisk.requireLock || item.signal.tier === "LOCK")).sort((left, right) => (right.signal.edge ?? -1) - (left.signal.edge ?? -1)), [liveMarkets, liveRisk]);
-  const liveRequest = useCallback(async (body: Record<string, unknown>, confirm = false) => fetch("/api/polymarket/live", { body: JSON.stringify(body), cache: "no-store", credentials: "same-origin", headers: { "Content-Type": "application/json", ...(confirm ? { "x-polymarket-live-confirm": "1" } : {}) }, method: "POST" }), []);
-  const refreshLivePositions = useCallback(async () => {
-    if (!liveSession?.connected || livePositionRefreshBusy.current) return;
-    livePositionRefreshBusy.current = true;
-    try {
-      const response = await liveRequest({ action: "positions" });
-      const payload = await response.json() as { ok?: boolean; error?: string; positions?: LivePositionSnapshot[] };
-      if (!response.ok || !payload.ok || !Array.isArray(payload.positions)) throw new Error(payload.error || "Live positions could not be refreshed.");
-      livePositionsRef.current = payload.positions.filter((position) => (position.size ?? 0) > 0);
-      livePositionRefreshedAt.current = Date.now();
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Live positions could not be refreshed.";
-      appendLog("Live positions unavailable", detail, "warning");
-    } finally {
-      livePositionRefreshedAt.current = Date.now();
-      livePositionRefreshBusy.current = false;
-    }
-  }, [appendLog, liveRequest, liveSession?.connected]);
-  const refreshLiveBalance = useCallback(async () => {
-    if (!liveSession?.connected) return;
-    try {
-      const response = await liveRequest({ action: "balance" });
-      const payload = await response.json() as { ok?: boolean; error?: string; live?: LiveSessionState };
-      if (!response.ok || !payload.ok || !payload.live) throw new Error(payload.error || "Live balance refresh failed.");
-      setLiveSession({ ...payload.live, connected: true }); setLiveStatus((current) => ({ ...current, lastError: "" })); appendLog("Live balance refreshed", String(payload.live.openOrders) + " open CLOB orders · " + dollars(payload.live.balance), "positive");
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Live balance refresh failed.";
-      setLiveStatus((current) => ({ ...current, lastError: detail })); appendLog("Live balance unavailable", detail, "negative");
-    }
-  }, [appendLog, liveRequest, liveSession?.connected]);
-  const startLiveExecutor = () => {
-    if (!liveSession?.connected) { setView("account"); setAccountDialogOpen(true); return; }
-    if (!liveConsent || killSwitch) { setLiveStatus((current) => ({ ...current, lastError: killSwitch ? "Reset the paper risk halt before starting live execution." : "Confirm the live-order risk notice before starting." })); return; }
-    setLiveStatus({ lastAction: "LIVE RUNNER STARTED", lastDetail: "Scanning fresh validated 5m/15m markets with fractional Kelly sizing.", lastError: "", lastLatencyMs: null }); setLiveRunning(true); setLivePaused(false); setView("live"); appendLog("Live executor started", "Owner-authenticated runner is scanning balance-aware LOCK signals. Orders remain capped by the Live Risk Policy.", "warning");
-  };
-  const toggleLivePause = () => { setLivePaused((current) => !current); setLiveStatus((current) => ({ ...current, lastError: "" })); appendLog(livePaused ? "Live executor resumed" : "Live new orders paused", "Existing CLOB orders are not automatically cancelled; use Kill + Cancel All when needed.", "warning"); };
-  const killLiveExecutor = async () => {
-    setLiveRunning(false); setLivePaused(true); setLiveConsent(false);
-    if (!liveSession?.connected) return;
-    try {
-      const response = await liveRequest({ action: "cancel-all", confirmLive: true }, true);
-      const payload = await response.json() as { ok?: boolean; error?: string; status?: string };
-      if (!response.ok || !payload.ok) throw new Error(payload.error || "Cancel-all request failed.");
-      setLiveStatus({ lastAction: "KILL SWITCH", lastDetail: "Live runner stopped and Polymarket cancel-all returned successfully.", lastError: "", lastLatencyMs: null }); appendLog("LIVE KILL + CANCEL ALL", "New live submissions stopped; the server accepted the explicit cancel-all request.", "negative");
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Cancel-all request failed.";
-      setLiveStatus({ lastAction: "LIVE RUNNER STOPPED", lastDetail: "Cancel-all could not be confirmed. Reconcile open orders in Account.", lastError: detail, lastLatencyMs: null }); appendLog("Live cancel-all uncertain", detail, "negative");
-    }
-  };
+  // ---- engine tick: paper engine, ledger, recorder -----------------------
   useEffect(() => {
-    if (!liveRunning || livePaused || !liveSession?.connected || killSwitch) return;
-    let disposed = false;
-    let timer: number | undefined;
-    const loop = async () => {
-      if (disposed) return;
-      if (liveBusy.current) { timer = window.setTimeout(() => void loop(), 900); return; }
+    const tick = () => {
       const now = Date.now();
-      if (liveRisk.earlyExitEnabled && now - livePositionRefreshedAt.current >= 5_000) {
-        if (!livePositionsRef.current.length) await refreshLivePositions();
-        else void refreshLivePositions();
+      const current = engineRef.current;
+      controller.watchResolution(current.account.positions.map((position) => position.marketId));
+      const step = stepPaperEngine(current, {
+        markets: controller.markets,
+        feed: (asset) => controller.derived(asset, now),
+        resolutions: controller.resolutions,
+        config: configRef.current,
+        now,
+        autoTrade: autoRef.current,
+      });
+      engineRef.current = step.state;
+      setEngine(step.state);
+      for (const event of step.events) {
+        appendLog(event.title, event.detail, event.tone);
+        if (event.kind === "halt" || event.kind === "fill" || event.kind === "settle") alert(`${event.title}\n${event.detail}`);
       }
-      if (liveRisk.earlyExitEnabled && livePositionsRef.current.length) {
-        const activePositionKeys = new Set<string>();
-        const exitCandidates: Array<{ position: LivePositionSnapshot; market: LiveMarket; side: PaperSide; tokenID: string; evaluation: ReturnType<typeof evaluateModelAwareExit> }> = [];
-        for (const position of livePositionsRef.current) {
-          const tokenID = position.tokenID ?? position.id;
-          const mapped = liveTokenMap.get(tokenID);
-          if (!mapped || position.size === null || position.averagePrice === null) continue;
-          activePositionKeys.add(tokenID);
-          const currentPrice = mapped.side === "UP" ? mapped.market.upBid : mapped.market.downBid;
-          const fairProbability = mapped.side === "UP" ? mapped.market.fairUp : mapped.market.fairUp === null ? null : 1 - mapped.market.fairUp;
-          if (currentPrice === null || fairProbability === null) {
-            liveExitObservations.current.delete(tokenID);
-            continue;
+      setLedger((previous) => {
+        let next: Map<string, MarketDecisionRow> | null = null;
+        for (const [id, signal] of step.decisions) {
+          const market = controller.markets.get(id);
+          if (!market) continue;
+          const before = previous.get(id);
+          const row = updateLedgerRow(before, market, signal, now);
+          if (
+            !before ||
+            before.decision !== row.decision ||
+            before.entry !== row.entry ||
+            before.checkpoint !== row.checkpoint ||
+            now - before.lastUpdatedAt > 15_000
+          ) {
+            next = next ?? new Map(previous);
+            next.set(id, row);
           }
-          const evaluation = evaluateModelAwareExit({ policy: liveRisk, entryPrice: position.averagePrice, currentPrice, fairProbability, shares: position.size, feeRate: liveRisk.feeRate, remainingSeconds: mapped.market.remaining });
-          if (!evaluation.shouldExit) {
-            liveExitObservations.current.delete(tokenID);
-            continue;
-          }
-          const previous = liveExitObservations.current.get(tokenID);
-          const count = previous && now - previous.lastSeen <= 15_000 ? previous.count + 1 : 1;
-          liveExitObservations.current.set(tokenID, { count, lastSeen: now });
-          if (count >= liveRisk.earlyExitConfirmations) exitCandidates.push({ position, market: mapped.market, side: mapped.side, tokenID, evaluation });
         }
-        for (const key of liveExitObservations.current.keys()) if (!activePositionKeys.has(key)) liveExitObservations.current.delete(key);
-        const exitCandidate = exitCandidates[0];
-        if (exitCandidate) {
-          liveBusy.current = true;
-          try {
-            const response = await liveRequest({ action: "exit", marketId: exitCandidate.market.id, tokenID: exitCandidate.tokenID, amount: exitCandidate.position.size, requestId: `exit:${exitCandidate.tokenID}:${Math.floor(now / 10_000)}`, confirmLive: true, config: liveRisk }, true);
-            const payload = await response.json() as { ok?: boolean; status?: string; reason?: string; error?: string; uncertain?: boolean; latencyMs?: number; balanceAfter?: number | null; sizing?: { shares?: number; netProfit?: number; modelGap?: number } };
-            const latencyMs = typeof payload.latencyMs === "number" ? payload.latencyMs : null;
-            const detail = payload.reason || payload.error || "No live exit submitted.";
-            setLiveStatus({ lastAction: payload.status === "EXECUTED" ? "EARLY EXIT EXECUTED" : payload.status || "EARLY EXIT PASSED", lastDetail: detail, lastError: payload.uncertain ? (payload.error || "Exit outcome is uncertain; reconcile the Account tab.") : response.ok ? "" : (payload.error || "Live exit request failed."), lastLatencyMs: latencyMs });
-            liveExitObservations.current.delete(exitCandidate.tokenID);
-            const balanceAfter = typeof payload.balanceAfter === "number" ? payload.balanceAfter : null;
-            if (balanceAfter !== null) setLiveSession((current) => current ? { ...current, balance: balanceAfter } : current);
-            if (payload.uncertain || response.status === 401 || response.status === 403) {
-              setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", payload.error || "Live exit authorization or submission state needs reconciliation.", "negative");
-            } else if (payload.status === "EXECUTED") {
-              appendLog(`${exitCandidate.market.asset} ${exitCandidate.market.duration} live early exit`, `${exitCandidate.side} · ${detail} · ${latencyMs ?? "—"} ms`, "positive");
-              livePositionRefreshedAt.current = 0;
-            }
-          } catch (error) {
-            const detail = error instanceof Error ? error.message : "Live exit request failed.";
-            setLiveStatus({ lastAction: "EARLY EXIT ERROR", lastDetail: detail, lastError: detail, lastLatencyMs: null });
-            appendLog("Live early exit unavailable", detail, "negative");
-            liveExitObservations.current.delete(exitCandidate.tokenID);
+        const pendingIds: string[] = [];
+        for (const row of previous.values()) {
+          if (row.outcome || row.endTime > now) continue;
+          const resolution = controller.resolutions.get(row.id);
+          if (resolution) {
+            next = next ?? new Map(previous);
+            next.set(row.id, resolveLedgerRow(row, resolution));
+          } else if ((row.entry || row.checkpoint) && now - row.endTime < 6 * 60 * 60 * 1000) pendingIds.push(row.id);
+        }
+        controller.watchResolution(pendingIds);
+        return next ?? previous;
+      });
+      const recording = recordingRef.current;
+      if (now - recording.lastAt >= 5_000) {
+        recording.lastAt = now;
+        for (const market of controller.markets.values()) {
+          if (market.startTime > now || market.endTime <= now) continue;
+          recording.snapshots.push(snapshotFromLiveMarket(market, controller.derived(market.asset, now), now));
+        }
+        for (const [id, resolution] of controller.resolutions) recording.outcomes.set(id, resolution.outcome);
+        if (recording.snapshots.length > MAX_RECORDED) recording.snapshots.splice(0, recording.snapshots.length - MAX_RECORDED);
+        setRecordedCount(recording.snapshots.length);
+      }
+    };
+    const timer = window.setInterval(tick, 1_000);
+    return () => window.clearInterval(timer);
+  }, [alert, appendLog, controller]);
+
+  // ---- derived view state (recomputed on each controller flush) ----------
+  const now = clock || Date.now();
+  const markets = controller.markets;
+  const activeMarkets = useMemo(
+    () =>
+      [...markets.values()]
+        .filter((market) => market.startTime <= now && market.endTime > now)
+        .sort((left, right) => left.endTime - right.endTime || left.asset.localeCompare(right.asset)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [markets, version, now],
+  );
+  const signals = useMemo(() => {
+    const map = new Map<string, MarketSignal>();
+    for (const market of activeMarkets)
+      map.set(market.id, analyzeMarketSignal(market, controller.derived(market.asset, now), { ...paperConfig.signal, budgetUsd: paperConfig.stakeUsd }, now));
+    return map;
+  }, [activeMarkets, controller, now, paperConfig]);
+  const visibleMarkets = activeMarkets.filter((market) => durationFilter === "ALL" || market.duration === durationFilter);
+  const selectedMarket = visibleMarkets.find((market) => market.id === selectedMarketId) ?? visibleMarkets[0] ?? null;
+  const selectedSignal = selectedMarket ? (signals.get(selectedMarket.id) ?? null) : null;
+  const account = engine.account;
+  const equity = accountEquity(account, markets);
+  const unrealized = accountUnrealized(account, markets);
+  const dayPnl = equity - account.dayStartEquity;
+  const drawdown = account.peakEquity > 0 ? Math.max(0, (account.peakEquity - equity) / account.peakEquity) : 0;
+  const equitySeries = account.equityHistory.map((point) => point.equity);
+  const upcoming = [...markets.values()].filter((market) => market.startTime > now).length;
+
+  // ---- paper actions -----------------------------------------------------
+  const manualBuy = (side: Side) => {
+    if (!selectedMarket || !selectedSignal || selectedSignal.action !== side || selectedSignal.limitPrice === null) return;
+    const result = buyPaper(engineRef.current.account, selectedMarket, side, paperConfig.stakeUsd, {
+      slippageBps: paperConfig.signal.slippageBps,
+      limitPrice: selectedSignal.limitPrice,
+      probability: selectedSignal.probability,
+      reason: `manual ${selectedSignal.tier}`,
+    });
+    if (!result.fill) {
+      appendLog(`${side} paper order rejected`, result.error ?? "No depth under the limit.", "warning");
+      return;
+    }
+    const next = { ...engineRef.current, account: markAccount(result.account, markets) };
+    engineRef.current = next;
+    setEngine(next);
+    appendLog(
+      `${selectedMarket.asset} ${selectedMarket.duration} manual ${side}`,
+      `${result.fill.shares.toFixed(2)} sh @ ${cents(result.fill.avgPrice)} (all-in ${cents(result.fill.costPerShare)})`,
+      "positive",
+    );
+  };
+  const closeAll = () => {
+    const result = closePaperPositions(engineRef.current.account, markets, { slippageBps: paperConfig.signal.slippageBps, reason: "manual close all" });
+    const next = { ...engineRef.current, account: result.account };
+    engineRef.current = next;
+    setEngine(next);
+    appendLog(
+      result.closed ? "Positions sold into the bid" : "Nothing sellable",
+      `${result.closed} closed · ${result.skipped} held (no bid depth) · ${signedDollars(result.realized)}`,
+      result.closed ? "positive" : "warning",
+    );
+  };
+  const killSwitch = () => {
+    setAutoTrade(false);
+    const next = { ...engineRef.current, pending: [], halt: { reason: "Manual kill switch.", at: Date.now() } };
+    engineRef.current = next;
+    setEngine(next);
+    appendLog("KILL SWITCH", "Paper auto-trading disabled and pending orders cleared.", "negative");
+    alert("Manual kill switch engaged.");
+  };
+  const resetAccount = (cash: number) => {
+    if (typeof window !== "undefined" && !window.confirm("Reset the paper account? Positions and history are cleared; the decision ledger is kept.")) return;
+    const next = createEngineState(createPaperAccount(cash));
+    engineRef.current = next;
+    setEngine(next);
+    appendLog("Paper account reset", `${dollars(next.account.startingCash)} starting cash.`, "neutral");
+  };
+  const clearHalt = () => {
+    const next = { ...engineRef.current, halt: null, account: { ...engineRef.current.account, dayStartEquity: equity, peakEquity: equity } };
+    engineRef.current = next;
+    setEngine(next);
+    appendLog("Halt acknowledged", "Limits re-based to current equity.", "warning");
+  };
+  const exportRecording = () => {
+    const recording = recordingRef.current;
+    const lines =
+      recording.snapshots.map(serializeSnapshotLine).join("") + [...recording.outcomes].map(([id, outcome]) => serializeResolutionLine(id, outcome)).join("");
+    downloadText(`pqe-replay-${new Date().toISOString().slice(0, 19)}.jsonl`, lines, "application/x-ndjson");
+  };
+  const recordedDataset = useMemo<ReplayDataset>(() => {
+    void recordedCount;
+    return { snapshots: [...recordingRef.current.snapshots], outcomes: new Map(recordingRef.current.outcomes), rejected: 0 };
+  }, [recordedCount]);
+
+  // ---- account + live session -------------------------------------------
+  const fetchAccount = useCallback(async (walletAddress: string) => {
+    if (!walletAddress.trim()) return false;
+    setAccountLoading(true);
+    setAccountError("");
+    try {
+      const response = await fetch("/api/polymarket/account", {
+        body: JSON.stringify({ walletAddress: walletAddress.trim() }),
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      const payload = (await response.json()) as { ok?: boolean; error?: string; account?: ConnectedAccount };
+      if (!response.ok || !payload.ok || !payload.account) throw new Error(payload.error || "Account snapshot unavailable.");
+      setConnectedAccount(payload.account);
+      writeStoredJson(WALLET_KEY, walletAddress.trim());
+      return true;
+    } catch (error) {
+      setAccountError(error instanceof Error ? error.message : "Account request failed.");
+      return false;
+    } finally {
+      setAccountLoading(false);
+    }
+  }, []);
+  const connectLive = async () => {
+    setAccountLoading(true);
+    setAccountError("");
+    try {
+      const useServerKey = serverKeyConfigured && connection.useServerKey;
+      const response = await liveRequest(
+        useServerKey
+          ? { action: "connect", useServerKey: true }
+          : {
+              action: "connect",
+              walletAddress: connection.walletAddress.trim(),
+              privateKey: connection.privateKey.trim(),
+              signatureType: Number(connection.signatureType),
+            },
+      );
+      const payload = (await response.json()) as { ok?: boolean; error?: string; live?: Omit<LiveSessionState, "connected"> };
+      if (!response.ok || !payload.ok || !payload.live) throw new Error(payload.error || "Live session could not be established.");
+      setLiveSession({ ...payload.live, connected: true });
+      setConnection((current) => ({ ...current, privateKey: "", walletAddress: payload.live!.walletAddress }));
+      setAccountDialogOpen(false);
+      setView("live");
+      appendLog(
+        "Live session armed",
+        `${payload.live.keySource === "server" ? "Server-held" : "Browser-entered"} key · ${dollars(payload.live.balance)} available.`,
+        "positive",
+      );
+      void fetchAccount(payload.live.walletAddress);
+    } catch (error) {
+      setAccountError(error instanceof Error ? error.message : "Live connection failed.");
+    } finally {
+      setAccountLoading(false);
+    }
+  };
+  const disconnect = () => {
+    void liveRequest({ action: "disconnect" }).catch(() => undefined);
+    setLiveRunning(false);
+    setLiveSession(null);
+    setConnectedAccount(null);
+    appendLog("Account disconnected", "Encrypted live session cleared.", "neutral");
+  };
+  const refreshLiveBalance = async () => {
+    const response = await liveRequest({ action: "balance" });
+    const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string; live?: Omit<LiveSessionState, "connected"> };
+    if (payload.ok && payload.live) setLiveSession({ ...payload.live, connected: true });
+    else setLiveStatus((current) => ({ ...current, lastError: payload.error || "Balance refresh failed." }));
+  };
+  const killLive = async () => {
+    setLiveRunning(false);
+    setLivePaused(false);
+    setLiveConsent(false);
+    if (!liveSession?.connected) return;
+    const response = await liveRequest({ action: "cancel-all", confirmLive: true }, true).catch(() => null);
+    const ok = Boolean(response?.ok);
+    setLiveStatus({
+      lastAction: ok ? "KILL + CANCEL ALL" : "CANCEL UNCERTAIN",
+      lastDetail: ok ? "Runner stopped; cancel-all accepted." : "Reconcile open orders in Account.",
+      lastError: ok ? "" : "Cancel-all could not be confirmed.",
+      lastLatencyMs: null,
+    });
+    alert(ok ? "LIVE kill switch: runner stopped, cancel-all accepted." : "LIVE kill switch: cancel-all could not be confirmed.");
+  };
+
+  // ---- live runner loop --------------------------------------------------
+  const liveCandidates = useMemo(
+    () =>
+      activeMarkets
+        .map((market) => ({
+          market,
+          signal: analyzeMarketSignal(market, controller.derived(market.asset, now), { ...liveRisk.signal, budgetUsd: liveRisk.maxTradeUsd }, now),
+        }))
+        .filter(
+          ({ market, signal }) =>
+            signal.action !== "PASS" &&
+            liveRisk.allowedDurations.includes(market.duration) &&
+            liveRisk.allowedAssets.includes(market.asset) &&
+            (!liveRisk.requireLock || signal.tier === "LOCK"),
+        )
+        .sort((left, right) => (right.signal.edge ?? 0) - (left.signal.edge ?? 0)),
+    [activeMarkets, controller, liveRisk, now],
+  );
+  const liveCandidatesRef = useRef(liveCandidates);
+  const liveRiskRef = useRef(liveRisk);
+  useEffect(() => {
+    liveCandidatesRef.current = liveCandidates;
+    liveRiskRef.current = liveRisk;
+  }, [liveCandidates, liveRisk]);
+  useEffect(() => {
+    if (!liveRunning || livePaused || !liveSession?.connected) return;
+    let disposed = false;
+    let busy = false;
+    const attempted = new Map<string, number>();
+    const exitSeen = new Map<string, { count: number; at: number }>();
+    let positions: LivePosition[] = [];
+    let positionsAt = 0;
+    const stop = (detail: string) => {
+      setLiveRunning(false);
+      setLiveStatus({ lastAction: "LIVE RUNNER STOPPED", lastDetail: detail, lastError: detail, lastLatencyMs: null });
+      appendLog("Live runner stopped", detail, "negative");
+      alert(`LIVE runner stopped: ${detail}`);
+    };
+    const loop = async () => {
+      if (disposed || busy) return;
+      busy = true;
+      try {
+        const now = Date.now();
+        const risk = liveRiskRef.current;
+        if (risk.earlyExitEnabled && now - positionsAt > 5_000) {
+          const response = await liveRequest({ action: "positions" });
+          const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; positions?: LivePosition[] };
+          if (payload.ok && payload.positions) positions = payload.positions;
+          positionsAt = now;
+        }
+        for (const position of risk.earlyExitEnabled ? positions : []) {
+          const market = [...controller.markets.values()].find(
+            (candidate) => candidate.upTokenId === position.tokenId || candidate.downTokenId === position.tokenId,
+          );
+          if (!market || !position.tokenId) continue;
+          const side: Side = market.upTokenId === position.tokenId ? "UP" : "DOWN";
+          const feed = controller.derived(market.asset, now);
+          const snapshot = snapshotFromLiveMarket(market, feed, now);
+          const exit = evaluateExit({
+            snapshot,
+            side,
+            shares: position.size,
+            entryCostPerShare: position.averagePrice ?? 1,
+            params: risk.signal,
+            minGap: risk.earlyExitModelGap,
+            minProfitUsd: risk.earlyExitMinProfitUsd,
+            minProfitPct: risk.earlyExitMinProfitPct,
+            minRemainingSeconds: risk.earlyExitMinRemainingSeconds,
+          });
+          const seen = exitSeen.get(position.tokenId);
+          if (!exit.shouldExit) {
+            exitSeen.delete(position.tokenId);
+            continue;
           }
-          liveBusy.current = false;
-          timer = window.setTimeout(() => void loop(), 1_100);
+          const count = seen && now - seen.at < 15_000 ? seen.count + 1 : 1;
+          exitSeen.set(position.tokenId, { count, at: now });
+          if (count < risk.earlyExitConfirmations) continue;
+          exitSeen.delete(position.tokenId);
+          const response = await liveRequest(
+            {
+              action: "exit",
+              marketId: market.id,
+              tokenID: position.tokenId,
+              amount: position.size,
+              requestId: `exit:${position.tokenId}:${Math.floor(now / 15_000)}`,
+              confirmLive: true,
+              config: risk,
+              feed: feedPayload(snapshot, feed.sigmaPerSqrtSecond, feed.volSamples),
+            },
+            true,
+          );
+          const payload = (await response.json().catch(() => ({}))) as {
+            status?: string;
+            reason?: string;
+            error?: string;
+            uncertain?: boolean;
+            latencyMs?: number;
+          };
+          setLiveStatus({
+            lastAction: payload.status ?? "EXIT",
+            lastDetail: payload.reason ?? payload.error ?? "",
+            lastError: payload.uncertain ? (payload.error ?? "Exit uncertain.") : "",
+            lastLatencyMs: payload.latencyMs ?? null,
+          });
+          if (payload.uncertain || response.status === 401 || response.status === 403)
+            return stop(payload.error ?? "Exit state uncertain; reconcile the account.");
+          if (payload.status === "EXECUTED") appendLog(`${market.asset} ${market.duration} live exit`, payload.reason ?? "", "positive");
+          positionsAt = 0;
           return;
         }
-      }
-      const next = liveCandidates.find((item) => now - (liveAttempted.current.get(item.market.id) ?? 0) >= 45000);
-      if (!next) {
-        const reason = liveCandidates.length ? "Candidates are cooling down after a recent attempt." : "No fresh LOCK candidate passes the configured live gates.";
-        if (liveReason.current !== reason) { liveReason.current = reason; setLiveStatus((current) => ({ ...current, lastAction: "SCANNING", lastDetail: reason, lastError: "" })); }
-        timer = window.setTimeout(() => void loop(), 1200);
-        return;
-      }
-      liveBusy.current = true;
-      const startedAt = Date.now();
-      try {
-        const requestId = next.market.id + ":" + Math.floor(now / 10000);
-        const response = await liveRequest({ action: "execute", marketId: next.market.id, requestId, confirmLive: true, config: liveRisk }, true);
-        const payload = await response.json() as { ok?: boolean; status?: string; reason?: string; error?: string; uncertain?: boolean; latencyMs?: number; balanceAfter?: number | null; sizing?: { stakeUsd?: number; units?: number }; signal?: { action?: string; tier?: string; edge?: number | null } };
-        const latencyMs = typeof payload.latencyMs === "number" ? payload.latencyMs : Date.now() - startedAt;
-        const detail = payload.reason || payload.error || (payload.status === "EXECUTED" ? "Order accepted by Polymarket." : "No order submitted.");
-        setLiveStatus({ lastAction: payload.status || (response.ok ? "REJECTED" : "ERROR"), lastDetail: detail, lastError: payload.uncertain ? (payload.error || "Execution outcome is uncertain; reconcile the Account tab.") : response.ok ? "" : (payload.error || "Live execution request failed."), lastLatencyMs: latencyMs });
-        const balanceAfter = typeof payload.balanceAfter === "number" ? payload.balanceAfter : null;
-        if (balanceAfter !== null) setLiveSession((current) => current ? { ...current, balance: balanceAfter } : current);
-        liveAttempted.current.set(next.market.id, Date.now());
-        if (payload.uncertain || response.status === 401 || response.status === 403) {
-          setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", payload.error || "Live authorization or submission state needs reconciliation.", "negative");
-        } else if (payload.status === "EXECUTED") {
-          appendLog(next.market.asset + " " + next.market.duration + " LIVE order", String(next.signal.action) + " · " + dollars(payload.sizing?.stakeUsd ?? null) + " · " + String(payload.sizing?.units ?? 0) + " units · " + String(latencyMs) + " ms", "warning");
-        } else if (payload.status !== "PASS" && liveReason.current !== detail) {
-          liveReason.current = detail; appendLog("Live candidate held", detail, "warning");
+        const next = liveCandidatesRef.current.find((candidate) => now - (attempted.get(candidate.market.id) ?? 0) > 45_000);
+        if (!next || next.signal.action === "PASS") {
+          setLiveStatus((current) =>
+            current.lastAction === "SCANNING"
+              ? current
+              : { ...current, lastAction: "SCANNING", lastDetail: "No candidate passes the live policy right now.", lastError: "" },
+          );
+          return;
+        }
+        attempted.set(next.market.id, now);
+        const feed = controller.derived(next.market.asset, now);
+        const snapshot = snapshotFromLiveMarket(next.market, feed, now);
+        const response = await liveRequest(
+          {
+            action: "execute",
+            marketId: next.market.id,
+            side: next.signal.action,
+            requestId: `${next.market.id}:${next.signal.action}:${Math.floor(now / 15_000)}`,
+            confirmLive: true,
+            config: risk,
+            feed: feedPayload(snapshot, feed.sigmaPerSqrtSecond, feed.volSamples),
+          },
+          true,
+        );
+        const payload = (await response.json().catch(() => ({}))) as {
+          status?: string;
+          reason?: string;
+          error?: string;
+          uncertain?: boolean;
+          latencyMs?: number;
+          sizing?: { stakeUsd?: number };
+          signal?: { limitPrice?: number };
+        };
+        setLiveStatus({
+          lastAction: payload.status ?? (response.ok ? "REJECTED" : "ERROR"),
+          lastDetail: payload.reason ?? payload.error ?? (payload.status === "EXECUTED" ? `Filled up to limit ${payload.signal?.limitPrice}` : ""),
+          lastError: payload.uncertain ? (payload.error ?? "Execution uncertain.") : "",
+          lastLatencyMs: payload.latencyMs ?? null,
+        });
+        if (payload.uncertain || response.status === 401 || response.status === 403)
+          return stop(payload.error ?? "Execution state uncertain; reconcile the account.");
+        if (payload.status === "EXECUTED") {
+          const detail = `${next.signal.action} · ${dollars(payload.sizing?.stakeUsd)} · limit ${payload.signal?.limitPrice} · ${payload.latencyMs}ms`;
+          appendLog(`${next.market.asset} ${next.market.duration} LIVE order`, detail, "warning");
+          alert(`LIVE order ${next.market.asset} ${next.market.duration}: ${detail}`);
         }
       } catch (error) {
-        const detail = error instanceof Error ? error.message : "Live execution request failed.";
-        setLiveStatus({ lastAction: "ERROR", lastDetail: detail, lastError: detail, lastLatencyMs: Date.now() - startedAt }); setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", detail, "negative");
+        stop(error instanceof Error ? error.message : "Live request failed.");
       } finally {
-        liveBusy.current = false;
-        if (!disposed) timer = window.setTimeout(() => void loop(), 1100);
+        busy = false;
       }
     };
-    void loop();
-    return () => { disposed = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [killSwitch, liveCandidates, livePaused, liveRequest, liveRisk, liveRunning, liveSession?.connected, liveTokenMap, refreshLivePositions, appendLog]);
+    const timer = window.setInterval(() => void loop(), 1_200);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [alert, appendLog, controller, liveRunning, livePaused, liveSession?.connected]);
 
-  const statusForData = dataStatus === "error" || dataStatus === "loading" ? "WARN" : "READY"; const rangeLength = ({ "5M": 5, "15M": 15, "1H": 60, "6H": 360, "24H": 1440 } as Record<string, number | undefined>)[selectedRange] ?? equitySeries.length; const selectedTicks = selectedRange === "ALL" ? equitySeries : equitySeries.slice(-rangeLength);
-  const paperLab = <PaperLabPanel paperTest={paperTestView} paperAccount={account} paperMarkets={liveMarketMap} clock={clock} engineRunning={engineRunning} paused={paused} startingBalanceInput={paperTestStartingBalanceInput} durationDaysInput={paperTestDurationDaysInput} ledgerRows={ledgerRows} metrics={ledgerMetrics} telegram={telegram} onStartingBalanceChange={setPaperTestStartingBalanceInput} onDurationDaysChange={setPaperTestDurationDaysInput} onStart={startPaperTest} onPause={togglePaperTestPause} onStop={stopPaperTest} onReset={resetPaperTest} onExport={exportDecisionLedger} onClearLedger={clearDecisionLedger} onTelegramConnect={connectTelegram} onTelegramDisconnect={disconnectTelegram} onTelegramTest={sendTelegramTest} onTelegramRefresh={() => void refreshTelegramStatus()} />;
+  // ---- telegram actions + weekly report ---------------------------------
+  const reportText = (label: string) =>
+    [
+      `Polymarket Quant Engine · ${label}`,
+      `Equity ${dollars(equity)} (${signedDollars(equity - account.startingCash)}) · day ${signedDollars(dayPnl)} · ${account.positions.length} open`,
+      `Ledger: ${ledgerMetrics.entries} entries, ${ledgerMetrics.settled} settled, win ${percentage(ledgerMetrics.winRate)}, realized edge ${ledgerMetrics.realizedEdge === null ? "—" : (ledgerMetrics.realizedEdge * 100).toFixed(1) + "pt"}`,
+      `Brier model ${ledgerMetrics.brierModel?.toFixed(4) ?? "—"} vs book ${ledgerMetrics.brierMarket?.toFixed(4) ?? "—"} (${ledgerMetrics.calibrated} checkpoints)`,
+      engine.halt ? `HALTED: ${engine.halt.reason}` : "Not halted",
+    ].join("\n");
+  const reportRef = useRef(reportText);
+  useEffect(() => {
+    reportRef.current = reportText;
+  });
+  useEffect(() => {
+    if (!telegram.connected) return;
+    const check = () => {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        day: "2-digit",
+        hour: "2-digit",
+        hourCycle: "h23",
+        minute: "2-digit",
+        month: "2-digit",
+        timeZone: "America/New_York",
+        weekday: "short",
+        year: "numeric",
+      }).formatToParts(new Date());
+      const part = (type: string) => parts.find((item) => item.type === type)?.value ?? "";
+      if (part("weekday") !== "Sun" || Number(part("hour")) !== 21 || Number(part("minute")) > 5) return;
+      const weekKey = `${part("year")}-${part("month")}-${part("day")}`;
+      if (readStoredJson<string>(TELEGRAM_LAST_SENT_KEY) === weekKey) return;
+      void sendTelegram(reportRef.current("Weekly report"))
+        .then(() => writeStoredJson(TELEGRAM_LAST_SENT_KEY, weekKey))
+        .catch(() => undefined);
+    };
+    const timer = window.setInterval(check, 30_000);
+    return () => window.clearInterval(timer);
+  }, [sendTelegram, telegram.connected]);
+  const connectTelegram = async (botToken: string, chatId: string) => {
+    try {
+      const response = await telegramRequest({ action: "connect", botToken, chatId });
+      const payload = (await response.json()) as { ok?: boolean; error?: string; telegram?: Partial<TelegramViewState> };
+      if (!response.ok || !payload.ok || !payload.telegram) throw new Error(payload.error || "Telegram link failed.");
+      setTelegram((current) => ({ ...current, ...payload.telegram, connected: true, lastStatus: "Telegram linked and verified.", lastError: "" }));
+      return true;
+    } catch (error) {
+      setTelegram((current) => ({ ...current, lastError: error instanceof Error ? error.message : "Telegram link failed." }));
+      return false;
+    }
+  };
 
-    return <><main className="terminal-shell"><aside className="sidebar-rail"><div className="brand-mark" aria-label="Polymarket Quant Engine"><span className="brand-mark-core">P</span><span className="brand-mark-pulse" /></div><nav className="rail-nav" aria-label="Primary navigation"><button className={`rail-button ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")} type="button" title="Overview"><LayoutDashboard size={19} /></button><button className={`rail-button ${view === "paper" ? "active" : ""}`} onClick={() => setView("paper")} type="button" title="Paper trader"><BarChart3 size={19} /></button><button className={`rail-button ${view === "backtest" ? "active" : ""}`} onClick={() => setView("backtest")} type="button" title="Paper lab"><LineChart size={19} /></button><button className={`rail-button ${view === "account" ? "active" : ""}`} onClick={() => setView("account")} type="button" title="Connected account"><CircleDollarSign size={19} /></button><button className="rail-button" onClick={() => setView("overview")} type="button" title="Public market data"><ScanLine size={19} /></button></nav><div className="rail-bottom"><button className="rail-button" onClick={() => setView("live")} type="button" title="Live executor"><Settings2 size={19} /></button><span className="rail-version">v0.2</span></div></aside>
-    <section className="terminal-main"><header className="topbar"><div className="title-block"><div className="eyebrow"><span className="eyebrow-dot" />POLYMARKET / PM5 PREDICTOR</div><h1>Decision terminal</h1><p>Public market data in. Calibrated paper signals out. Every result traceable.</p></div><div className="topbar-right"><div className="connection-strip"><StatusDot label="GAMMA" status={statusForData} detail="Public market metadata layer" /><StatusDot label="CLOB" status="PUBLIC" detail="Public Polymarket order books" /><StatusDot label="SPOT" status="PUBLIC" detail="Public Coinbase spot endpoint" /><StatusDot label="LEDGER" status="READY" detail="Browser-local paper ledger" /><StatusDot label="ACCOUNT" status={connectedAccount ? "READY" : "LOCKED"} detail="Read-only wallet and CLOB account data" /></div><div className="topbar-actions"><button className="mode-pill runner-pill" onClick={() => setRunnerDialogOpen(true)} type="button"><Terminal size={13} />24/7 RUNNER</button><button className="mode-pill account-mode" onClick={() => setAccountDialogOpen(true)} type="button"><Wallet size={13} />{connectedAccount ? "ACCOUNT READY" : "LINK ACCOUNT"}</button><button className="mode-pill" onClick={() => setView("live")} type="button"><span className="mode-pill-dot" />{liveRunning ? "LIVE ACTIVE" : "PAPER / LIVE"}<ChevronDown size={13} /></button><span className="clock-readout"><Clock3 size={14} />{clock ? new Date(clock).toLocaleTimeString("en-US", { hour12: false, timeZone: "UTC" }) : "--:--:--"} UTC</span></div></div></header>
-      {killSwitch ? <div className="critical-banner"><AlertTriangle size={17} /><span><strong>RISK HALT</strong> — paper auto-execution is disabled; reset only after reviewing the ledger.</span><button onClick={resetPaperSession} type="button">Reset empty ledger</button></div> : <div className="info-banner"><Activity size={16} /><span><strong>Paper is the default.</strong> Live execution is opt-in, owner-authenticated, balance-aware, and fail-closed.</span><span className="banner-spacer" /><button onClick={() => setRunnerDialogOpen(true)} type="button">24/7 runner setup <Terminal size={14} /></button><button onClick={() => setView("live")} type="button">Open live executor <ArrowUpRight size={14} /></button></div>}
-      <div className="terminal-content"><div className="workspace-tabs" role="tablist" aria-label="Workspace"><button className={view === "overview" ? "active" : ""} onClick={() => setView("overview")} role="tab" aria-selected={view === "overview"} type="button"><LayoutDashboard size={14} />Overview</button><button className={view === "paper" ? "active" : ""} onClick={() => setView("paper")} role="tab" aria-selected={view === "paper"} type="button"><Wallet size={14} />Paper trader</button><button className={view === "backtest" ? "active" : ""} onClick={() => setView("backtest")} role="tab" aria-selected={view === "backtest"} type="button"><LineChart size={14} />Paper lab</button><button className={view === "account" ? "active" : ""} onClick={() => setView("account")} role="tab" aria-selected={view === "account"} type="button"><CircleDollarSign size={14} />Account</button><button className={view === "live" ? "active" : ""} onClick={() => setView("live")} role="tab" aria-selected={view === "live"} type="button"><Zap size={14} />Live executor</button><span className="workspace-tab-spacer" /><span className="data-receipt"><span className={`status-dot ${streamStatus === "LIVE" ? "status-ready" : "status-warning"}`} />{streamStatus === "LIVE" ? "WS LIVE" : streamStatus.toLowerCase()} · {lastStreamUpdate ? `${formatAge(lastStreamUpdate, clock)} stream tick` : "waiting for stream tick"}</span></div>
-        <section className="control-row" aria-label="Trading controls"><div className="engine-state"><span className={`engine-pulse ${engineRunning && !paused && !killSwitch ? "running" : ""}`} /><span><strong>{killSwitch ? "HALTED" : engineRunning ? (paused ? "PAPER ENGINE PAUSED" : "PAPER ENGINE RUNNING") : "PAPER ENGINE STANDBY"}</strong><small>{engineRunning ? "Candidate scan uses only executable public asks" : "Start the paper engine to scan signals"}</small></span></div><div className="control-buttons"><button className="button-primary" disabled={killSwitch || engineRunning} onClick={startEngine} type="button"><Play size={15} fill="currentColor" />{engineRunning ? "RUNNING" : "START PAPER ENGINE"}</button><button className={`button-secondary ${paused ? "button-warning" : ""}`} disabled={!engineRunning} onClick={togglePause} type="button"><Pause size={15} />{paused ? "RESUME" : "PAUSE NEW TRADES"}</button><button className="button-secondary" onClick={cancelOrders} type="button"><Ban size={15} />CLEAR QUEUE <span className="button-count">{account.openOrders}</span></button><button className="button-secondary" disabled={!account.positions.length} onClick={closePositions} type="button"><Wallet size={15} />CLOSE POSITIONS</button><button className="button-danger" onClick={triggerKillSwitch} type="button"><Zap size={15} />KILL SWITCH</button></div></section>
-        {view === "account" ? <AccountView account={connectedAccount} error={accountError} loading={accountLoading} onConnect={() => setAccountDialogOpen(true)} onDisconnect={disconnectAccount} onRefresh={() => void fetchConnectedAccount(accountConnection)} /> : view === "live" ? <LiveExecutionPanel candidateCount={liveCandidates.length} consent={liveConsent} killSwitch={killSwitch} marketCount={liveMarkets.length} onConsentChange={setLiveConsent} onKill={() => void killLiveExecutor()} onLink={() => setAccountDialogOpen(true)} onPause={toggleLivePause} onRefresh={() => void refreshLiveBalance()} onRiskChange={(patch) => setLiveRisk((current) => normalizeLiveRiskConfig({ ...current, ...patch }))} onStart={startLiveExecutor} paused={livePaused} risk={liveRisk} running={liveRunning} session={liveSession} status={liveStatus} /> : view !== "backtest" ? <><section className="metric-grid" aria-label="Paper account summary"><MetricCard label="TOTAL EQUITY" value={dollars(equity)} delta={signedDollars(todayPnl)} deltaTone={todayPnl >= 0 ? "positive" : "negative"} detail="vs. starting cash" icon={<CircleDollarSign size={17} />} spark={selectedTicks} /><MetricCard label="CASH" value={dollars(account.cash)} delta={`${account.positions.length} open`} deltaTone="neutral" detail="available balance" icon={<Wallet size={17} />} /><MetricCard label="SESSION P&L" value={signedDollars(todayPnl)} delta={`${account.fills.length} fills`} deltaTone={todayPnl >= 0 ? "positive" : "negative"} detail="paper ledger" icon={todayPnl >= 0 ? <TrendingUp size={17} /> : <TrendingDown size={17} />} spark={selectedTicks} /><MetricCard label="UNREALIZED" value={signedDollars(unrealized)} delta={`${account.positions.length} positions`} deltaTone={unrealized >= 0 ? "positive" : "negative"} detail="marked to bid" icon={<Activity size={17} />} /><MetricCard label="REALIZED P&L" value={signedDollars(account.realizedPnl)} delta={`${account.closedTrades.length} closed`} deltaTone={account.realizedPnl >= 0 ? "positive" : "negative"} detail="after recorded fees" icon={<Target size={17} />} /><MetricCard label="FEES" value={dollars(account.fees)} delta={`${(config.feeRate * 100).toFixed(2)}% model`} deltaTone="neutral" detail="configured cost" icon={<CircleDot size={17} />} /><MetricCard label="DRAWDOWN" value={percentage(maxDrawdown)} delta={maxDrawdown <= config.maxLoss ? "within limit" : "halt threshold"} deltaTone={maxDrawdown <= config.maxLoss ? "positive" : "negative"} detail={`max ${percentage(config.maxLoss)} configured`} icon={<Gauge size={17} />} /><MetricCard label="WIN RATE" value={percentage(winRate)} delta={account.closedTrades.length ? `${account.closedTrades.length} settled` : "no settled trades"} deltaTone="neutral" detail="paper ledger only" icon={<ShieldCheck size={17} />} /></section>
-          <section className="section-heading"><div><div className="eyebrow">PUBLIC MARKET DISCOVERY</div><h2>Active short-duration markets</h2></div><div className="section-heading-right"><span className="last-tick">{filteredMarkets.length ? `${filteredMarkets.length} markets` : "no markets"}</span><span className="last-tick"><span className={`status-dot ${dataStatus === "ready" ? "status-ready" : "status-warning"}`} />{lastUpdated ? formatAge(lastUpdated, clock) : "no tick"}</span><div className="filter-tabs" role="tablist" aria-label="Market duration">{(["ALL", "5m", "15m"] as const).map((filter) => <button aria-selected={durationFilter === filter} className={durationFilter === filter ? "filter-tab active" : "filter-tab"} key={filter} onClick={() => setDurationFilter(filter)} role="tab" type="button">{filter}</button>)}</div><button className="icon-button" disabled={refreshing} onClick={() => void refreshMarkets()} title="Refresh public market discovery" type="button">{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}</button></div></section>
-          {dataStatus === "error" ? <div className="data-alert"><AlertTriangle size={16} /><div><strong>Public data unavailable</strong><span>{dataError}</span></div><button onClick={() => void refreshMarkets()} type="button">Retry</button></div> : null}{dataStatus === "ready" && !filteredMarkets.length ? <EmptyState title="No eligible markets right now" detail={dataError || "Gamma returned no active crypto markets matching the 5m/15m filters. The engine will keep checking; it will not fabricate quotes."} action={<button className="button-secondary" onClick={() => void refreshMarkets()} type="button"><RefreshCw size={14} />Refresh public feed</button>} /> : null}
-          <section className="market-layout">{filteredMarkets.length ? <div className="market-grid" aria-label="Public markets">{filteredMarkets.map((market) => <MarketCard key={market.id} config={config} market={market} onSelect={() => setSelectedMarketId(market.id)} selected={selectedMarket?.id === market.id} />)}</div> : <div />}{selectedMarket && selectedSignal ? <aside className="panel signal-panel" aria-label="Selected market signal">
-            <div className="panel-heading"><div><div className="eyebrow">CHART SIGNAL</div><h3>{selectedMarket.asset} {selectedMarket.duration}</h3></div><span className={`action-pill ${currentAction.tone}`}>{currentAction.label}</span></div>
-            <p className="market-question signal-question">{selectedMarket.question}</p>
-            <div className="signal-hero"><div><span className="metric-label">CANDLE MODEL P(UP)</span><strong>{percentage(selectedSignal.fairUp)}</strong><small>Coinbase OHLC · volatility + trend · {selectedMarket.referenceSource === "COINBASE ESTIMATE" ? "estimated " : ""}ref {formatSpot(selectedMarket.asset, selectedMarket.reference)}</small></div><div className="signal-confidence"><span className="confidence-ring" style={{ "--confidence": `${selectedSignal.biasConfidence === null ? 0 : clamp(selectedSignal.biasConfidence, 0, 1) * 100}%` } as CSSProperties}><span>{percentage(selectedSignal.biasConfidence, 0)}</span></span><small>direction · uncalibrated</small></div></div>
-            <div className="signal-price-checks"><div><small>UP · P(UP) {percentage(selectedSignal.fairUp)} vs ask {cents(selectedMarket.upAsk)}</small><strong className={selectedSignal.upEdge === null ? "text-muted" : selectedSignal.upEdge >= 0 ? "text-positive" : "text-negative"}>net edge {selectedSignal.upEdge === null ? "—" : percentage(selectedSignal.upEdge)}</strong></div><div><small>DOWN · P(DOWN) {percentage(selectedSignal.fairUp === null ? null : 1 - selectedSignal.fairUp)} vs ask {cents(selectedMarket.downAsk)}</small><strong className={selectedSignal.downEdge === null ? "text-muted" : selectedSignal.downEdge >= 0 ? "text-positive" : "text-negative"}>net edge {selectedSignal.downEdge === null ? "—" : percentage(selectedSignal.downEdge)}</strong></div></div>
-            <div className="candle-chart-grid"><CandleChart label="5M CANDLES" candles={selectedMarket.chart5m} trend={selectedSignal.trend5m} rsiValue={selectedSignal.rsi5m} /><CandleChart label="15M CANDLES" candles={selectedMarket.chart15m} trend={selectedSignal.trend15m} rsiValue={selectedSignal.rsi15m} /></div>
-            <div className="signal-divider" />
-            <div className="signal-metrics"><div><span>UP ASK</span><strong>{cents(selectedMarket.upAsk)}</strong></div><div><span>DOWN ASK</span><strong>{cents(selectedMarket.downAsk)}</strong></div><div><span>ENTRY</span><strong className={selectedSignal.action === "UP" ? "text-positive" : selectedSignal.action === "DOWN" ? "text-negative" : "text-muted"}>{selectedSignal.action === "PASS" ? "PASS" : `${selectedSignal.action} · ${cents(selectedSignal.entryPrice)}`}</strong></div><div><span>NET EDGE</span><strong className={selectedSignal.edge !== null && selectedSignal.edge >= config.minEdge ? "text-positive" : "text-muted"}>{percentage(selectedSignal.edge)}</strong></div></div>
-            <div className="signal-block"><div className="signal-block-title"><span>ENTRY FILTERS</span><small>public chart + book data</small></div><div className="signal-bar-row"><span>Ask depth</span><span>{selectedMarket.liquidity ? dollars(selectedMarket.liquidity, 0) : "—"}</span><div className="signal-bar"><i style={{ width: `${Math.min(100, selectedMarket.liquidity / Math.max(1, config.maxTrade) * 10)}%` }} /></div></div><div className="signal-bar-row"><span>Book spread</span><span>{percentage(selectedMarket.spread)}</span><div className="signal-bar amber"><i style={{ width: `${Math.min(100, (selectedMarket.spread ?? 0) * 500)}%` }} /></div></div><div className="signal-bar-row"><span>Chart snapshot</span><span>{selectedMarket.chartUpdatedAt === null ? "MISSING" : formatAge(selectedMarket.chartUpdatedAt, clock)}</span><div className="signal-bar cyan"><i style={{ width: `${selectedMarket.chartUpdatedAt === null ? 0 : Math.max(0, 100 - Math.max(0, (clock - selectedMarket.chartUpdatedAt) / 1200))}%` }} /></div></div></div>
-            <div className={`no-trade-box ${selectedSignal.action !== "PASS" ? "candidate-box" : ""}`}><div className="no-trade-icon"><ShieldCheck size={16} /></div><div><strong>{selectedSignal.action === "PASS" ? "PASS · No entry" : selectedSignal.tier === "LOCK" ? "LOCK · High chart confluence" : `ENTRY ${selectedSignal.action} · gates passed`}</strong><p>{selectedSignal.reason} “LOCK” is a strict filter label, not a guaranteed outcome. Paper only.</p></div></div>
-            <div className="paper-order-actions"><button className="button-primary" disabled={killSwitch || selectedSignal.action !== "UP" || selectedMarket.upAsk === null || !selectedMarket.upBook} onClick={() => manualBuy("UP")} type="button"><ArrowUpRight size={14} />PAPER UP · {dollars(config.maxTrade, 0)}</button><button className="button-secondary" disabled={killSwitch || selectedSignal.action !== "DOWN" || selectedMarket.downAsk === null || !selectedMarket.downBook} onClick={() => manualBuy("DOWN")} type="button"><ArrowDownRight size={14} />PAPER DOWN · {dollars(config.maxTrade, 0)}</button></div>
-            <div className="panel-footnote"><span>5M</span><strong>{selectedSignal.trend5m}</strong><span>15M</span><strong>{selectedSignal.trend15m}</strong><span className="footnote-spacer" /><span>LEFT</span><strong>{timeLeft(selectedMarket.remaining)}</strong><a href={selectedMarket.sourceUrl} target="_blank" rel="noreferrer">OPEN MARKET ↗</a></div>
-          </aside> : null}</section>
-          <section className="dashboard-grid"><article className="panel chart-panel"><div className="panel-heading"><div><div className="eyebrow">PAPER PORTFOLIO MONITOR</div><h3>Equity curve <span className="heading-muted">/ local ledger</span></h3></div><div className="range-tabs" role="tablist" aria-label="Chart period">{["5M", "15M", "1H", "6H", "24H", "ALL"].map((range) => <button aria-selected={selectedRange === range} className={selectedRange === range ? "range-tab active" : "range-tab"} key={range} onClick={() => setSelectedRange(range)} role="tab" type="button">{range}</button>)}</div></div><div className="chart-summary"><span><strong>{dollars(equity)}</strong><small>current equity</small></span><span className={todayPnl >= 0 ? "chart-stat-positive" : "chart-stat-negative"}>{todayPnl >= 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />} {signedDollars(todayPnl)} <small>session P&amp;L</small></span><span><small>MAX DD</small><strong>{percentage(maxDrawdown)}</strong></span></div><div className="chart-wrap"><EquityChart values={selectedTicks} color={todayPnl >= 0 ? "#6cf2c4" : "#ff7d8a"} /><div className="chart-axis"><span>{account.equityHistory.length ? formatTime(account.equityHistory[0].timestamp) : "—"}</span><span>{account.equityHistory.length > 2 ? formatTime(account.equityHistory[Math.floor(account.equityHistory.length / 2)].timestamp) : "—"}</span><span>NOW</span></div></div></article><article className="panel positions-panel"><div className="panel-heading"><div><div className="eyebrow">EXPOSURE</div><h3>Paper positions <span className="heading-muted">/ {account.positions.length}</span></h3></div><button className="text-button" disabled={!account.positions.length} onClick={closePositions} type="button">Close all <ArrowUpRight size={13} /></button></div><div className="positions-table-wrap"><table className="positions-table"><thead><tr><th>MARKET</th><th>SIDE</th><th>SIZE</th><th>MARK</th><th>P&amp;L</th></tr></thead><tbody>{account.positions.length ? account.positions.map((position) => { const mark = marketMap.get(position.marketId)?.[position.side === "UP" ? "upBid" : "downBid"] ?? position.mark; const pnl = mark === null || mark === undefined ? null : (mark - position.avgEntry) * position.shares; return <tr key={position.id}><td><strong>{position.marketLabel}</strong><small>{timeLeft(Math.max(0, Math.round((position.endTime - clock) / 1000)))} left</small></td><td><span className={`side-chip ${position.side === "UP" ? "up" : "down"}`}>{position.side}</span></td><td>{position.shares.toFixed(2)} sh</td><td>{cents(mark)}</td><td className={pnl === null ? "text-muted" : pnl >= 0 ? "text-positive" : "text-negative"}>{signedDollars(pnl)}</td></tr>; }) : <tr><td className="empty-row" colSpan={5}>No open paper positions. The ledger is flat.</td></tr>}</tbody></table></div><div className="positions-footer"><span><span className="status-dot status-ready" />Marked from current public bids</span><span>{dollars(deployed)} deployed</span></div></article></section>
-          <section className="dashboard-grid lower"><article className="panel feed-panel"><div className="panel-heading"><div><div className="eyebrow">AUDIT TRAIL</div><h3>Engine feed <span className="heading-muted">/ this browser</span></h3></div><span className="feed-live"><span className={`status-dot ${dataStatus === "ready" ? "status-ready" : "status-warning"}`} />{dataStatus === "ready" ? "PUBLIC" : "WAITING"}</span></div>{logs.length ? <div className="feed-list">{logs.map((log) => <div className="feed-row" key={log.id}><span className="feed-time">{log.time}</span><span className={`feed-marker ${log.tone}`} /><div><strong>{log.message}</strong><small>{log.detail}</small></div></div>)}</div> : <EmptyState title="No events yet" detail="The audit trail will populate when public data syncs or you submit a paper action." />}</article><article className="panel risk-panel"><div className="panel-heading"><div><div className="eyebrow">RISK CONFIGURATION</div><h3>Guardrails <span className="heading-muted">/ editable</span></h3></div><SlidersHorizontal size={17} className="heading-icon" /></div><div className="risk-controls"><label className="range-control"><span><b>Minimum net edge</b><em>{percentage(config.minEdge)}</em></span><input max="0.12" min="0" onChange={(event) => setConfig((current) => ({ ...current, minEdge: Number(event.target.value) }))} step="0.005" type="range" value={config.minEdge} /></label><label className="range-control"><span><b>Max paper trade</b><em>{dollars(config.maxTrade, 0)}</em></span><input max="250" min="5" onChange={(event) => setConfig((current) => ({ ...current, maxTrade: Number(event.target.value) }))} step="5" type="range" value={config.maxTrade} /></label><label className="range-control"><span><b>Daily loss halt</b><em>{percentage(config.maxLoss)}</em></span><input max="0.25" min="0.01" onChange={(event) => setConfig((current) => ({ ...current, maxLoss: Number(event.target.value) }))} step="0.01" type="range" value={config.maxLoss} /></label><label className="range-control"><span><b>Fee assumption</b><em>{percentage(config.feeRate, 2)}</em></span><input max="0.1" min="0" onChange={(event) => setConfig((current) => ({ ...current, feeRate: Number(event.target.value) }))} step="0.0025" type="range" value={config.feeRate} /></label><label className="range-control"><span><b>Slippage buffer</b><em>{config.slippageBps} bps</em></span><input max="100" min="0" onChange={(event) => setConfig((current) => ({ ...current, slippageBps: Number(event.target.value) }))} step="5" type="range" value={config.slippageBps} /></label></div><div className="risk-note"><ShieldCheck size={15} /><span>No martingale or live orders. Missing candles, reference, quote, or ask depth blocks entry.</span></div></article></section></> : <section className="backtest-lab">{paperLab}<div className="section-heading"><div><div className="eyebrow">RESEARCH WORKBENCH</div><h2>Historical backtest</h2><p className="section-subtitle">Replay a reference/spot baseline from timestamped rows. This does not validate the live OHLC signal.</p></div><span className="research-badge"><LineChart size={14} />DETERMINISTIC</span></div><div className="backtest-grid"><article className="panel dataset-panel"><div className="panel-heading"><div><div className="eyebrow">DATASET</div><h3>Bring your own history</h3></div><FileUp size={17} className="heading-icon" /></div><p className="panel-copy">Import timestamp, asset, duration, reference, spot, up_ask, down_ask, and optional outcome columns. This baseline omits live candle filters; outcomes are required for settled P&amp;L.</p><div className="upload-zone"><input accept=".csv,text/csv" id="backtest-upload" onChange={(event) => void handleCsvUpload(event.target.files?.[0])} type="file" /><label htmlFor="backtest-upload"><Upload size={17} /><strong>Import CSV</strong><span>Local browser parsing · no upload</span></label></div><div className="dataset-actions"><button className="button-secondary" disabled={!recordedTicks.length} onClick={useRecordedTicks} type="button"><Database size={14} />Use recorded public ticks <span className="button-count">{recordedTicks.length}</span></button><button className="text-button" onClick={downloadTemplate} type="button"><Download size={13} />Download template</button></div><div className="dataset-status"><span className={`status-dot ${backtestRows.length ? "status-ready" : "status-warning"}`} /><strong>{backtestRows.length ? `${backtestRows.length} rows ready` : "No dataset loaded"}</strong><span>{backtestRejected ? `${backtestRejected} rejected` : "Settled outcomes are optional"}</span></div></article><article className="panel backtest-config-panel"><div className="panel-heading"><div><div className="eyebrow">SIMULATION CONFIG</div><h3>Cost-aware replay</h3></div><SlidersHorizontal size={17} className="heading-icon" /></div><div className="backtest-form"><label><span>Starting capital</span><input min="1" onChange={(event) => setBacktestStartingCash(Number(event.target.value))} step="10" type="number" value={backtestStartingCash} /></label><label><span>Minimum net edge</span><input max="0.5" min="0" onChange={(event) => setConfig((current) => ({ ...current, minEdge: Number(event.target.value) }))} step="0.005" type="number" value={config.minEdge} /></label><label><span>Max trade</span><input min="1" onChange={(event) => setConfig((current) => ({ ...current, maxTrade: Number(event.target.value) }))} step="1" type="number" value={config.maxTrade} /></label><label><span>Fee rate</span><input max="0.5" min="0" onChange={(event) => setConfig((current) => ({ ...current, feeRate: Number(event.target.value) }))} step="0.0025" type="number" value={config.feeRate} /></label><label><span>Slippage bps</span><input max="500" min="0" onChange={(event) => setConfig((current) => ({ ...current, slippageBps: Number(event.target.value) }))} step="1" type="number" value={config.slippageBps} /></label></div><button className="button-primary run-backtest" disabled={!backtestRows.length} onClick={executeBacktest} type="button"><Play size={15} fill="currentColor" />RUN BACKTEST</button></article></div><div className="backtest-metrics metric-grid"><MetricCard label="SIGNALS" value={backtestResult ? String(backtestResult.signals) : "—"} delta={backtestResult ? `${backtestResult.unsettled} unsettled` : "run a dataset"} deltaTone="neutral" detail="edge filter passes" icon={<ScanLine size={17} />} /><MetricCard label="NET P&L" value={backtestResult ? signedDollars(backtestResult.netPnl) : "—"} delta={backtestResult ? percentage(backtestResult.roi) : "—"} deltaTone={backtestResult?.netPnl !== null && backtestResult?.netPnl !== undefined && backtestResult.netPnl >= 0 ? "positive" : "neutral"} detail="settled rows only" icon={<TrendingUp size={17} />} /><MetricCard label="WIN RATE" value={backtestResult ? percentage(backtestResult.winRate) : "—"} delta={backtestResult ? `${backtestResult.wins}W / ${backtestResult.losses}L` : "—"} deltaTone="neutral" detail="settled trades" icon={<Target size={17} />} /><MetricCard label="MAX DD" value={backtestResult ? percentage(backtestResult.maxDrawdown) : "—"} delta={backtestResult ? `${backtestResult.settled} settled` : "—"} deltaTone="neutral" detail="replayed equity" icon={<Gauge size={17} />} /><MetricCard label="BRIER" value={backtestResult ? backtestResult.brierScore?.toFixed(4) ?? "—" : "—"} delta={backtestResult ? "lower is better" : "—"} deltaTone="neutral" detail="probability calibration" icon={<ShieldCheck size={17} />} /></div>{backtestResult ? <section className="backtest-results"><article className="panel chart-panel"><div className="panel-heading"><div><div className="eyebrow">REPLAY OUTPUT</div><h3>Settled equity <span className="heading-muted">/ no outcome guessing</span></h3></div><span className={`result-badge ${backtestResult.settled ? "ready" : "waiting"}`}>{backtestResult.settled ? `${backtestResult.settled} SETTLED` : "NO SETTLED ROWS"}</span></div>{backtestResult.settled ? <div className="chart-wrap"><EquityChart values={backtestResult.equityCurve} color={backtestResult.netPnl !== null && backtestResult.netPnl >= 0 ? "#6cf2c4" : "#ff7d8a"} /></div> : <EmptyState title="No settled outcomes in this dataset" detail="Signals are shown below, but P&L, ROI, win rate, drawdown, and Brier score remain unavailable until outcome values are supplied." />}</article><article className="panel backtest-trades-panel"><div className="panel-heading"><div><div className="eyebrow">TRADE REPLAY</div><h3>Signals and outcomes <span className="heading-muted">/ latest 250</span></h3></div><span className="feed-live"><span className="status-dot status-ready" />LOCAL</span></div><div className="positions-table-wrap"><table className="positions-table"><thead><tr><th>TIME</th><th>MARKET</th><th>SIDE</th><th>EDGE</th><th>STATUS</th><th>P&amp;L</th></tr></thead><tbody>{backtestResult.trades.length ? backtestResult.trades.slice().reverse().map((trade, index) => <tr key={`${trade.timestamp}-${trade.asset}-${index}`}><td>{formatTime(trade.timestamp)}</td><td><strong>{trade.asset} {trade.duration}</strong><small>fair {percentage(trade.fair)}</small></td><td><span className={`side-chip ${trade.side === "UP" ? "up" : "down"}`}>{trade.side}</span></td><td>{percentage(trade.edge)}</td><td className={trade.status === "SETTLED WIN" ? "text-positive" : trade.status === "SETTLED LOSS" ? "text-negative" : "text-warning"}>{trade.status}</td><td className={trade.pnl === null ? "text-muted" : trade.pnl >= 0 ? "text-positive" : "text-negative"}>{signedDollars(trade.pnl)}</td></tr>) : <tr><td className="empty-row" colSpan={6}>No signals passed the configured edge filter.</td></tr>}</tbody></table></div></article></section> : <EmptyState title="Backtest output is waiting" detail="Load a user-supplied CSV or record public ticks from the Overview tab, then run the deterministic replay." />}</section>}
-        <footer className="terminal-footer"><span><Terminal size={14} />Paper ledger stays in this browser</span><span><Database size={14} />Public data is not synthetic</span><span><LockKeyhole size={14} />Raw key is cleared after linking; session is encrypted</span><span className="footer-spacer" /><span>Research first. Trade deliberately.</span></footer></div>
-    </section>
-    {null}
-    {accountDialogOpen ? <AccountConnectModal connection={accountConnection} error={accountError} loading={accountLoading} onChange={(field, value) => setAccountConnection((current) => ({ ...current, [field]: value }))} onClose={() => setAccountDialogOpen(false)} onSubmit={() => void connectAccount()} /> : null}
-    {runnerDialogOpen ? <RunnerSetupModal onClose={() => setRunnerDialogOpen(false)} /> : null}
-  </main></>;
+  // ---- render ------------------------------------------------------------
+  const status = controller.status;
+  const sockets = [status.clob, status.rtds, status.coinbase];
+  const feedStatus: "READY" | "WARN" = sockets.every((value) => value === "LIVE") ? "READY" : "WARN";
+  const anchoredAssets = [...controller.feeds.keys()].filter((asset) => controller.derived(asset, now).spotSource === "ANCHORED").length;
+
+  return (
+    <main className="terminal-shell">
+      <aside className="sidebar-rail">
+        <div className="brand-mark" aria-label="Polymarket Quant Engine">
+          <span className="brand-mark-core">P</span>
+          <span className="brand-mark-pulse" />
+        </div>
+        <nav className="rail-nav" aria-label="Primary navigation">
+          {(
+            [
+              ["overview", <LayoutDashboard key="o" size={19} />, "Overview"],
+              ["paper", <BarChart3 key="p" size={19} />, "Paper engine"],
+              ["research", <LineChart key="r" size={19} />, "Research"],
+              ["account", <CircleDollarSign key="a" size={19} />, "Account"],
+              ["live", <Zap key="l" size={19} />, "Live executor"],
+            ] as const
+          ).map(([id, icon, title]) => (
+            <button className={`rail-button ${view === id ? "active" : ""}`} key={id} onClick={() => setView(id)} title={title} type="button">
+              {icon}
+            </button>
+          ))}
+        </nav>
+        <div className="rail-bottom">
+          <span className="rail-version">v1.0</span>
+        </div>
+      </aside>
+      <section className="terminal-main">
+        <header className="topbar">
+          <div className="title-block">
+            <div className="eyebrow">
+              <span className="eyebrow-dot" />
+              POLYMARKET / 5M + 15M CRYPTO
+            </div>
+            <h1>Decision terminal</h1>
+            <p>Chainlink TWAP settlement model · official price to beat · fee-curve limit orders · official resolutions.</p>
+          </div>
+          <div className="topbar-right">
+            <div className="connection-strip">
+              <StatusDot label="BOOKS" status={status.clob === "LIVE" ? "READY" : "WARN"} detail="CLOB market WebSocket with delta integrity checks" />
+              <StatusDot label="CHAINLINK" status={status.rtds === "LIVE" ? "READY" : "WARN"} detail="Polymarket RTDS: Chainlink TWAP stream + Binance" />
+              <StatusDot label="EXCHANGE" status={status.coinbase === "LIVE" ? "READY" : "WARN"} detail="Coinbase ticker for the underlying" />
+              <StatusDot label="ANCHORED" status={anchoredAssets ? "READY" : "WARN"} detail={`${anchoredAssets} assets anchored to the settlement stream`} />
+              <StatusDot label="LIVE" status={liveSession?.connected ? "READY" : "LOCKED"} detail="Owner-authenticated live session" />
+            </div>
+            <div className="topbar-actions">
+              <button className="mode-pill runner-pill" onClick={() => setRunnerOpen(true)} type="button">
+                <Terminal size={13} />
+                HEADLESS RUNNER
+              </button>
+              <button className="mode-pill account-mode" onClick={() => setAccountDialogOpen(true)} type="button">
+                <Wallet size={13} />
+                {liveSession?.connected ? "LIVE LINKED" : "LINK ACCOUNT"}
+              </button>
+              <span className="clock-readout">
+                <Clock3 size={14} />
+                {clock ? new Date(clock).toLocaleTimeString("en-US", { hour12: false, timeZone: "UTC" }) : "--:--:--"} UTC
+              </span>
+            </div>
+          </div>
+        </header>
+        {engine.halt ? (
+          <div className="critical-banner">
+            <AlertTriangle size={17} />
+            <span>
+              <strong>PAPER HALT</strong> — {engine.halt.reason}
+            </span>
+            <button onClick={clearHalt} type="button">
+              Acknowledge
+            </button>
+          </div>
+        ) : null}
+        <div className="terminal-content">
+          <div className="workspace-tabs" role="tablist" aria-label="Workspace">
+            {(
+              [
+                ["overview", "Overview"],
+                ["paper", "Paper engine"],
+                ["research", "Research"],
+                ["account", "Account"],
+                ["live", "Live executor"],
+              ] as const
+            ).map(([id, label]) => (
+              <button aria-selected={view === id} className={view === id ? "active" : ""} key={id} onClick={() => setView(id)} role="tab" type="button">
+                {label}
+              </button>
+            ))}
+            <span className="workspace-tab-spacer" />
+            <span className="data-receipt">
+              <span className={`status-dot ${feedStatus === "READY" ? "status-ready" : "status-warning"}`} />
+              {sockets.join(" / ").toLowerCase()} · {formatAge(status.lastMessageAt, now)} · {status.bookResyncs} book resyncs
+            </span>
+          </div>
+          <section className="control-row" aria-label="Trading controls">
+            <div className="engine-state">
+              <span className={`engine-pulse ${autoTrade && !engine.halt ? "running" : ""}`} />
+              <span>
+                <strong>{engine.halt ? "HALTED" : autoTrade ? "PAPER AUTO-TRADE ON" : "PAPER SIGNALS ONLY"}</strong>
+                <small>
+                  {engine.pending.length} in flight · {paperConfig.latencyMs}ms simulated latency · settles on official outcomes
+                </small>
+              </span>
+            </div>
+            <div className="control-buttons">
+              <button className={autoTrade ? "button-secondary" : "button-primary"} onClick={() => setAutoTrade((current) => !current)} type="button">
+                {autoTrade ? <Pause size={15} /> : <Play size={15} fill="currentColor" />}
+                {autoTrade ? "PAUSE AUTO" : "START AUTO"}
+              </button>
+              <button className="button-secondary" disabled={!account.positions.length} onClick={closeAll} type="button">
+                <Wallet size={15} />
+                SELL ALL
+              </button>
+              <button className="button-danger" onClick={killSwitch} type="button">
+                <Zap size={15} />
+                KILL SWITCH
+              </button>
+            </div>
+          </section>
+
+          {view === "account" ? (
+            <AccountView
+              account={connectedAccount}
+              error={accountError}
+              loading={accountLoading}
+              onConnect={() => setAccountDialogOpen(true)}
+              onDisconnect={disconnect}
+              onRefresh={() => void fetchAccount(connection.walletAddress)}
+            />
+          ) : view === "live" ? (
+            <LiveExecutionPanel
+              candidateCount={liveCandidates.length}
+              consent={liveConsent}
+              marketCount={activeMarkets.length}
+              now={now}
+              onConsentChange={setLiveConsent}
+              onKill={() => void killLive()}
+              onLink={() => setAccountDialogOpen(true)}
+              onPause={() => setLivePaused((current) => !current)}
+              onRefresh={() => void refreshLiveBalance()}
+              onRiskChange={(patch) =>
+                setLiveRisk((current) =>
+                  normalizeLiveRiskConfig({ ...current, ...patch, signal: { ...current.signal, ...(patch.signal ?? {}) } } as Partial<LiveRiskConfig>),
+                )
+              }
+              onStart={() => {
+                setLiveStatus({
+                  lastAction: "LIVE RUNNER STARTED",
+                  lastDetail: "Scanning for candidates that pass the live policy.",
+                  lastError: "",
+                  lastLatencyMs: null,
+                });
+                setLiveRunning(true);
+                setLivePaused(false);
+              }}
+              paused={livePaused}
+              risk={liveRisk}
+              running={liveRunning}
+              session={liveSession}
+              status={liveStatus}
+            />
+          ) : view === "paper" ? (
+            <PaperLabPanel
+              account={account}
+              clock={now}
+              config={paperConfig}
+              halt={engine.halt}
+              ledgerRows={ledgerRows}
+              markets={markets}
+              metrics={ledgerMetrics}
+              pending={engine.pending.length}
+              telegram={telegram}
+              onClearHalt={clearHalt}
+              onClearLedger={() => {
+                if (window.confirm("Clear the decision ledger?")) setLedger(new Map());
+              }}
+              onConfigChange={(patch) =>
+                setPaperConfig((current) =>
+                  normalizePaperConfig({ ...current, ...patch, signal: { ...current.signal, ...(patch.signal ?? {}) } } as Partial<PaperConfig>),
+                )
+              }
+              onExportLedger={() => downloadText(`pqe-ledger-${new Date().toISOString().slice(0, 10)}.csv`, decisionLedgerCsv(ledgerRows), "text/csv")}
+              onResetAccount={resetAccount}
+              onTelegramAlerts={(alerts) => setTelegram((current) => ({ ...current, alerts }))}
+              onTelegramConnect={connectTelegram}
+              onTelegramDisconnect={() => {
+                void telegramRequest({ action: "disconnect" });
+                setTelegram((current) => ({ ...current, connected: false, lastStatus: "Telegram unlinked." }));
+              }}
+              onTelegramTest={() =>
+                void sendTelegram(reportRef.current("Manual test"))
+                  .then(() => setTelegram((current) => ({ ...current, lastStatus: "Test report sent.", lastError: "" })))
+                  .catch((error) => setTelegram((current) => ({ ...current, lastError: error instanceof Error ? error.message : "Send failed." })))
+              }
+            />
+          ) : view === "research" ? (
+            <ResearchLab baseParams={paperConfig.signal} onExportRecording={exportRecording} recorded={recordedDataset} />
+          ) : (
+            <>
+              <section className="metric-grid" aria-label="Paper account summary">
+                <MetricCard
+                  label="EQUITY"
+                  value={dollars(equity)}
+                  delta={signedDollars(equity - account.startingCash)}
+                  deltaTone={toneFor(equity - account.startingCash)}
+                  detail="marked to bid"
+                  icon={<CircleDollarSign size={17} />}
+                  spark={equitySeries.slice(-200)}
+                />
+                <MetricCard
+                  label="CASH"
+                  value={dollars(account.cash)}
+                  delta={`${account.positions.length} open`}
+                  detail="available"
+                  icon={<Wallet size={17} />}
+                />
+                <MetricCard
+                  label="DAY P&L"
+                  value={signedDollars(dayPnl)}
+                  delta={`halt at −${percentage(paperConfig.dailyLossPct)}`}
+                  deltaTone={toneFor(dayPnl)}
+                  detail="since ET day open"
+                  icon={dayPnl >= 0 ? <TrendingUp size={17} /> : <TrendingDown size={17} />}
+                />
+                <MetricCard
+                  label="UNREALIZED"
+                  value={signedDollars(unrealized)}
+                  delta={`${engine.pending.length} in flight`}
+                  deltaTone={toneFor(unrealized)}
+                  detail="bid − all-in cost"
+                  icon={<Activity size={17} />}
+                />
+                <MetricCard
+                  label="REALIZED"
+                  value={signedDollars(account.realizedPnl)}
+                  delta={`${account.closedTrades.length} closed`}
+                  deltaTone={toneFor(account.realizedPnl)}
+                  detail="official settlements + exits"
+                  icon={<Target size={17} />}
+                />
+                <MetricCard label="FEES PAID" value={dollars(account.fees)} delta="fee curve" detail="rate × (p(1−p))^e" icon={<Gauge size={17} />} />
+                <MetricCard
+                  label="DRAWDOWN"
+                  value={percentage(drawdown)}
+                  delta={`halt at ${percentage(paperConfig.maxDrawdownPct)}`}
+                  deltaTone={drawdown < paperConfig.maxDrawdownPct ? "positive" : "negative"}
+                  detail="from peak equity"
+                  icon={<Gauge size={17} />}
+                />
+                <MetricCard
+                  label="REALIZED EDGE"
+                  value={ledgerMetrics.realizedEdge === null ? "—" : `${(ledgerMetrics.realizedEdge * 100).toFixed(1)}pt`}
+                  delta={`${ledgerMetrics.settled} graded`}
+                  deltaTone={toneFor(ledgerMetrics.realizedEdge)}
+                  detail="first entries, official outcomes"
+                  icon={<ShieldCheck size={17} />}
+                />
+              </section>
+              <section className="section-heading">
+                <div>
+                  <div className="eyebrow">LIVE WINDOWS</div>
+                  <h2>Active 5m / 15m markets</h2>
+                </div>
+                <div className="section-heading-right">
+                  <span className="last-tick">
+                    {visibleMarkets.length} live · {upcoming} upcoming
+                  </span>
+                  <div className="filter-tabs" role="tablist" aria-label="Market duration">
+                    {(["ALL", "5m", "15m"] as const).map((filter) => (
+                      <button
+                        aria-selected={durationFilter === filter}
+                        className={durationFilter === filter ? "filter-tab active" : "filter-tab"}
+                        key={filter}
+                        onClick={() => setDurationFilter(filter)}
+                        role="tab"
+                        type="button"
+                      >
+                        {filter}
+                      </button>
+                    ))}
+                  </div>
+                  <button className="icon-button" onClick={() => void controller.refresh()} title="Refresh discovery and books" type="button">
+                    {status.lastRestAt === null ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                  </button>
+                </div>
+              </section>
+              {status.lastError ? (
+                <div className="data-alert">
+                  <AlertTriangle size={16} />
+                  <div>
+                    <strong>Public data warning</strong>
+                    <span>{status.lastError}</span>
+                  </div>
+                </div>
+              ) : null}
+              <section className="market-layout">
+                {visibleMarkets.length ? (
+                  <div className="market-grid" aria-label="Live markets">
+                    {visibleMarkets.map((market: LiveMarket) => {
+                      const signal = signals.get(market.id);
+                      return signal ? (
+                        <MarketCard
+                          feed={controller.derived(market.asset, now)}
+                          key={market.id}
+                          market={market}
+                          onSelect={() => setSelectedMarketId(market.id)}
+                          remaining={(market.endTime - now) / 1000}
+                          selected={selectedMarket?.id === market.id}
+                          signal={signal}
+                        />
+                      ) : null;
+                    })}
+                  </div>
+                ) : (
+                  <EmptyState
+                    title={status.lastRestAt === null ? "Connecting to Polymarket" : "No live windows right now"}
+                    detail="Discovery runs every 15 s; nothing is fabricated while waiting."
+                  />
+                )}
+                {selectedMarket && selectedSignal ? (
+                  <SignalPanel
+                    disabled={Boolean(engine.halt)}
+                    feed={controller.derived(selectedMarket.asset, now)}
+                    market={selectedMarket}
+                    now={now}
+                    onBuy={manualBuy}
+                    signal={selectedSignal}
+                    stakeUsd={paperConfig.stakeUsd}
+                  />
+                ) : null}
+              </section>
+              <section className="dashboard-grid">
+                <article className="panel chart-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <div className="eyebrow">PAPER EQUITY</div>
+                      <h3>Equity curve</h3>
+                    </div>
+                  </div>
+                  <div className="chart-wrap">
+                    <EquityChart values={equitySeries} color={equity >= account.startingCash ? "#6cf2c4" : "#ff7d8a"} />
+                  </div>
+                </article>
+                <article className="panel positions-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <div className="eyebrow">EXPOSURE</div>
+                      <h3>
+                        Open positions <span className="heading-muted">/ {account.positions.length}</span>
+                      </h3>
+                    </div>
+                  </div>
+                  <div className="positions-table-wrap">
+                    <table className="positions-table">
+                      <thead>
+                        <tr>
+                          <th>MARKET</th>
+                          <th>SIDE</th>
+                          <th>COST</th>
+                          <th>BID</th>
+                          <th>P&amp;L</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {account.positions.length ? (
+                          account.positions.map((position) => {
+                            const market = markets.get(position.marketId);
+                            const bid = market ? (position.side === "UP" ? market.upBid : market.downBid) : position.mark;
+                            const pnl = bid === null ? null : bid * position.shares - position.totalCost;
+                            return (
+                              <tr key={position.id}>
+                                <td>
+                                  <strong>{position.marketLabel}</strong>
+                                  <small>{position.endTime > now ? `${timeLeft((position.endTime - now) / 1000)} left` : "awaiting resolution"}</small>
+                                </td>
+                                <td>
+                                  <span className={`side-chip ${position.side === "UP" ? "up" : "down"}`}>{position.side}</span>
+                                </td>
+                                <td>{cents(position.avgEntry)}</td>
+                                <td>{cents(bid)}</td>
+                                <td className={pnl === null ? "text-muted" : pnl >= 0 ? "text-positive" : "text-negative"}>{signedDollars(pnl)}</td>
+                              </tr>
+                            );
+                          })
+                        ) : (
+                          <tr>
+                            <td className="empty-row" colSpan={5}>
+                              Flat.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </article>
+              </section>
+              <section className="dashboard-grid lower">
+                <article className="panel feed-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <div className="eyebrow">AUDIT TRAIL</div>
+                      <h3>Engine feed</h3>
+                    </div>
+                  </div>
+                  {logs.length ? (
+                    <div className="feed-list">
+                      {logs.map((log) => (
+                        <div className="feed-row" key={log.id}>
+                          <span className="feed-time">{log.time}</span>
+                          <span className={`feed-marker ${log.tone}`} />
+                          <div>
+                            <strong>{log.message}</strong>
+                            <small>{log.detail}</small>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <EmptyState title="No events yet" detail="Fills, misses, settlements, halts, and feed warnings appear here." />
+                  )}
+                </article>
+                <article className="panel risk-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <div className="eyebrow">FEEDS</div>
+                      <h3>Settlement anchoring</h3>
+                    </div>
+                  </div>
+                  <div className="positions-table-wrap">
+                    <table className="positions-table">
+                      <thead>
+                        <tr>
+                          <th>ASSET</th>
+                          <th>SOURCE</th>
+                          <th>BASIS</th>
+                          <th>VOL/MIN</th>
+                          <th>AGE</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...controller.feeds.keys()].sort().map((asset) => {
+                          const feed = controller.derived(asset, now);
+                          return (
+                            <tr key={asset}>
+                              <td>
+                                <strong>{asset}</strong>
+                              </td>
+                              <td>{feed.spotSource}</td>
+                              <td>{feed.basisBps === null ? "—" : `${feed.basisBps.toFixed(1)}bp`}</td>
+                              <td>{feed.sigmaPerSqrtSecond ? `${(feed.sigmaPerSqrtSecond * Math.sqrt(60) * 10_000).toFixed(1)}bp` : "—"}</td>
+                              <td>{formatAge(feed.spotTimestamp, now)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </article>
+              </section>
+            </>
+          )}
+          <footer className="terminal-footer">
+            <span>
+              <Terminal size={14} />
+              Same engine in browser and headless runner
+            </span>
+            <span>
+              <ShieldCheck size={14} />
+              Paper settles on official outcomes only
+            </span>
+            <span className="footer-spacer" />
+            <span>No strategy is guaranteed to profit. Validate on recorded data first.</span>
+          </footer>
+        </div>
+      </section>
+      {accountDialogOpen ? (
+        <AccountConnectModal
+          connection={connection}
+          error={accountError}
+          loading={accountLoading}
+          onChange={(field, value) => setConnection((current) => ({ ...current, [field]: value }))}
+          onClose={() => setAccountDialogOpen(false)}
+          onSubmit={() => void connectLive()}
+          serverKeyConfigured={serverKeyConfigured}
+        />
+      ) : null}
+      {runnerOpen ? <RunnerSetupModal onClose={() => setRunnerOpen(false)} /> : null}
+    </main>
+  );
 }

@@ -1,29 +1,30 @@
 # Setup
 
-## Development
+Requirements: Node.js 22.13+ and pnpm 11.25.0 (`corepack enable && corepack prepare pnpm@11.25.0 --activate`).
 
-1. Install Node.js 22 or later.
-2. Run pnpm install.
-3. Copy .env.example to .env only if a server-side adapter is being developed.
-4. Start with pnpm run dev.
-5. Open the dashboard and keep PAPER mode selected.
+```bash
+pnpm install
+pnpm run check        # typecheck + lint + prettier + tests
+pnpm run dev          # dashboard
+pnpm run headless -- --auto --record   # 24/7 paper/shadow engine, no browser
+pnpm run replay -- data/replay-YYYY-MM-DD.jsonl --walk-forward
+```
 
-## Checks
+## Environment (`.env.local`, never committed)
 
-    pnpm exec tsc --noEmit
-    pnpm run lint
-    pnpm run build
+| Variable | Purpose |
+| --- | --- |
+| `POLYMARKET_LIVE_SESSION_SECRET` | 64 hex chars. Seals live-session and daily-risk cookies. Required for live. |
+| `POLYMARKET_TELEGRAM_SESSION_SECRET` | 64 hex chars. Seals the Telegram cookie. |
+| `POLYMARKET_LIVE_ALLOWED_USER_ID` | Owner id on hosted deployments. |
+| `POLYMARKET_LIVE_ALLOW_LOCALHOST` | `true` only on a trusted single-user machine; enables loopback owner access. |
+| `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE` | Server-held signer (recommended). The key never reaches the browser. |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Alerts from the headless runner. |
 
-## Before live credentials
+Generate secrets with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
 
-Do not add a private key to client code, NEXT_PUBLIC variables, localStorage, query strings, screenshots, or logs. Live mode should be enabled only by a backend readiness check that confirms credentials, wallet/account resolution, balance, market data, user stream, risk configuration, and reconciliation health.
+## Before trading real money
 
-## Official surfaces
-
-- Gamma: https://gamma-api.polymarket.com
-- CLOB: https://clob.polymarket.com
-- Data API: https://data-api.polymarket.com
-- Relayer: https://relayer-v2.polymarket.com
-- Public market WebSocket: wss://ws-subscriptions-clob.polymarket.com/ws/market
-- Authenticated user WebSocket: wss://ws-subscriptions-clob.polymarket.com/ws/user
-- RTDS: wss://ws-live-data.polymarket.com
+1. Run the headless runner with `--record` for days, not hours.
+2. `pnpm run replay -- data/*.jsonl --walk-forward` and require, out of sample: positive realized edge with a confidence interval that excludes zero, a model (or posterior) Brier score below the book's, and non-negative 5 s markouts.
+3. Start live with the default policy (LOCK tier, $25 max trade, 5% daily stop, BTC/ETH/SOL/XRP) and compare live fills against the paper engine's simulated fills.

@@ -45,3 +45,6 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
+
+# headless runner state and recordings
+/data/

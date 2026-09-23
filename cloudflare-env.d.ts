@@ -6,5 +6,8 @@ declare namespace Cloudflare {
     POLYMARKET_LIVE_ALLOWED_USER_ID?: string;
     POLYMARKET_LIVE_SESSION_SECRET?: string;
     POLYMARKET_TELEGRAM_SESSION_SECRET?: string;
+    POLYMARKET_PRIVATE_KEY?: string;
+    POLYMARKET_WALLET_ADDRESS?: string;
+    POLYMARKET_SIGNATURE_TYPE?: string;
   }
 }
