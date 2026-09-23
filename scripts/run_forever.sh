@@ -9,13 +9,17 @@ set -u
 mode="${1:-headless}"
 shift || true
 
+if [ "$mode" = "headless" ]; then
+  exec pnpm run headless:supervised -- "$@"
+fi
+
 while true; do
   if [ "$mode" = "web" ]; then
     echo "Starting the dashboard on http://127.0.0.1:8787"
     pnpm run start -- --port 8787
   else
-    echo "Starting the headless engine (state and recordings in ./data)"
-    pnpm run headless -- --auto --record "$@"
+    echo "Unknown mode: $mode (use headless or web)" >&2
+    exit 2
   fi
   status=$?
   echo "Process exited with code ${status}. Restarting in 5 seconds..."

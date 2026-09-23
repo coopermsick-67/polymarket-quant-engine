@@ -9,24 +9,37 @@ import { readFileSync } from "node:fs";
 import { fetchResolutions } from "../app/lib/polymarket-data";
 import { parseReplayJsonl, runReplay, walkForward, type ReplayReport } from "../app/lib/replay";
 import type { MarketSnapshot, Side } from "../app/lib/signal";
+import { openRecordingFile } from "./recording-store";
 
 const args = process.argv.slice(2);
 const option = (name: string, fallback: number) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 && args[index + 1] ? Number(args[index + 1]) : fallback;
 };
-const files = args.filter((arg) => arg.endsWith(".jsonl"));
+const files = args.filter((arg) => /\.(?:jsonl|sqlite|sqlite\.gz)$/.test(arg));
 if (!files.length) {
-  console.error("usage: pnpm run replay -- <recording.jsonl> [--latency ms] [--stake usd] [--min-edge p] [--model-weight w] [--walk-forward]");
+  console.error("usage: pnpm run replay -- <recording.jsonl|recording.sqlite|recording.sqlite.gz> [more files] [--latency ms] [--stake usd] [--walk-forward]");
   process.exit(1);
 }
 
 const snapshots: MarketSnapshot[] = [];
 const outcomes = new Map<string, Side>();
 for (const file of files) {
-  const parsed = parseReplayJsonl(readFileSync(file, "utf8"));
-  snapshots.push(...parsed.snapshots);
-  for (const [id, outcome] of parsed.outcomes) outcomes.set(id, outcome);
+  if (file.endsWith(".jsonl")) {
+    const parsed = parseReplayJsonl(readFileSync(file, "utf8"));
+    snapshots.push(...parsed.snapshots);
+    for (const [id, outcome] of parsed.outcomes) outcomes.set(id, outcome);
+  } else {
+    const recording = await openRecordingFile(file);
+    try {
+      const rows = recording.db.prepare("SELECT snapshot_json FROM snapshots ORDER BY at").all() as { snapshot_json: string }[];
+      for (const row of rows) snapshots.push(JSON.parse(row.snapshot_json) as MarketSnapshot);
+      const resolutions = recording.db.prepare("SELECT market_id, outcome FROM resolutions").all() as { market_id: string; outcome: Side }[];
+      for (const row of resolutions) outcomes.set(row.market_id, row.outcome);
+    } finally {
+      await recording.close();
+    }
+  }
 }
 const marketIds = [...new Set(snapshots.map((snapshot) => snapshot.marketId))];
 const missing = marketIds.filter((id) => !outcomes.has(id));

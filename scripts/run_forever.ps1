@@ -11,13 +11,18 @@ if (-not $pnpm) {
   exit 1
 }
 
+if ($Mode -eq "headless") {
+  & $pnpm run headless:supervised
+  exit $LASTEXITCODE
+}
+
 while ($true) {
   if ($Mode -eq "web") {
     Write-Host "Starting the dashboard on http://127.0.0.1:8787"
     & $pnpm run start -- --port 8787
   } else {
-    Write-Host "Starting the headless engine (state and recordings in .\data)"
-    & $pnpm run headless -- --auto --record
+    Write-Error "Unknown mode '$Mode'. Use headless or web."
+    exit 2
   }
   $exitCode = $LASTEXITCODE
   Write-Warning "Process exited with code $exitCode. Restarting in 5 seconds..."

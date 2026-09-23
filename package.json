@@ -13,11 +13,16 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "typecheck": "tsc --noEmit -p .",
     "test": "node --import tsx --test tests/*.test.ts",
+    "test:e2e": "RUN_DASHBOARD_E2E=1 node --import tsx --test tests/dashboard-e2e.test.ts",
     "format": "prettier --write \"app/**/*.{ts,tsx}\" \"scripts/*.ts\" \"tests/**/*.ts\"",
     "format:check": "prettier --check \"app/**/*.{ts,tsx}\" \"scripts/*.ts\" \"tests/**/*.ts\"",
     "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm test",
     "headless": "node --import tsx scripts/headless.ts",
-    "replay": "node --import tsx scripts/replay.ts"
+    "headless:supervised": "node --import tsx scripts/headless-supervisor.ts",
+    "runner:status": "node --import tsx scripts/runner-status.ts",
+    "replay": "node --import tsx scripts/replay.ts",
+    "backfill": "node --import tsx scripts/backfill.ts",
+    "report": "node --import tsx scripts/nightly-report.ts"
   },
   "dependencies": {
     "@polymarket/clob-client-v2": "1.1.0",
@@ -39,6 +44,7 @@
     "@vitejs/plugin-rsc": "0.5.26",
     "eslint": "9.39.4",
     "eslint-config-next": "16.3.4",
+    "playwright": "^1.63.0",
     "prettier": "^3.9.6",
     "react-server-dom-webpack": "19.2.6",
     "tailwindcss": "4.2.1",

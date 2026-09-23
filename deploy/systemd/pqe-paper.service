@@ -1,0 +1,31 @@
+[Unit]
+Description=Polymarket Quant Engine paper recorder
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pqe
+Group=pqe
+WorkingDirectory=/opt/polymarket-quant-engine
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=TZ=UTC
+Environment=PQE_DATA_DIR=/var/lib/pqe
+EnvironmentFile=-/etc/pqe-paper.env
+ExecStart=/usr/bin/env corepack pnpm run headless:supervised -- --data-dir /var/lib/pqe
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=40
+UMask=0077
+StateDirectory=pqe
+StateDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pqe
+
+[Install]
+WantedBy=multi-user.target

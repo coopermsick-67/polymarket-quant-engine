@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the quant evidence job nightly
+
+[Timer]
+OnCalendar=*-*-* 02:17:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+Unit=pqe-nightly.service
+
+[Install]
+WantedBy=timers.target

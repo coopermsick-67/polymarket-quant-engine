@@ -1,7 +1,7 @@
 "use client";
 
-import { AlertTriangle, Check, LockKeyhole, Pause, Play, RefreshCw, ShieldCheck, SlidersHorizontal, Wallet, X, Zap } from "lucide-react";
-import type { LiveRiskConfig } from "../lib/live-risk";
+import { AlertTriangle, Check, LockKeyhole, RefreshCw, ShieldCheck, SlidersHorizontal, Wallet, X, Zap } from "lucide-react";
+import { LIVE_EXECUTION_DISABLED_REASON, type LiveRiskConfig } from "../lib/live-risk";
 import type { Horizon, SignalParams } from "../lib/signal";
 import { dollars, percentage, points } from "./format";
 
@@ -22,20 +22,13 @@ export type LiveRiskPatch = Omit<Partial<LiveRiskConfig>, "signal"> & { signal?:
 
 type Props = {
   session: LiveSessionState | null;
-  running: boolean;
-  paused: boolean;
-  consent: boolean;
   risk: LiveRiskConfig;
   marketCount: number;
-  candidateCount: number;
   status: LiveExecutionStatus;
   now: number;
   onLink: () => void;
-  onStart: () => void;
-  onPause: () => void;
   onKill: () => void;
   onRefresh: () => void;
-  onConsentChange: (checked: boolean) => void;
   onRiskChange: (patch: LiveRiskPatch) => void;
 };
 
@@ -69,27 +62,9 @@ const Range = ({
   </label>
 );
 
-export default function LiveExecutionPanel({
-  session,
-  running,
-  paused,
-  consent,
-  risk,
-  marketCount,
-  candidateCount,
-  status,
-  now,
-  onLink,
-  onStart,
-  onPause,
-  onKill,
-  onRefresh,
-  onConsentChange,
-  onRiskChange,
-}: Props) {
+export default function LiveExecutionPanel({ session, risk, marketCount, status, now, onLink, onKill, onRefresh, onRiskChange }: Props) {
   const balance = session?.balance ?? null;
   const unitCap = balance === null ? null : Math.min(balance * risk.unitBalancePct * risk.unitsPerTrade, risk.maxTradeUsd);
-  const canStart = Boolean(session?.connected && consent && !running);
   const ttl = session?.expiresAt ? Math.max(0, Math.floor((session.expiresAt - now) / 1000)) : null;
   const toggle = <T extends string>(list: T[], item: T) => (list.includes(item) ? list.filter((value) => value !== item) : [...list, item]);
 
@@ -98,11 +73,12 @@ export default function LiveExecutionPanel({
       <div className="section-heading">
         <div>
           <div className="eyebrow">LIVE EXECUTOR</div>
-          <h2>Limit-priced, server-verified order runner</h2>
+          <h2>Live order submission is disabled</h2>
           <p className="section-subtitle">
-            Every order is a fill-and-kill LIMIT at the highest price that still clears the edge floor after the fee curve. The server rebuilds the market from
-            Gamma, the CLOB and the official price to beat, checks your positions, exposure and daily loss, and never retries an uncertain submission.
+            The browser does not run an order loop. Buys and sells remain blocked until the out-of-sample strategy and execution safety evidence gates pass.
+            Account reads and an explicit cancel-all request remain available for reconciliation.
           </p>
+          <p className="live-disabled-note">{LIVE_EXECUTION_DISABLED_REASON}</p>
         </div>
         <span className={`result-badge ${session?.connected ? "ready" : "waiting"}`}>
           <span className={`status-dot ${session?.connected ? "status-ready" : "status-locked"}`} />
@@ -116,10 +92,10 @@ export default function LiveExecutionPanel({
             <LockKeyhole size={23} />
           </div>
           <div>
-            <h3>Link a wallet to arm live execution</h3>
+            <h3>Link an account to view its status</h3>
             <p>
-              Preferred: configure POLYMARKET_PRIVATE_KEY and POLYMARKET_WALLET_ADDRESS on the server so the key never enters the browser. A browser-entered key
-              is sealed in an encrypted, 15-minute, HttpOnly session.
+              Account linking enables balance and position reads plus an explicit cancel-all request. It does not enable order placement. If you link an
+              account, configure POLYMARKET_PRIVATE_KEY and POLYMARKET_WALLET_ADDRESS on the server so the key never enters the browser.
             </p>
             <div className="gate-list">
               <div>
@@ -173,11 +149,11 @@ export default function LiveExecutionPanel({
               <div className="panel-heading">
                 <div>
                   <div className="eyebrow">EXECUTION CONTROL</div>
-                  <h3>{running ? (paused ? "Live runner paused" : "Live runner active") : "Live runner standby"}</h3>
+                  <h3>Order placement blocked</h3>
                 </div>
-                <span className={`feed-live ${running && !paused ? "live-active" : ""}`}>
-                  <span className={`status-dot ${running && !paused ? "status-ready" : paused ? "status-warning" : "status-locked"}`} />
-                  {running ? (paused ? "PAUSED" : "ARMED") : "STANDBY"}
+                <span className="feed-live">
+                  <span className="status-dot status-locked" />
+                  DISABLED
                 </span>
               </div>
               <div className="live-control-summary">
@@ -185,30 +161,16 @@ export default function LiveExecutionPanel({
                   <b>{marketCount}</b> active markets
                 </span>
                 <span>
-                  <b>{candidateCount}</b> candidates now
+                  <b>{session.openOrders}</b> open CLOB orders
                 </span>
                 <span>
                   <b>{risk.allowedAssets.join(" ")}</b>
                 </span>
               </div>
-              <label className="live-consent">
-                <input checked={consent} onChange={(event) => onConsentChange(event.target.checked)} type="checkbox" />
-                <span>
-                  I understand this places real orders with the linked wallet. Limit prices cap the price paid; they do not guarantee a fill or a profit.
-                </span>
-              </label>
               <div className="live-actions">
-                <button className="button-primary" disabled={!canStart} onClick={onStart} type="button">
-                  <Play fill="currentColor" size={14} />
-                  {running ? "RUNNING" : "START LIVE"}
-                </button>
-                <button className="button-secondary" disabled={!running} onClick={onPause} type="button">
-                  <Pause size={14} />
-                  {paused ? "RESUME" : "PAUSE"}
-                </button>
-                <button className="button-secondary" disabled={running} onClick={onRefresh} type="button">
+                <button className="button-secondary" onClick={onRefresh} type="button">
                   <RefreshCw size={14} />
-                  REFRESH
+                  REFRESH ACCOUNT
                 </button>
                 <button className="button-danger" onClick={onKill} type="button">
                   <Zap size={14} />
@@ -407,9 +369,9 @@ export default function LiveExecutionPanel({
               </div>
             ) : (
               <div className="live-status-row">
-                <span className="status-dot status-ready" />
-                <strong>{status.lastAction || "No live order attempted"}</strong>
-                <span>{status.lastDetail || "Start remains locked until you confirm the risk notice."}</span>
+                <span className="status-dot status-locked" />
+                <strong>{status.lastAction || "Live buys and sells are disabled"}</strong>
+                <span>{status.lastDetail || "No browser order runner is active. Review the evidence gates before enabling any live path."}</span>
                 <b>{status.lastLatencyMs === null ? "—" : `${status.lastLatencyMs} ms`}</b>
               </div>
             )}

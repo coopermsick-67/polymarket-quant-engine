@@ -497,6 +497,7 @@ button { color: inherit; }
 }
 
 .live-executor { display: flex; flex-direction: column; gap: 18px; }
+.live-disabled-note { background: rgba(255, 194, 93, 0.08); border: 1px solid rgba(255, 194, 93, 0.24); border-radius: 6px; color: var(--amber); font-size: 11px; line-height: 1.45; margin: 10px 0 0; padding: 9px 11px; }
 .live-lock-panel { align-items: flex-start; display: flex; gap: 18px; padding: 22px; }
 .live-lock-panel h3 { margin: 0 0 7px; }
 .live-lock-panel p { color: #8392a4; font-size: 12px; line-height: 1.55; margin: 0 0 16px; max-width: 720px; }
