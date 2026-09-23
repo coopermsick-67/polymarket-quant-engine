@@ -18,7 +18,7 @@ S_now      = exchange_now + basis          basis = median(stream(t) − exchange
 σ          = EWMA of 1 s exchange returns, blended with Garman-Klass 5m candles on a cold start
 P(UP)      = Φ( ln(S_now / K) / (σ √τ) )   evaluated at σ·0.7, σ, σ·1.3; the worst case for each side is used
 P_noisy    = ε + (1 − 2ε) · P(UP)          ε = resolution noise (0.02)
-posterior  = logistic( w · logit(P_noisy) + (1 − w) · logit(book mid) )   w = model weight (0.5)
+posterior  = logistic( w · logit(P_noisy) + (1 − w) · logit(book mid) )   w = model weight (0.3)
 ```
 
 Entry cost is the depth-walked average price plus slippage plus the fee curve `rate × (p(1 − p))^exponent` per share from each market's `feeSchedule` (matches the official client's `adjustBuyAmountForFees`; 1.75¢/share at 50¢ under rate 0.07, exponent 1). The order's limit is the highest tick at which the worst-case posterior still beats the all-in cost by the edge floor.
@@ -30,13 +30,15 @@ Entry cost is the depth-walked average price plus slippage plus the fee curve `r
 - **Not** from chart patterns. EMA/RSI/candle indicators are shown for context only; they were a hand-tuned +7.5pt nudge in the old engine and never earned a place in fair value.
 - **Not** from disagreeing with the book for its own sake. Against a fairly priced book the engine makes zero trades after fees (tested).
 
-## Evidence so far
+## Evidence so far (read this before trading)
 
-- Simulated: against a book quoting the right model on a 20 s-old price, 400 markets → 199 fills, +10pt realized edge, positive 5 s markouts. Against a fair book → 0 trades.
-- Live paper runs on 2026-09-23 found and fixed six defects: marks to zero on emptied books, a false halt, Gamma's 20-row default page, a WebSocket error recursion, stream-silence handling, and startup trades before volatility had warmed up. The first two runs lost money; the trades were few, taken during warm-up, and partly on the wrong (TWAP) model. They are not evidence of edge in either direction.
-- On 62 real checkpoints, the raw model's Brier score (0.1026) was slightly worse than the book's (0.0998), while the model-plus-book posterior (0.0950) beat both. That is the case for trading the posterior, not the raw model.
+- **Simulated.** Against a book quoting the right model on a 20 s-old price, 400 markets gave 199 fills, +10pt realized edge, and positive 5 s markouts. Against a fair book: 0 trades. This proves the machinery works, not that real books are beatable.
+- **Live paper, 2026-09-23 (~2 hours, 200 markets, 184 officially resolved).** Three headless runs; each hit the 5% daily-loss halt. The runs also found and fixed nine defects (see git history).
+- **Calibration on the cleanest run (178 checkpoints, point model, anchored feeds).** Brier: model 0.1035, model+book posterior 0.0831, **book 0.0720**. The model was underconfident: when it said 76%, the outcome happened 96% of the time. Paper realized edge was −8pt per trade against +9pt predicted (34 trades).
+- **Pooled replay over all recordings.** 75 trades, realized edge −7pt against +25pt predicted, net −$444 on $25 stakes. The best walk-forward setting made +$27 on 36 out-of-sample trades, which is statistically indistinguishable from zero, and still lost to the book on calibration.
+- **Diagnostics.** Realized moves to settlement are about 1.0× the model's σ√τ, so volatility scale is roughly right. But settlement landed on average 0.4–0.5σ above the model's spot, in an hour when all eight assets rose together, so a correlated drift and a model level bias cannot yet be told apart. Coinbase 1 s volatility is inflated by microstructure noise for SOL and XRP (1 s vs 30 s: 6.7 vs 4.4 and 15.2 vs 12.6 bp/min), though not for BTC.
 
-**Status: unproven.** Record with the headless runner for days, then run `pnpm run replay -- data/*.jsonl --walk-forward`. Promote to live only if, out of sample, realized edge is positive with a confidence interval excluding zero, the posterior's Brier score beats the book's, and 5 s markouts are non-negative.
+**Conclusion: the book is better calibrated than this model.** Defaults now weight the book at 70% (model weight 0.3). Every apparent edge so far has been model error, not mispricing. Do not trade live until recorded data shows the posterior beating the book out of sample.
 
 ## Not built
 

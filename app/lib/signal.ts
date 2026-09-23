@@ -83,7 +83,7 @@ export type SignalParams = {
 export const DEFAULT_SIGNAL_PARAMS: SignalParams = {
   budgetUsd: 25,
   minEdge: 0.03,
-  modelWeight: 0.5,
+  modelWeight: 0.3,
   volUncertainty: 0.3,
   slippageBps: 10,
   minEntryPrice: 0.05,

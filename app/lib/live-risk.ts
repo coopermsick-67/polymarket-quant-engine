@@ -27,7 +27,7 @@ export type LiveRiskConfig = EarlyExitPolicy & {
 
 export const DEFAULT_LIVE_RISK: LiveRiskConfig = {
   ...DEFAULT_LIVE_EARLY_EXIT,
-  signal: { ...DEFAULT_SIGNAL_PARAMS, minEdge: 0.04, modelWeight: 0.5 },
+  signal: { ...DEFAULT_SIGNAL_PARAMS, minEdge: 0.04, modelWeight: 0.3 },
   unitBalancePct: 0.01,
   unitsPerTrade: 1,
   kellyFraction: 0.25,
