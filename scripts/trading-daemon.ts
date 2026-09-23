@@ -325,6 +325,7 @@ async function statusPayload() {
     process: "running",
     readiness,
     mode: "paper",
+    referencePolicy: "Coinbase candle-open estimates are paper-only fallbacks; live execution still requires a Polymarket reference.",
     tradingState: tradingStateSnapshot(stale, killed, paused, riskHalted),
     lastCycleAt: state.lastCycleAt,
     lastHealthyDataAt: state.lastHealthyDataAt,
@@ -695,7 +696,7 @@ function closeMarketStreams(): void {
 function marketHasFreshInputs(market: LiveMarket, now: number): boolean {
   return market.startTime !== null && market.startTime <= now && market.remaining >= 30 &&
     market.upAsk !== null && market.upBid !== null && market.downAsk !== null && market.downBid !== null &&
-    marketDataFreshnessIssue(market, now) === null;
+    marketDataFreshnessIssue(market, now, { allowCoinbaseReferenceEstimate: true }) === null;
 }
 
 async function resolveExpiredPositions(now: number): Promise<void> {
@@ -820,10 +821,10 @@ async function runCycle(): Promise<void> {
     const sizingEquity = accountEquity(state.account, marketMap);
     latestSignals = usableMarkets
       .map((market) => {
-        const preliminary = analyzeMarketSignal(market, costs, paperMinBetUsd, paperMinNetEdge);
+        const preliminary = analyzeMarketSignal(market, costs, paperMinBetUsd, paperMinNetEdge, { allowCoinbaseReferenceEstimate: true });
         const stake = paperBetSize(sizingEquity, state.account.cash);
         const signal = stake.usd >= paperMinBetUsd
-          ? analyzeMarketSignal(market, costs, stake.usd, paperMinNetEdge)
+          ? analyzeMarketSignal(market, costs, stake.usd, paperMinNetEdge, { allowCoinbaseReferenceEstimate: true })
           : preliminary;
         return {
           marketId: market.id,
@@ -899,10 +900,10 @@ async function runCycle(): Promise<void> {
         const candidates = usableMarkets
           .filter((market) => !state.account.positions.some((position) => position.marketId === market.id))
           .map((market) => {
-            const preliminary = analyzeMarketSignal(market, costs, paperMinBetUsd, paperMinNetEdge);
+            const preliminary = analyzeMarketSignal(market, costs, paperMinBetUsd, paperMinNetEdge, { allowCoinbaseReferenceEstimate: true });
             const stake = paperBetSize(currentEquity, state.account.cash);
             const signal = stake.usd >= paperMinBetUsd
-              ? analyzeMarketSignal(market, costs, stake.usd, paperMinNetEdge)
+              ? analyzeMarketSignal(market, costs, stake.usd, paperMinNetEdge, { allowCoinbaseReferenceEstimate: true })
               : preliminary;
             return { market, signal, stakeUsd: stake.usd, stakePct: currentEquity > 0 ? stake.usd / currentEquity : 0 };
           })
@@ -914,7 +915,11 @@ async function runCycle(): Promise<void> {
         if (candidate) {
           const lastEntryAt = state.lastEntryByMarket[candidate.market.id] ?? 0;
           if (!stopping && !shutdownController.signal.aborted && now - lastEntryAt >= 15_000) {
-            const result = buyPaper(state.account, candidate.market, candidate.signal.action as PaperSide, candidate.stakeUsd, costs, "headless paper auto engine", now);
+            const referenceLabel = candidate.market.referenceSource === "COINBASE ESTIMATE"
+              ? "Coinbase opening-reference estimate (paper only)"
+              : "Polymarket opening reference";
+            const result = buyPaper(state.account, candidate.market, candidate.signal.action as PaperSide, candidate.stakeUsd, costs,
+              `headless paper auto engine; ${referenceLabel}`, now);
             if (result.fill) {
               state.account = markAccount(result.account, marketMap, now);
               state.lastEntryByMarket[candidate.market.id] = now;

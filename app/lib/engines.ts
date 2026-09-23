@@ -718,9 +718,16 @@ const newestCompletedCandleAt = (history: MarketCandle[], barSeconds: number, no
   return Math.max(...candles.map((candle) => candle.timestamp + barSeconds * 1000));
 };
 
-export const marketDataFreshnessIssue = (market: LiveMarket, now = market.sourceTimestamp || Date.now()): string | null => {
+export const marketDataFreshnessIssue = (
+  market: LiveMarket,
+  now = market.sourceTimestamp || Date.now(),
+  // Opt in only for the paper daemon; browser and live callers remain strict.
+  options: { allowCoinbaseReferenceEstimate?: boolean } = {},
+): string | null => {
   if (market.reference === null || market.reference <= 0 || market.spot === null || market.spot <= 0) return "Missing live spot or market reference.";
-  if (market.referenceSource !== "POLYMARKET") return "Waiting for the Polymarket opening reference. Coinbase candle opens are only a proxy for the Chainlink settlement price.";
+  if (market.referenceSource !== "POLYMARKET" && !(options.allowCoinbaseReferenceEstimate && market.referenceSource === "COINBASE ESTIMATE")) {
+    return "Waiting for the Polymarket opening reference. Coinbase candle opens are only a proxy for the Chainlink settlement price.";
+  }
   if (market.chartUpdatedAt === null || now - market.chartUpdatedAt > 120_000) return "Chart feed is stale; waiting for a fresh candle snapshot.";
   for (const orderBook of [market.upBook, market.downBook]) {
     if (!orderBook || orderBook.timestamp === null || now - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - now > 30_000) {
@@ -852,7 +859,13 @@ const passSignal = (reason: string, stats5m: ChartTrendStats | null = null, stat
   estimatedFill: null,
 });
 
-export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budget = 25, minNetEdge = 0.04): MarketSignal => {
+export const analyzeMarketSignal = (
+  market: LiveMarket,
+  costs: CostConfig,
+  budget = 25,
+  minNetEdge = 0.04,
+  options: { allowCoinbaseReferenceEstimate?: boolean } = {},
+): MarketSignal => {
   const now = market.sourceTimestamp || Date.now();
   const stats5m = chartTrendStats(market.chart5m, 300, now);
   const stats15m = chartTrendStats(market.chart15m, 900, now);
@@ -870,7 +883,7 @@ export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budge
     const comparison = comparePrices(fairUp);
     return passSignal(reason, stats5m, stats15m, fairUp, read, comparison.upEdge, comparison.downEdge);
   };
-  const freshnessIssue = marketDataFreshnessIssue(market, now);
+  const freshnessIssue = marketDataFreshnessIssue(market, now, options);
   if (freshnessIssue) return pass(freshnessIssue);
 
   if (!stats5m || !stats15m) {
@@ -910,6 +923,7 @@ export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budge
   if (edge < requiredEdge) return { ...pass(`Best price edge is ${Math.round(edge * 1000) / 10}% on ${side}, below the ${Math.round(requiredEdge * 1000) / 10}% entry floor.`, fairUp), confidence, upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill };
 
   const locked = edge >= Math.max(0.08, requiredEdge * 2) && Math.abs(target) >= 0.5 && Math.abs(context) >= 0.25;
+  const referenceLabel = market.referenceSource === "COINBASE ESTIMATE" ? "Coinbase opening-reference estimate (paper only)" : "Polymarket reference";
   return {
     action: side,
     tier: locked ? "LOCK" : "ENTRY",
@@ -927,7 +941,7 @@ export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budge
     score15m: stats15m.score,
     rsi5m: stats5m.rsi,
     rsi15m: stats15m.rsi,
-    reason: locked ? "5m and 15m trends align; a Polymarket reference, order-book depth, and the stricter net-edge gate pass. Probability remains uncalibrated." : "5m and 15m trends align; a Polymarket reference, order-book depth, and the net-edge gate pass. Probability remains uncalibrated.",
+    reason: locked ? `5m and 15m trends align; ${referenceLabel}, order-book depth, and the stricter net-edge gate pass. Probability remains uncalibrated.` : `5m and 15m trends align; ${referenceLabel}, order-book depth, and the net-edge gate pass. Probability remains uncalibrated.`,
     estimatedFill: fill,
   };
 };

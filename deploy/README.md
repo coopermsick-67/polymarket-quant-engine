@@ -126,7 +126,7 @@ The engine environment file contains the following paper-only settings. Defaults
 
 Edit the environment file only if you understand these simulated limits. Do not add wallet, Polymarket, or messaging secrets to it.
 
-The daemon saves state in `/var/lib/polymarket-quant-engine/paper-state.json`, checks the paper ledger's cash/positions/P&L reconciliation on every cycle, and halts new entries on stale data or risk-limit violations. A daily-loss halt blocks new entries; it does not force-close open positions, which can continue losing beyond the configured threshold. Kill, pause, and halt files are persistent until an operator changes them. Logs rotate daily and are compressed.
+The daemon saves state in `/var/lib/polymarket-quant-engine/paper-state.json`, checks the paper ledger's cash/positions/P&L reconciliation on every cycle, and halts new entries on stale data or risk-limit violations. When Gamma omits the opening reference, paper mode can use the matching Coinbase candle open as a labeled estimate; Polymarket's Chainlink TWAP may differ, and live execution still requires a Polymarket reference. A daily-loss halt blocks new entries; it does not force-close open positions, which can continue losing beyond the configured threshold. Kill, pause, and halt files are persistent until an operator changes them. Logs rotate daily and are compressed.
 
 Verify the daemon before installing Hermes:
 
