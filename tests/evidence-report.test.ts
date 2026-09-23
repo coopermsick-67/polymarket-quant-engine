@@ -34,6 +34,24 @@ const makeDailySample = () => {
       });
     }
   }
+  const boundaryMarketId = "cross-midnight-market";
+  const boundarySeries = byMarket.get(marketIds[0])!;
+  const boundaryStart = Date.UTC(2026, 0, 1, 23, 55);
+  const boundaryShift = boundaryStart - boundarySeries[0].startTime;
+  outcomes.set(boundaryMarketId, source.outcomes.get(marketIds[0])!);
+  for (const snapshot of boundarySeries) {
+    snapshots.push({
+      ...snapshot,
+      marketId: boundaryMarketId,
+      startTime: snapshot.startTime + boundaryShift,
+      endTime: snapshot.endTime + boundaryShift,
+      now: snapshot.now + boundaryShift,
+      spotTimestamp: snapshot.spotTimestamp === null ? null : snapshot.spotTimestamp + boundaryShift,
+      ticks: snapshot.ticks.map((tick) => ({ ...tick, timestamp: tick.timestamp + boundaryShift })),
+      up: { ...snapshot.up, timestamp: snapshot.up.timestamp === null ? null : snapshot.up.timestamp + boundaryShift },
+      down: { ...snapshot.down, timestamp: snapshot.down.timestamp === null ? null : snapshot.down.timestamp + boundaryShift },
+    });
+  }
   return { snapshots, outcomes };
 };
 
@@ -88,6 +106,15 @@ describe("evidence reports", () => {
         ),
       );
     }
+    const midnightFold = folds.find((fold) => fold.dayStart === Date.UTC(2026, 0, 2))!;
+    assert.equal(
+      midnightFold.train?.calibrationRows.some((row) => row.marketId === "cross-midnight-market"),
+      false,
+    );
+    assert.equal(
+      midnightFold.test?.calibrationRows.some((row) => row.marketId === "cross-midnight-market"),
+      false,
+    );
     const report = buildEvidenceReport({ snapshots, outcomes, folds, generatedAt: new Date("2026-01-10T00:00:00Z"), bootstrapRepetitions: 500 });
     assert.equal(report.sample.recordedDays, 4);
     assert.equal(report.sample.outOfSampleDays, 3);

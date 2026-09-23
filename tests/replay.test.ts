@@ -42,6 +42,13 @@ describe("replay backtester", () => {
     const result = walkForward(stale.snapshots, stale.outcomes, [{ minEdge: 0.02 }, { minEdge: 0.05 }], { latencyMs: 1_000 }, 0.6, 5);
     assert.ok(result.trainMarkets > result.testMarkets);
     assert.ok(result.test !== null && result.chosen !== null);
+    const trained = new Set(result.train!.calibrationRows.map((row) => row.marketId));
+    const tested = new Set(result.test!.calibrationRows.map((row) => row.marketId));
+    assert.equal(
+      [...tested].some((marketId) => trained.has(marketId)),
+      false,
+    );
+    assert.ok([...trained].every((marketId) => stale.snapshots.find((snapshot) => snapshot.marketId === marketId)!.endTime < result.cutoff));
   });
 
   it("round-trips JSONL and imports CSV", () => {

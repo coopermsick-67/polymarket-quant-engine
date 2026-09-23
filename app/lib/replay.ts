@@ -338,7 +338,8 @@ export const walkForwardByDay = (
   const folds: WalkForwardFold[] = [];
   for (let index = 1; index < days.length; index += 1) {
     const dayStart = days[index];
-    const trainSnapshots = snapshots.filter((snapshot) => snapshot.startTime < dayStart);
+    // A market that is still open at midnight has no outcome available for fitting yet.
+    const trainSnapshots = snapshots.filter((snapshot) => snapshot.endTime < dayStart);
     const testSnapshots = snapshots.filter((snapshot) => utcDayStart(snapshot.startTime) === dayStart);
     const trainMarketIds = new Set(trainSnapshots.map((snapshot) => snapshot.marketId));
     const testMarketIds = new Set(testSnapshots.map((snapshot) => snapshot.marketId));
@@ -380,7 +381,8 @@ export const walkForward = (
 ) => {
   const starts = [...new Map(snapshots.map((snapshot) => [snapshot.marketId, snapshot.startTime])).entries()].sort((left, right) => left[1] - right[1]);
   const cut = starts[Math.floor(starts.length * trainFraction)]?.[1] ?? Infinity;
-  const train = snapshots.filter((snapshot) => snapshot.startTime < cut);
+  // Exclude markets crossing the split: their outcomes are not known at fit time.
+  const train = snapshots.filter((snapshot) => snapshot.endTime < cut);
   const test = snapshots.filter((snapshot) => snapshot.startTime >= cut);
   const candidates = (grid.length ? grid : [{}]).map((params) => ({
     params,
