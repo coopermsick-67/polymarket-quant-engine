@@ -10,7 +10,11 @@ pnpm run headless -- --auto            # 24/7 paper/shadow engine and SQLite rec
 pnpm run backfill -- --data-dir data   # fill official outcomes and boundary prices into recordings
 pnpm run report -- --data-dir data     # daily OOS calibration, edge/markout CIs, and gate status
 pnpm run replay -- data/recordings/recording-YYYY-MM-DD.sqlite.gz --walk-forward
+pnpm exec playwright install chromium  # once, for the browser smoke test
+pnpm run test:e2e
 ```
+
+The Playwright smoke test relays external HTTP requests through its Node-side fixture handler and stubs the market WebSockets. It verifies market cards render, the disabled live-evidence gates display, and the page raises no runtime errors without depending on public API availability.
 
 ## Environment (`.env.local`, never committed)
 

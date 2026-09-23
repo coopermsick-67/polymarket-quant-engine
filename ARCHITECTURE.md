@@ -56,3 +56,5 @@ One engine, three hosts: the browser dashboard, the headless Node runner, and th
 - Browser: paper account, config, and ledger in `localStorage` (per-viewer conveniences). Recording kept in memory and exportable as JSONL.
 - Headless: `data/paper-state.json` (atomic rename), plus `data/recordings/recording-YYYY-MM-DD.sqlite` and gzip archives. SQLite contains replayable snapshots and the raw feed/event data used to audit them. Run `pnpm run backfill -- --data-dir data` to fetch official resolutions and price boundaries.
 - Live: new order submission is rejected server-side. Read-only account access and cancel-all remain available. The existing cookie and in-memory request map are not durable order idempotency or fill reconciliation; the live runner must move to a durable headless service before live use.
+
+CI also runs a Chromium smoke test with deterministic Gamma and CLOB fixtures. Playwright routes external HTTP requests through a Node-side handler and stubs the market WebSockets, so the browser does not depend on public API reachability.

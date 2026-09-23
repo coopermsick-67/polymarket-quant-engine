@@ -19,12 +19,14 @@ Pricing, paper/shadow trading, replay backtesting, and limit-priced live executi
 ```bash
 corepack enable && corepack prepare pnpm@11.25.0 --activate
 pnpm install
-pnpm run check                               # typecheck, lint, prettier, 81 tests
+pnpm run check                               # typecheck, lint, prettier, Node tests
 pnpm run dev                                 # dashboard
 pnpm run headless -- --auto                  # paper engine + daily SQLite recorder, no browser
 pnpm run backfill -- --data-dir data         # official outcomes and open/close prices
 pnpm run report -- --data-dir data           # walk-forward report, CIs, gates, optional Telegram
 pnpm run replay -- data/recordings/recording-*.sqlite* --walk-forward
+pnpm exec playwright install chromium        # once, for the browser smoke test
+pnpm run test:e2e                            # local market fixtures are relayed through Node
 ```
 
 Supervised 24/7: `bash scripts/run_forever.sh headless` (or `scripts/run_forever.ps1 headless` on Windows).

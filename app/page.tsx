@@ -57,11 +57,11 @@ import {
   type MarketSignal,
   type PaperAccount,
 } from "./lib/engines";
-import { normalizeLiveRiskConfig, type LiveRiskConfig, type LivePosition } from "./lib/live-risk";
+import { normalizeLiveRiskConfig, type LiveRiskConfig } from "./lib/live-risk";
 import { createEngineState, normalizePaperConfig, stepPaperEngine, type PaperConfig, type PaperEngineState } from "./lib/paper-engine";
 import { snapshotFromLiveMarket, type LiveMarket } from "./lib/polymarket-data";
 import { serializeResolutionLine, serializeSnapshotLine, type ReplayDataset } from "./lib/replay";
-import { evaluateExit, type MarketSnapshot, type Side } from "./lib/signal";
+import { type MarketSnapshot, type Side } from "./lib/signal";
 
 type View = "overview" | "paper" | "research" | "account" | "live";
 type LogItem = { id: string; time: string; message: string; detail: string; tone: Tone };
@@ -83,17 +83,6 @@ const liveRequest = (body: Record<string, unknown>, confirm = false) =>
     headers: { "Content-Type": "application/json", ...(confirm ? { "x-polymarket-live-confirm": "1" } : {}) },
     method: "POST",
   });
-
-const feedPayload = (snapshot: MarketSnapshot, sigma: number | null, volSamples: number) => ({
-  clientNow: snapshot.now,
-  spot: snapshot.spot,
-  spotTimestamp: snapshot.spotTimestamp,
-  spotSource: snapshot.spotSource,
-  basisBps: snapshot.basisBps,
-  sigmaPerSqrtSecond: sigma,
-  volSamples,
-  ticks: snapshot.ticks.slice(-120),
-});
 
 export default function Home() {
   const [view, setView] = useState<View>("overview");
@@ -205,9 +194,6 @@ export default function Home() {
   // ---- live execution ----------------------------------------------------
   const [liveRisk, setLiveRisk] = useState<LiveRiskConfig>(() => normalizeLiveRiskConfig(readStoredJson<Partial<LiveRiskConfig>>(LIVE_RISK_KEY)));
   const [liveSession, setLiveSession] = useState<LiveSessionState | null>(null);
-  const [liveRunning, setLiveRunning] = useState(false);
-  const [livePaused, setLivePaused] = useState(false);
-  const [liveConsent, setLiveConsent] = useState(false);
   const [liveStatus, setLiveStatus] = useState<LiveExecutionStatus>({ lastAction: "", lastDetail: "", lastError: "", lastLatencyMs: null });
   const [serverKeyConfigured, setServerKeyConfigured] = useState(false);
   useEffect(() => writeStoredJson(LIVE_RISK_KEY, liveRisk), [liveRisk]);
@@ -448,9 +434,9 @@ export default function Home() {
       setAccountDialogOpen(false);
       setView("live");
       appendLog(
-        "Live session armed",
-        `${payload.live.keySource === "server" ? "Server-held" : "Browser-entered"} key · ${dollars(payload.live.balance)} available.`,
-        "positive",
+        "Live account linked",
+        `${payload.live.keySource === "server" ? "Server-held" : "Browser-entered"} key · ${dollars(payload.live.balance)} available. Order placement remains disabled.`,
+        "neutral",
       );
       void fetchAccount(payload.live.walletAddress);
     } catch (error) {
@@ -461,7 +447,6 @@ export default function Home() {
   };
   const disconnect = () => {
     void liveRequest({ action: "disconnect" }).catch(() => undefined);
-    setLiveRunning(false);
     setLiveSession(null);
     setConnectedAccount(null);
     appendLog("Account disconnected", "Encrypted live session cleared.", "neutral");
@@ -473,9 +458,6 @@ export default function Home() {
     else setLiveStatus((current) => ({ ...current, lastError: payload.error || "Balance refresh failed." }));
   };
   const killLive = async () => {
-    setLiveRunning(false);
-    setLivePaused(false);
-    setLiveConsent(false);
     if (!liveSession?.connected) return;
     const response = await liveRequest({ action: "cancel-all", confirmLive: true }, true).catch(() => null);
     const ok = Boolean(response?.ok);
@@ -487,175 +469,6 @@ export default function Home() {
     });
     alert(ok ? "LIVE kill switch: runner stopped, cancel-all accepted." : "LIVE kill switch: cancel-all could not be confirmed.");
   };
-
-  // ---- live runner loop --------------------------------------------------
-  const liveCandidates = useMemo(
-    () =>
-      activeMarkets
-        .map((market) => ({
-          market,
-          signal: analyzeMarketSignal(market, controller.derived(market.asset, now), { ...liveRisk.signal, budgetUsd: liveRisk.maxTradeUsd }, now),
-        }))
-        .filter(
-          ({ market, signal }) =>
-            signal.action !== "PASS" &&
-            liveRisk.allowedDurations.includes(market.duration) &&
-            liveRisk.allowedAssets.includes(market.asset) &&
-            (!liveRisk.requireLock || signal.tier === "LOCK"),
-        )
-        .sort((left, right) => (right.signal.edge ?? 0) - (left.signal.edge ?? 0)),
-    [activeMarkets, controller, liveRisk, now],
-  );
-  const liveCandidatesRef = useRef(liveCandidates);
-  const liveRiskRef = useRef(liveRisk);
-  useEffect(() => {
-    liveCandidatesRef.current = liveCandidates;
-    liveRiskRef.current = liveRisk;
-  }, [liveCandidates, liveRisk]);
-  useEffect(() => {
-    if (!liveRunning || livePaused || !liveSession?.connected) return;
-    let disposed = false;
-    let busy = false;
-    const attempted = new Map<string, number>();
-    const exitSeen = new Map<string, { count: number; at: number }>();
-    let positions: LivePosition[] = [];
-    let positionsAt = 0;
-    const stop = (detail: string) => {
-      setLiveRunning(false);
-      setLiveStatus({ lastAction: "LIVE RUNNER STOPPED", lastDetail: detail, lastError: detail, lastLatencyMs: null });
-      appendLog("Live runner stopped", detail, "negative");
-      alert(`LIVE runner stopped: ${detail}`);
-    };
-    const loop = async () => {
-      if (disposed || busy) return;
-      busy = true;
-      try {
-        const now = Date.now();
-        const risk = liveRiskRef.current;
-        if (risk.earlyExitEnabled && now - positionsAt > 5_000) {
-          const response = await liveRequest({ action: "positions" });
-          const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; positions?: LivePosition[] };
-          if (payload.ok && payload.positions) positions = payload.positions;
-          positionsAt = now;
-        }
-        for (const position of risk.earlyExitEnabled ? positions : []) {
-          const market = [...controller.markets.values()].find(
-            (candidate) => candidate.upTokenId === position.tokenId || candidate.downTokenId === position.tokenId,
-          );
-          if (!market || !position.tokenId) continue;
-          const side: Side = market.upTokenId === position.tokenId ? "UP" : "DOWN";
-          const feed = controller.derived(market.asset, now);
-          const snapshot = snapshotFromLiveMarket(market, feed, now);
-          const exit = evaluateExit({
-            snapshot,
-            side,
-            shares: position.size,
-            entryCostPerShare: position.averagePrice ?? 1,
-            params: risk.signal,
-            minGap: risk.earlyExitModelGap,
-            minProfitUsd: risk.earlyExitMinProfitUsd,
-            minProfitPct: risk.earlyExitMinProfitPct,
-            minRemainingSeconds: risk.earlyExitMinRemainingSeconds,
-          });
-          const seen = exitSeen.get(position.tokenId);
-          if (!exit.shouldExit) {
-            exitSeen.delete(position.tokenId);
-            continue;
-          }
-          const count = seen && now - seen.at < 15_000 ? seen.count + 1 : 1;
-          exitSeen.set(position.tokenId, { count, at: now });
-          if (count < risk.earlyExitConfirmations) continue;
-          exitSeen.delete(position.tokenId);
-          const response = await liveRequest(
-            {
-              action: "exit",
-              marketId: market.id,
-              tokenID: position.tokenId,
-              amount: position.size,
-              requestId: `exit:${position.tokenId}:${Math.floor(now / 15_000)}`,
-              confirmLive: true,
-              config: risk,
-              feed: feedPayload(snapshot, feed.sigmaPerSqrtSecond, feed.volSamples),
-            },
-            true,
-          );
-          const payload = (await response.json().catch(() => ({}))) as {
-            status?: string;
-            reason?: string;
-            error?: string;
-            uncertain?: boolean;
-            latencyMs?: number;
-          };
-          setLiveStatus({
-            lastAction: payload.status ?? "EXIT",
-            lastDetail: payload.reason ?? payload.error ?? "",
-            lastError: payload.uncertain ? (payload.error ?? "Exit uncertain.") : "",
-            lastLatencyMs: payload.latencyMs ?? null,
-          });
-          if (payload.uncertain || response.status === 401 || response.status === 403)
-            return stop(payload.error ?? "Exit state uncertain; reconcile the account.");
-          if (payload.status === "EXECUTED") appendLog(`${market.asset} ${market.duration} live exit`, payload.reason ?? "", "positive");
-          positionsAt = 0;
-          return;
-        }
-        const next = liveCandidatesRef.current.find((candidate) => now - (attempted.get(candidate.market.id) ?? 0) > 45_000);
-        if (!next || next.signal.action === "PASS") {
-          setLiveStatus((current) =>
-            current.lastAction === "SCANNING"
-              ? current
-              : { ...current, lastAction: "SCANNING", lastDetail: "No candidate passes the live policy right now.", lastError: "" },
-          );
-          return;
-        }
-        attempted.set(next.market.id, now);
-        const feed = controller.derived(next.market.asset, now);
-        const snapshot = snapshotFromLiveMarket(next.market, feed, now);
-        const response = await liveRequest(
-          {
-            action: "execute",
-            marketId: next.market.id,
-            side: next.signal.action,
-            requestId: `${next.market.id}:${next.signal.action}:${Math.floor(now / 15_000)}`,
-            confirmLive: true,
-            config: risk,
-            feed: feedPayload(snapshot, feed.sigmaPerSqrtSecond, feed.volSamples),
-          },
-          true,
-        );
-        const payload = (await response.json().catch(() => ({}))) as {
-          status?: string;
-          reason?: string;
-          error?: string;
-          uncertain?: boolean;
-          latencyMs?: number;
-          sizing?: { stakeUsd?: number };
-          signal?: { limitPrice?: number };
-        };
-        setLiveStatus({
-          lastAction: payload.status ?? (response.ok ? "REJECTED" : "ERROR"),
-          lastDetail: payload.reason ?? payload.error ?? (payload.status === "EXECUTED" ? `Filled up to limit ${payload.signal?.limitPrice}` : ""),
-          lastError: payload.uncertain ? (payload.error ?? "Execution uncertain.") : "",
-          lastLatencyMs: payload.latencyMs ?? null,
-        });
-        if (payload.uncertain || response.status === 401 || response.status === 403)
-          return stop(payload.error ?? "Execution state uncertain; reconcile the account.");
-        if (payload.status === "EXECUTED") {
-          const detail = `${next.signal.action} · ${dollars(payload.sizing?.stakeUsd)} · limit ${payload.signal?.limitPrice} · ${payload.latencyMs}ms`;
-          appendLog(`${next.market.asset} ${next.market.duration} LIVE order`, detail, "warning");
-          alert(`LIVE order ${next.market.asset} ${next.market.duration}: ${detail}`);
-        }
-      } catch (error) {
-        stop(error instanceof Error ? error.message : "Live request failed.");
-      } finally {
-        busy = false;
-      }
-    };
-    const timer = window.setInterval(() => void loop(), 1_200);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, [alert, appendLog, controller, liveRunning, livePaused, liveSession?.connected]);
 
   // ---- telegram actions + weekly report ---------------------------------
   const reportText = (label: string) =>
@@ -842,33 +655,17 @@ export default function Home() {
             />
           ) : view === "live" ? (
             <LiveExecutionPanel
-              candidateCount={liveCandidates.length}
-              consent={liveConsent}
               marketCount={activeMarkets.length}
               now={now}
-              onConsentChange={setLiveConsent}
               onKill={() => void killLive()}
               onLink={() => setAccountDialogOpen(true)}
-              onPause={() => setLivePaused((current) => !current)}
               onRefresh={() => void refreshLiveBalance()}
               onRiskChange={(patch) =>
                 setLiveRisk((current) =>
                   normalizeLiveRiskConfig({ ...current, ...patch, signal: { ...current.signal, ...(patch.signal ?? {}) } } as Partial<LiveRiskConfig>),
                 )
               }
-              onStart={() => {
-                setLiveStatus({
-                  lastAction: "LIVE RUNNER STARTED",
-                  lastDetail: "Scanning for candidates that pass the live policy.",
-                  lastError: "",
-                  lastLatencyMs: null,
-                });
-                setLiveRunning(true);
-                setLivePaused(false);
-              }}
-              paused={livePaused}
               risk={liveRisk}
-              running={liveRunning}
               session={liveSession}
               status={liveStatus}
             />
