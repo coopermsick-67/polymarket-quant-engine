@@ -87,33 +87,27 @@ const relayRequest = async (route: Route, markets: Record<string, unknown>[]) =>
   await route.continue();
 };
 
-const installSocketStub = async (page: Page) =>
-  page.addInitScript(() => {
+const installSocketStub = (page: Page) =>
+  page.addInitScript(`
     class FixtureWebSocket {
       static CONNECTING = 0;
       static OPEN = 1;
       static CLOSING = 2;
       static CLOSED = 3;
-      readonly url: string;
-      readyState = FixtureWebSocket.CONNECTING;
-      onopen: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      onclose: ((event: CloseEvent) => void) | null = null;
-
-      constructor(url: string) {
+      constructor(url) {
         this.url = url;
+        this.readyState = FixtureWebSocket.CONNECTING;
+        this.onopen = null;
+        this.onmessage = null;
+        this.onerror = null;
+        this.onclose = null;
         window.setTimeout(() => {
           if (this.readyState !== FixtureWebSocket.CONNECTING) return;
           this.readyState = FixtureWebSocket.OPEN;
           this.onopen?.(new Event("open"));
         }, 0);
       }
-
-      send(data: string) {
-        void data;
-      }
-
+      send(data) { void data; }
       close() {
         if (this.readyState === FixtureWebSocket.CLOSED) return;
         this.readyState = FixtureWebSocket.CLOSED;
@@ -121,7 +115,7 @@ const installSocketStub = async (page: Page) =>
       }
     }
     Object.defineProperty(window, "WebSocket", { configurable: true, writable: true, value: FixtureWebSocket });
-  });
+  `);
 
 const startDevServer = () =>
   spawn(process.execPath, ["scripts/run-framework.mjs", "dev", "--host", "127.0.0.1", "--port", String(port)], {
