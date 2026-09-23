@@ -122,7 +122,7 @@ const installSocketStub = async (page: Page) =>
   });
 
 const startDevServer = () =>
-  spawn(process.execPath, ["scripts/run-framework.mjs", "dev"], {
+  spawn(process.execPath, ["scripts/run-framework.mjs", "dev", "--host", "127.0.0.1"], {
     cwd: process.cwd(),
     env: { ...process.env, CI: "1" },
     stdio: ["ignore", "pipe", "pipe"],
