@@ -33,14 +33,14 @@ export default function LocalPaperDaemonPanel() {
   const [clock, setClock] = useState(0);
   const inFlight = useRef(false);
 
-  const refresh = useCallback(async (): Promise<boolean> => {
+  const refresh = useCallback(async (timeoutMs = 2500): Promise<boolean> => {
     if (inFlight.current) return false;
     inFlight.current = true;
     try {
       const response = await fetch(statusUrl, {
         cache: "no-store",
         mode: "cors",
-        signal: AbortSignal.timeout(2500),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!response.ok) throw new Error(`Local daemon returned HTTP ${response.status}.`);
       const payload = await response.json() as PaperDaemonStatus;
@@ -53,7 +53,9 @@ export default function LocalPaperDaemonPanel() {
       return true;
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : "Local daemon request failed.";
-      setError(detail.includes("Failed to fetch") || detail.includes("NetworkError")
+      setError(detail.toLowerCase().includes("timed out") || detail.toLowerCase().includes("signal timed out")
+        ? "The browser timed out reaching localhost. Allow local network access for this Site, and confirm the terminal daemon is running."
+        : detail.includes("Failed to fetch") || detail.includes("NetworkError")
         ? "The browser could not reach localhost. Allow local network access for this Site, and confirm the terminal daemon is running."
         : detail);
       return false;
@@ -64,7 +66,7 @@ export default function LocalPaperDaemonPanel() {
 
   const connect = useCallback(async () => {
     setConnecting(true);
-    const ok = await refresh();
+    const ok = await refresh(15_000);
     if (ok) setConnected(true);
     setConnecting(false);
   }, [refresh]);
