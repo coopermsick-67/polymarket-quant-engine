@@ -32,6 +32,22 @@ export type CandleHistory = {
   updatedAt: number;
 };
 
+export type MarketFeeSchedule = {
+  /** CLOB fee coefficient for (price * (1 - price)) ** exponent. */
+  rate: number;
+  exponent: number;
+  feesEnabled: boolean;
+  source: "CLOB" | "CONSERVATIVE_FALLBACK";
+};
+
+/** Used for short-dated crypto markets when the CLOB fee schedule cannot be read. */
+export const CONSERVATIVE_CRYPTO_FEE_SCHEDULE: MarketFeeSchedule = {
+  rate: 0.1,
+  exponent: 1,
+  feesEnabled: true,
+  source: "CONSERVATIVE_FALLBACK",
+};
+
 export type MarketDefinition = {
   id: string;
   conditionId: string | null;
@@ -46,6 +62,7 @@ export type MarketDefinition = {
   upTokenId: string;
   downTokenId: string;
   sourceUrl: string;
+  feeSchedule?: MarketFeeSchedule;
 };
 
 export type LiveMarket = MarketDefinition & {
@@ -88,10 +105,14 @@ const PUBLIC_REQUEST_TIMEOUT_MS = 15_000;
 const CLOB_BATCH_SIZE = 500;
 const CANDLE_CACHE_MS = 60_000;
 const CANDLE_LOOKBACK_BARS = 100;
+const CLOB_FEE_CACHE_MS = 5 * 60_000;
+const CLOB_FEE_FALLBACK_CACHE_MS = 30_000;
 
 let polymarketClockOffsetMs = 0;
 let polymarketClockSyncedAt = 0;
 const candleHistoryCache = new Map<Asset, CandleHistory>();
+const clobFeeScheduleCache = new Map<string, { schedule: MarketFeeSchedule; expiresAt: number }>();
+const clobFeeScheduleInFlight = new Map<string, Promise<MarketFeeSchedule>>();
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
@@ -383,7 +404,7 @@ const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
   try {
     const response = await fetch(url, { ...init, cache: "no-store", signal: timeoutController.signal });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-    return response.json() as Promise<T>;
+    return await response.json() as T;
   } catch (error) {
     if (timeoutController.signal.aborted && !upstreamSignal?.aborted) throw new Error(`Public request timed out after ${PUBLIC_REQUEST_TIMEOUT_MS / 1000}s`);
     throw error;
@@ -391,6 +412,53 @@ const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
     globalThis.clearTimeout(timeoutId);
     upstreamSignal?.removeEventListener("abort", abortRequest);
   }
+};
+
+const conservativeCryptoFeeSchedule = (): MarketFeeSchedule => ({ ...CONSERVATIVE_CRYPTO_FEE_SCHEDULE });
+
+const parseClobFeeSchedule = (payload: unknown): MarketFeeSchedule | null => {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const market = payload as Record<string, unknown>;
+  const feeData = market.fd ?? market.fee_data ?? market.feeData ?? market.feeSchedule;
+  if (feeData && typeof feeData === "object" && !Array.isArray(feeData)) {
+    const record = feeData as Record<string, unknown>;
+    const rate = finiteNumber(record.r ?? record.rate);
+    const exponent = finiteNumber(record.e ?? record.exponent);
+    if (rate !== null && exponent !== null && rate >= 0 && rate <= 1 && exponent >= 0 && exponent <= 8) {
+      return { rate, exponent, feesEnabled: rate > 0, source: "CLOB" };
+    }
+  }
+
+  const feesEnabled = market.feesEnabled ?? market.fees_enabled;
+  if (feesEnabled !== undefined && flagIsFalse(feesEnabled)) {
+    return { rate: 0, exponent: 1, feesEnabled: false, source: "CLOB" };
+  }
+  return null;
+};
+
+const fetchClobFeeSchedule = (conditionId: string | null, signal?: AbortSignal): Promise<MarketFeeSchedule> => {
+  if (!conditionId) return Promise.resolve(conservativeCryptoFeeSchedule());
+  const cached = clobFeeScheduleCache.get(conditionId);
+  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.schedule);
+  const inFlight = clobFeeScheduleInFlight.get(conditionId);
+  if (inFlight) return inFlight;
+
+  const request = fetchJson<unknown>(`${CLOB_API}/clob-markets/${encodeURIComponent(conditionId)}`, { signal })
+    .then((payload) => parseClobFeeSchedule(payload) ?? conservativeCryptoFeeSchedule())
+    .catch((error) => {
+      if (signal?.aborted) throw error;
+      return conservativeCryptoFeeSchedule();
+    })
+    .then((schedule) => {
+      clobFeeScheduleCache.set(conditionId, {
+        schedule,
+        expiresAt: Date.now() + (schedule.source === "CLOB" ? CLOB_FEE_CACHE_MS : CLOB_FEE_FALLBACK_CACHE_MS),
+      });
+      return schedule;
+    })
+    .finally(() => clobFeeScheduleInFlight.delete(conditionId));
+  clobFeeScheduleInFlight.set(conditionId, request);
+  return request;
 };
 
 const polymarketNow = () => Date.now() + polymarketClockOffsetMs;
@@ -455,7 +523,7 @@ let discoveryInFlight: Promise<MarketDefinition[]> | null = null;
 const discoverCryptoMarketsFresh = async (signal?: AbortSignal): Promise<MarketDefinition[]> => {
   const { rows: directMarkets, now } = await fetchCryptoMarketRows(signal);
   const seen = new Set<string>();
-  return directMarkets
+  const definitions = directMarkets
     .map((row) => normalizeMarket(row, now))
     .filter((market): market is MarketDefinition => Boolean(market))
     .filter((market) => {
@@ -471,6 +539,10 @@ const discoverCryptoMarketsFresh = async (signal?: AbortSignal): Promise<MarketD
       if (leftPhase !== rightPhase) return leftPhase - rightPhase;
       return leftStart - rightStart || left.endTime - right.endTime || left.asset.localeCompare(right.asset) || left.id.localeCompare(right.id);
     });
+  return Promise.all(definitions.map(async (definition) => ({
+    ...definition,
+    feeSchedule: await fetchClobFeeSchedule(definition.conditionId, signal),
+  })));
 };
 
 export async function discoverCryptoMarkets(signal?: AbortSignal): Promise<MarketDefinition[]> {
@@ -486,6 +558,38 @@ export async function discoverCryptoMarkets(signal?: AbortSignal): Promise<Marke
       });
   }
   return discoveryInFlight;
+}
+
+export async function fetchResolvedMarketOutcomes(
+  markets: Array<Pick<MarketDefinition, "id"> & Partial<Pick<MarketDefinition, "upTokenId" | "downTokenId">>>,
+  signal?: AbortSignal,
+): Promise<Map<string, "UP" | "DOWN">> {
+  const resolved = new Map<string, "UP" | "DOWN">();
+  await Promise.all(markets.map(async (market) => {
+    try {
+      const raw = await fetchJson<Record<string, unknown>>(`${GAMMA_API}/markets/${encodeURIComponent(market.id)}`, { signal });
+      if (!flagIsTrue(raw.closed)) return;
+      const tokenIds = jsonArray(raw.clobTokenIds || raw.clob_token_ids || raw.tokenIds || raw.token_ids);
+      const prices = jsonArray(raw.outcomePrices || raw.outcome_prices).map((value) => finiteNumber(value));
+      if (tokenIds.length !== prices.length || tokenIds.length < 2) return;
+      const winningIndexes = prices.flatMap((price, index) => price !== null && price >= 0.999 ? [index] : []);
+      const losingIndexes = prices.flatMap((price, index) => price !== null && price <= 0.001 ? [index] : []);
+      if (winningIndexes.length !== 1 || losingIndexes.length !== tokenIds.length - 1) return;
+      const winningToken = tokenIds[winningIndexes[0]];
+      if (market.upTokenId && winningToken === market.upTokenId) resolved.set(market.id, "UP");
+      else if (market.downTokenId && winningToken === market.downTokenId) resolved.set(market.id, "DOWN");
+      else {
+        const labels = outcomeLabelsFor(raw).map((label) => label.toLowerCase().trim());
+        const upIndex = labels.findIndex((label) => /^(up|yes|higher|above)$/.test(label));
+        const downIndex = labels.findIndex((label) => /^(down|no|lower|below)$/.test(label));
+        if (winningIndexes[0] === upIndex) resolved.set(market.id, "UP");
+        else if (winningIndexes[0] === downIndex) resolved.set(market.id, "DOWN");
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+  }));
+  return resolved;
 }
 
 const parseBook = (raw: Record<string, unknown>, tokenId: string): OrderBook => {

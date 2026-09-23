@@ -1,6 +1,7 @@
 import {
   bestAskFor,
   bestBidFor,
+  CONSERVATIVE_CRYPTO_FEE_SCHEDULE,
   estimateFairProbability,
   orderBookFor,
   sideFairProbability,
@@ -91,6 +92,7 @@ export type MarketSignal = {
   tier: "LOCK" | "ENTRY" | "PASS";
   bias: PaperSide | "NEUTRAL" | "WARMING UP";
   biasConfidence: number | null;
+  /** Compatibility field; this is a directional heuristic score, not a calibrated win probability. */
   confidence: number | null;
   fairUp: number | null;
   upEdge: number | null;
@@ -124,6 +126,13 @@ export type BacktestRow = {
   downAsk: number;
   outcome: PaperSide | null;
   remainingSeconds?: number;
+  /** Probability captured when the live model made the decision. */
+  modelFairUp?: number | null;
+  /** Captured live decision; PASS rows are never replayed as trades. */
+  modelAction?: PaperSide | "PASS" | null;
+  modelEdge?: number | null;
+  modelEntryPrice?: number | null;
+  modelStakeUsd?: number | null;
 };
 
 export type BacktestTrade = {
@@ -156,6 +165,28 @@ export type BacktestResult = {
 };
 
 const round = (value: number, digits = 8) => Number(value.toFixed(digits));
+const roundFee = (value: number) => Number((Math.round(Math.max(0, value) * 100_000) / 100_000).toFixed(5));
+const MAX_ORDER_BOOK_AGE_MS = 60_000;
+
+const feeScheduleFor = (market: LiveMarket) => {
+  const schedule = market.feeSchedule;
+  if (schedule && Number.isFinite(schedule.rate) && schedule.rate >= 0 && schedule.rate <= 1
+    && Number.isFinite(schedule.exponent) && schedule.exponent >= 0 && schedule.exponent <= 8) return schedule;
+  return CONSERVATIVE_CRYPTO_FEE_SCHEDULE;
+};
+
+/**
+ * Polymarket's taker fee curve is shares * rate * (price * (1-price)) ** exponent.
+ * Keep the configured legacy notional fee as a conservative floor for manual paper settings.
+ */
+const feePerShareAt = (market: LiveMarket, price: number, costs: CostConfig): number => {
+  const schedule = feeScheduleFor(market);
+  const boundedPrice = Math.min(1, Math.max(0, price));
+  const curve = Math.pow(boundedPrice * (1 - boundedPrice), schedule.exponent);
+  const marketFee = schedule.feesEnabled ? schedule.rate * curve : 0;
+  const configuredRate = Number.isFinite(costs.feeRate) ? Math.max(0, costs.feeRate) : 0;
+  return Math.max(marketFee, boundedPrice * configuredRate);
+};
 
 export const createPaperAccount = (startingCash: number, timestamp = Date.now()): PaperAccount => {
   const safeCash = Number.isFinite(startingCash) && startingCash > 0 ? startingCash : 1000;
@@ -190,6 +221,41 @@ export const accountUnrealized = (account: PaperAccount, markets: Map<string, Li
 
 export const accountDeployed = (account: PaperAccount) => account.positions.reduce((total, position) => total + position.totalCost, 0);
 
+/**
+ * Paper sizing stays at the minimum bankroll fraction until the probability
+ * model has enough settled, out-of-sample observations to justify scaling up.
+ * The $1 floor intentionally takes precedence for bankrolls at or below $100.
+ */
+export const paperStakeUsd = (
+  bankroll: number,
+  availableCash: number,
+  minFraction = 0.005,
+  maxFraction = 0.03,
+  minimumUsd = 1,
+): number => {
+  const safeBankroll = Math.max(0, Number.isFinite(bankroll) ? bankroll : 0);
+  const safeCash = Math.max(0, Number.isFinite(availableCash) ? availableCash : 0);
+  const floor = Math.max(0, Number.isFinite(minimumUsd) ? minimumUsd : 1);
+  const minPct = Math.max(0, Number.isFinite(minFraction) ? minFraction : 0.005);
+  const maxPct = Math.max(minPct, Number.isFinite(maxFraction) ? maxFraction : 0.03);
+  const target = Math.max(floor, safeBankroll * minPct);
+  const cap = Math.max(floor, safeBankroll * maxPct);
+  return round(Math.min(safeCash, target, cap));
+};
+
+/** Conservative net proceeds estimate for the daily-loss guard. */
+export const accountLiquidationEquity = (account: PaperAccount, markets: Map<string, LiveMarket>, costs: CostConfig): number => {
+  const liquidatableProceeds = account.positions.reduce((total, position) => {
+    const market = markets.get(position.marketId);
+    if (!market) return total;
+    const fill = walkBids(market, position.side, position.shares, costs);
+    // Any shares beyond visible bid depth are valued at zero until a fresh
+    // executable bid appears, so a thin book cannot inflate the loss baseline.
+    return total + (fill?.totalCost ?? 0);
+  }, 0);
+  return round(account.cash + liquidatableProceeds, 4);
+};
+
 export const accountWinRate = (account: PaperAccount): number | null => {
   if (!account.closedTrades.length) return null;
   return account.closedTrades.filter((trade) => trade.pnl > 0).length / account.closedTrades.length;
@@ -214,27 +280,61 @@ export const markAccount = (account: PaperAccount, markets: Map<string, LiveMark
 const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: CostConfig): FillResult | null => {
   const book = orderBookFor(market, side);
   if (!book?.asks.length || budget <= 0) return null;
-  const slippageMultiplier = 1 + Math.max(0, costs.slippageBps) / 10_000;
-  const feeMultiplier = 1 + Math.max(0, costs.feeRate);
+  const slippageBps = Number.isFinite(costs.slippageBps) ? Math.max(0, costs.slippageBps) : 0;
+  const slippageMultiplier = 1 + slippageBps / 10_000;
   let remainingBudget = budget;
   let shares = 0;
   let notional = 0;
+  let fee = 0;
   let levels = 0;
   for (const level of [...book.asks].sort((left, right) => left.price - right.price)) {
     const effectivePrice = level.price * slippageMultiplier;
-    const maxShares = remainingBudget / (effectivePrice * feeMultiplier);
+    if (!Number.isFinite(effectivePrice) || effectivePrice <= 0 || effectivePrice >= 1) continue;
+    const feePerShare = feePerShareAt(market, effectivePrice, costs);
+    // Leave room for the CLOB's five-decimal fee rounding so a fill cannot overspend cash.
+    const maxShares = Math.max(0, remainingBudget - 0.000005) / (effectivePrice + feePerShare);
     const levelShares = Math.min(level.size, maxShares);
     if (levelShares <= 0) break;
+    const levelNotional = levelShares * effectivePrice;
+    const levelFee = roundFee(levelShares * feePerShare);
     shares += levelShares;
-    notional += levelShares * effectivePrice;
-    remainingBudget -= levelShares * effectivePrice * feeMultiplier;
+    notional += levelNotional;
+    fee += levelFee;
+    remainingBudget -= levelNotional + levelFee;
     levels += 1;
     if (remainingBudget <= 0.00000001) break;
   }
   const minOrderSize = book.minOrderSize ?? 0;
   if (shares <= 0 || shares + 0.00000001 < minOrderSize) return null;
-  const fee = notional * Math.max(0, costs.feeRate);
-  return { shares: round(shares), price: round(notional / shares), notional: round(notional), fee: round(fee), totalCost: round(notional + fee), levels };
+  return { shares: round(shares), price: round(notional / shares), notional: round(notional), fee: round(fee, 5), totalCost: round(notional + fee, 5), levels };
+};
+
+const walkBids = (market: LiveMarket, side: PaperSide, requestedShares: number, costs: CostConfig): FillResult | null => {
+  const book = orderBookFor(market, side);
+  if (!book?.bids.length || requestedShares <= 0) return null;
+  const slippageBps = Number.isFinite(costs.slippageBps) ? Math.max(0, costs.slippageBps) : 0;
+  const slippageMultiplier = Math.max(0, 1 - slippageBps / 10_000);
+  let remainingShares = requestedShares;
+  let shares = 0;
+  let notional = 0;
+  let fee = 0;
+  let levels = 0;
+  for (const level of [...book.bids].sort((left, right) => right.price - left.price)) {
+    const effectivePrice = level.price * slippageMultiplier;
+    if (!Number.isFinite(effectivePrice) || effectivePrice <= 0 || effectivePrice > 1) continue;
+    const levelShares = Math.min(level.size, remainingShares);
+    if (levelShares <= 0) break;
+    const levelNotional = levelShares * effectivePrice;
+    shares += levelShares;
+    notional += levelNotional;
+    fee += roundFee(levelShares * feePerShareAt(market, effectivePrice, costs));
+    remainingShares -= levelShares;
+    levels += 1;
+    if (remainingShares <= 0.00000001) break;
+  }
+  if (shares <= 0) return null;
+  const netProceeds = Math.max(0, notional - fee);
+  return { shares: round(shares), price: round(notional / shares), notional: round(notional), fee: round(fee, 5), totalCost: round(netProceeds, 5), levels };
 };
 
 export const buyPaper = (
@@ -323,16 +423,21 @@ export const closePaperPositions = (
       continue;
     }
     const market = markets.get(position.marketId);
-    const exit = market ? bestBidFor(market, position.side) : position.mark;
-    if (!market || exit === null) {
+    const fill = market ? walkBids(market, position.side, position.shares, costs) : null;
+    if (!fill) {
       remaining.push(position);
       skipped += 1;
       continue;
     }
-    const proceeds = position.shares * exit;
-    const exitFee = proceeds * Math.max(0, costs.feeRate);
-    const pnl = proceeds - exitFee - position.totalCost;
-    cash += proceeds - exitFee;
+    const fullyClosed = fill.shares + 0.00000001 >= position.shares;
+    const closedShares = fullyClosed ? position.shares : Math.min(position.shares, fill.shares);
+    const basis = fullyClosed ? position.totalCost : position.totalCost * (closedShares / position.shares);
+    const remainingShares = fullyClosed ? 0 : round(position.shares - closedShares);
+    const remainingCost = fullyClosed ? 0 : Math.max(0, round(position.totalCost - basis));
+    const exitFee = fill.fee;
+    const netProceeds = fill.totalCost;
+    const pnl = netProceeds - basis;
+    cash += netProceeds;
     fees += exitFee;
     realizedPnl += pnl;
     closed += 1;
@@ -346,9 +451,9 @@ export const closePaperPositions = (
       asset: position.asset,
       duration: position.duration,
       side: position.side,
-      shares: position.shares,
-      price: exit,
-      notional: proceeds,
+      shares: closedShares,
+      price: fill.price,
+      notional: fill.notional,
       fee: exitFee,
       reason,
     });
@@ -360,12 +465,22 @@ export const closePaperPositions = (
       asset: position.asset,
       duration: position.duration,
       side: position.side,
-      shares: position.shares,
+      shares: closedShares,
       entry: position.avgEntry,
-      exit,
+      exit: fill.price,
       pnl,
       reason,
     });
+    if (!fullyClosed) {
+      remaining.push({
+        ...position,
+        shares: remainingShares,
+        totalCost: remainingCost,
+        avgEntry: remainingShares > 0 ? round(remainingCost / remainingShares) : position.avgEntry,
+        mark: bestBidFor(market!, position.side),
+        lastUpdated: timestamp,
+      });
+    }
   }
   return {
     account: {
@@ -456,6 +571,79 @@ export const settleResolvedPaperPositions = (
   };
 };
 
+export const settlePaperPositionsByOutcome = (
+  account: PaperAccount,
+  outcomes: Map<string, PaperSide>,
+  reason: string,
+  timestamp = Date.now(),
+): { account: PaperAccount; closed: number; skipped: number; realized: number } => {
+  let cash = account.cash;
+  let realizedPnl = account.realizedPnl;
+  const remaining: PaperPosition[] = [];
+  const sells: PaperFill[] = [];
+  const closedTrades: ClosedPaperTrade[] = [];
+  let closed = 0;
+  let skipped = 0;
+
+  for (const position of account.positions) {
+    const outcome = position.endTime <= timestamp ? outcomes.get(position.marketId) ?? null : null;
+    if (!outcome) {
+      remaining.push(position);
+      if (position.endTime <= timestamp) skipped += 1;
+      continue;
+    }
+    const exit = position.side === outcome ? 1 : 0;
+    const proceeds = position.shares * exit;
+    const pnl = proceeds - position.totalCost;
+    cash += proceeds;
+    realizedPnl += pnl;
+    closed += 1;
+    sells.push({
+      id: `${timestamp}-${position.marketId}-${position.side}-resolve`,
+      timestamp,
+      action: "SELL",
+      marketId: position.marketId,
+      marketLabel: position.marketLabel,
+      asset: position.asset,
+      duration: position.duration,
+      side: position.side,
+      shares: position.shares,
+      price: exit,
+      notional: proceeds,
+      fee: 0,
+      reason: `${reason} · ${outcome} resolved by Gamma`,
+    });
+    closedTrades.push({
+      id: `${timestamp}-${position.marketId}-${position.side}-resolved`,
+      timestamp,
+      marketId: position.marketId,
+      marketLabel: position.marketLabel,
+      asset: position.asset,
+      duration: position.duration,
+      side: position.side,
+      shares: position.shares,
+      entry: position.avgEntry,
+      exit,
+      pnl,
+      reason: `${reason} · ${outcome} resolved by Gamma`,
+    });
+  }
+
+  return {
+    account: {
+      ...account,
+      cash: round(cash),
+      realizedPnl: round(realizedPnl),
+      positions: remaining,
+      fills: [...sells, ...account.fills].slice(0, 2000),
+      closedTrades: [...closedTrades, ...account.closedTrades].slice(0, 2000),
+    },
+    closed,
+    skipped,
+    realized: round(realizedPnl - account.realizedPnl),
+  };
+};
+
 export const closeExpiringPaperPositions = (
   account: PaperAccount,
   markets: Map<string, LiveMarket>,
@@ -514,8 +702,42 @@ const standardDeviation = (values: number[]) => {
   return Math.sqrt(values.reduce((sum, value) => sum + (value - center) ** 2, 0) / (values.length - 1));
 };
 
+const usableCompletedCandles = (history: MarketCandle[], barSeconds: number, now: number) => history.filter((candle) =>
+  Number.isFinite(candle.timestamp)
+  && Number.isFinite(candle.open) && candle.open > 0
+  && Number.isFinite(candle.close) && candle.close > 0
+  && Number.isFinite(candle.high) && Number.isFinite(candle.low)
+  && candle.low > 0 && candle.high >= candle.low
+  && Number.isFinite(candle.volume) && candle.volume >= 0
+  && candle.timestamp + barSeconds * 1000 <= now,
+);
+
+const newestCompletedCandleAt = (history: MarketCandle[], barSeconds: number, now: number): number | null => {
+  const candles = usableCompletedCandles(history, barSeconds, now);
+  if (!candles.length) return null;
+  return Math.max(...candles.map((candle) => candle.timestamp + barSeconds * 1000));
+};
+
+export const marketDataFreshnessIssue = (market: LiveMarket, now = market.sourceTimestamp || Date.now()): string | null => {
+  if (market.reference === null || market.reference <= 0 || market.spot === null || market.spot <= 0) return "Missing live spot or market reference.";
+  if (market.referenceSource !== "POLYMARKET") return "Waiting for the Polymarket opening reference. Coinbase candle opens are only a proxy for the Chainlink settlement price.";
+  if (market.chartUpdatedAt === null || now - market.chartUpdatedAt > 120_000) return "Chart feed is stale; waiting for a fresh candle snapshot.";
+  for (const orderBook of [market.upBook, market.downBook]) {
+    if (!orderBook || orderBook.timestamp === null || now - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - now > 30_000) {
+      return "An order-book snapshot is stale or has no usable timestamp.";
+    }
+  }
+  const newest5mClose = newestCompletedCandleAt(market.chart5m, 300, now);
+  const newest15mClose = newestCompletedCandleAt(market.chart15m, 900, now);
+  if (newest5mClose === null || now - newest5mClose > 2 * 300_000
+    || newest15mClose === null || now - newest15mClose > 2 * 900_000) {
+    return "Completed 5m or 15m candle data is stale; waiting for fresh usable bars on both charts.";
+  }
+  return null;
+};
+
 const chartTrendStats = (history: MarketCandle[], barSeconds: number, now: number): ChartTrendStats | null => {
-  const candles = history.filter((candle) => candle.timestamp + barSeconds * 1000 <= now && candle.close > 0 && candle.high >= candle.low).slice(-80);
+  const candles = usableCompletedCandles(history, barSeconds, now).slice(-80);
   if (candles.length < 8) return null;
   const closes = candles.map((candle) => candle.close);
   const changes = closes.slice(1).map((close, index) => Math.log(close / closes[index]));
@@ -648,8 +870,8 @@ export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budge
     const comparison = comparePrices(fairUp);
     return passSignal(reason, stats5m, stats15m, fairUp, read, comparison.upEdge, comparison.downEdge);
   };
-  if (market.reference === null || market.reference <= 0 || market.spot === null || market.spot <= 0) return pass("Missing live spot or market reference.");
-  if (market.chartUpdatedAt === null || now - market.chartUpdatedAt > 120_000) return pass("Chart feed is stale; waiting for a fresh candle snapshot.");
+  const freshnessIssue = marketDataFreshnessIssue(market, now);
+  if (freshnessIssue) return pass(freshnessIssue);
 
   if (!stats5m || !stats15m) {
     const reason = !market.chart5m.length && !market.chart15m.length
@@ -659,16 +881,15 @@ export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budge
   }
   if (market.remaining < (market.duration === "5m" ? 30 : 60)) return pass("Too little time remains for a fresh entry.");
   if (market.fairUp === null) return pass("Candle volatility is unavailable, so probability is not estimated.");
-  if (market.referenceSource === "COINBASE ESTIMATE" && Math.abs(market.distance ?? 0) < 0.0005) return pass("Estimated Coinbase opening price is too close to spot; waiting for a clearer move or the market reference.");
-
   const target = market.duration === "5m" ? stats5m.score : stats15m.score;
   const context = market.duration === "5m" ? stats15m.score : stats5m.score;
   const chartAgreement = Math.sign(target) !== 0 && Math.sign(target) === Math.sign(context) && Math.abs(target) >= 0.2 && Math.abs(context) >= 0.14;
   if (!chartAgreement) return pass("5m and 15m chart trends do not confirm the same direction.");
   if (Math.sign(market.fairUp - 0.5) !== Math.sign(target)) return pass("Spot versus the market reference conflicts with the candle trend.");
 
-  const combinedScore = clampScore(target * 0.62 + context * 0.38);
-  const fairUp = Math.min(0.99, Math.max(0.01, market.fairUp + combinedScore * 0.075));
+  // Use the candle-volatility probability as-is. Adding a trend-based probability
+  // uplift made the estimate look more certain without calibration evidence.
+  const fairUp = market.fairUp;
   const upFill = walkAsks(market, "UP", budget, costs);
   const downFill = walkAsks(market, "DOWN", budget, costs);
   const candidates = [
@@ -684,12 +905,11 @@ export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budge
   const sideSpread = side === "UP" && market.upAsk !== null && market.upBid !== null ? market.upAsk - market.upBid : side === "DOWN" && market.downAsk !== null && market.downBid !== null ? market.downAsk - market.downBid : market.spread;
   if (sideSpread === null || sideSpread > 0.12) return { ...pass(`Best value is ${side}, but that side's spread is too wide for a reliable entry.`, fairUp), upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge };
 
-  const confidence = Math.min(0.96, 0.54 + Math.abs(combinedScore) * 0.2 + Math.abs(fairUp - 0.5) * 0.72 + (chartAgreement ? 0.06 : 0) - (market.referenceSource === "COINBASE ESTIMATE" ? 0.04 : 0));
-  const requiredEdge = Math.max(0.04, minNetEdge) + (market.referenceSource === "COINBASE ESTIMATE" ? 0.02 : 0);
-  if (confidence < 0.66) return { ...pass("Chart agreement is present, but model confidence is below the entry threshold.", fairUp), confidence, upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill };
+  const confidence = read.confidence;
+  const requiredEdge = Math.max(0.04, minNetEdge);
   if (edge < requiredEdge) return { ...pass(`Best price edge is ${Math.round(edge * 1000) / 10}% on ${side}, below the ${Math.round(requiredEdge * 1000) / 10}% entry floor.`, fairUp), confidence, upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill };
 
-  const locked = market.referenceSource === "POLYMARKET" && confidence >= 0.82 && edge >= Math.max(0.08, requiredEdge * 2) && Math.abs(target) >= 0.5 && Math.abs(context) >= 0.25;
+  const locked = edge >= Math.max(0.08, requiredEdge * 2) && Math.abs(target) >= 0.5 && Math.abs(context) >= 0.25;
   return {
     action: side,
     tier: locked ? "LOCK" : "ENTRY",
@@ -707,7 +927,7 @@ export const analyzeMarketSignal = (market: LiveMarket, costs: CostConfig, budge
     score15m: stats15m.score,
     rsi5m: stats5m.rsi,
     rsi15m: stats15m.rsi,
-    reason: locked ? "5m and 15m trends align; confidence, order-book depth, and net-edge gates pass." : market.referenceSource === "COINBASE ESTIMATE" ? "5m and 15m trends align; entry gates include extra protection for an estimated opening price." : "5m and 15m trends align and the cost-adjusted entry gates pass.",
+    reason: locked ? "5m and 15m trends align; a Polymarket reference, order-book depth, and the stricter net-edge gate pass. Probability remains uncalibrated." : "5m and 15m trends align; a Polymarket reference, order-book depth, and the net-edge gate pass. Probability remains uncalibrated.",
     estimatedFill: fill,
   };
 };
@@ -741,6 +961,7 @@ export const runBacktest = (
   let losses = 0;
   let edgeSum = 0;
   let brierSum = 0;
+  let brierSettled = 0;
   const trades: BacktestTrade[] = [];
   const equityCurve = [startingCash];
 
@@ -749,6 +970,7 @@ export const runBacktest = (
     shares: number;
     entryCost: number;
     fair: number;
+    hasRecordedProbability: boolean;
     side: PaperSide;
   };
 
@@ -774,7 +996,10 @@ export const runBacktest = (
     settled += 1;
     if (won) wins += 1;
     else losses += 1;
-    brierSum += (open.fair - (won ? 1 : 0)) ** 2;
+    if (open.hasRecordedProbability) {
+      brierSum += (open.fair - (won ? 1 : 0)) ** 2;
+      brierSettled += 1;
+    }
     const trade = trades[open.tradeIndex];
     if (trade) trades[open.tradeIndex] = { ...trade, status: won ? "SETTLED WIN" : "SETTLED LOSS", pnl };
     openTrades.delete(marketKey);
@@ -793,18 +1018,31 @@ export const runBacktest = (
     const remainingValue = row.remainingSeconds ?? (row.duration === "5m" ? 300 : 900);
     const remaining = Number.isFinite(remainingValue) ? Math.max(0, remainingValue) : row.duration === "5m" ? 300 : 900;
     if (remaining < 30) continue;
-    const fairUp = estimateFairProbability(row.reference, row.spot, remaining);
+    const fairUp = row.modelFairUp !== null && row.modelFairUp !== undefined && Number.isFinite(row.modelFairUp)
+      ? Math.min(0.99, Math.max(0.01, row.modelFairUp))
+      : estimateFairProbability(row.reference, row.spot, remaining);
     if (fairUp === null) continue;
     const upCost = row.upAsk * slippageMultiplier * feeMultiplier;
     const downCost = row.downAsk * slippageMultiplier * feeMultiplier;
     const upEdge = fairUp - upCost;
     const downEdge = 1 - fairUp - downCost;
-    const side: PaperSide = upEdge >= downEdge ? "UP" : "DOWN";
+    if (row.modelAction === "PASS") continue;
+    const side: PaperSide = row.modelAction === "UP" || row.modelAction === "DOWN"
+      ? row.modelAction
+      : upEdge >= downEdge ? "UP" : "DOWN";
     const fair = side === "UP" ? fairUp : 1 - fairUp;
-    const entry = side === "UP" ? row.upAsk * slippageMultiplier : row.downAsk * slippageMultiplier;
-    const edge = Math.max(upEdge, downEdge);
+    const recordedEntry = row.modelEntryPrice;
+    const entry = recordedEntry !== null && recordedEntry !== undefined && Number.isFinite(recordedEntry) && recordedEntry > 0
+      ? recordedEntry
+      : (side === "UP" ? row.upAsk : row.downAsk) * slippageMultiplier;
+    const edge = row.modelEdge !== null && row.modelEdge !== undefined && Number.isFinite(row.modelEdge)
+      ? row.modelEdge
+      : side === "UP" ? upEdge : downEdge;
     if (!Number.isFinite(entry) || entry <= 0 || entry >= 1 || !Number.isFinite(edge) || edge < minEdge) continue;
-    const entryBudget = Math.min(maxTrade, cash);
+    const requestedBudget = row.modelStakeUsd !== null && row.modelStakeUsd !== undefined && Number.isFinite(row.modelStakeUsd) && row.modelStakeUsd > 0
+      ? row.modelStakeUsd
+      : maxTrade;
+    const entryBudget = Math.min(requestedBudget, maxTrade, cash);
     const shares = entryBudget / (entry * feeMultiplier);
     if (!Number.isFinite(shares) || shares <= 0 || entryBudget <= 0) continue;
     const notional = shares * entry;
@@ -815,7 +1053,7 @@ export const runBacktest = (
     cash = round(cash - entryCost);
     committed = round(committed + entryCost);
     const tradeIndex = trades.push({ timestamp: row.timestamp, asset: row.asset, duration: row.duration, side, fair, entry, edge, notional: round(notional), status: "UNSETTLED", pnl: null }) - 1;
-    openTrades.set(marketKey, { tradeIndex, shares, entryCost, fair, side });
+    openTrades.set(marketKey, { tradeIndex, shares, entryCost, fair, hasRecordedProbability: row.modelFairUp !== null && row.modelFairUp !== undefined, side });
     if (row.outcome !== null) settle(marketKey, row.outcome);
   }
   const unsettled = openTrades.size;
@@ -830,7 +1068,7 @@ export const runBacktest = (
     maxDrawdown: settled ? maxDrawdown : null,
     winRate: settled ? wins / settled : null,
     averageEdge: signals ? edgeSum / signals : null,
-    brierScore: settled ? brierSum / settled : null,
+    brierScore: brierSettled ? brierSum / brierSettled : null,
     trades: trades.slice(-250),
     equityCurve,
   };
@@ -874,7 +1112,7 @@ export const parseBacktestCsv = (text: string): { rows: BacktestRow[]; rejected:
   let rejected = 0;
   for (const line of lines.slice(1)) {
     const values = split(line);
-    const timestampRaw = valueFor(values, ["timestamp", "time", "datetime", "date"]);
+    const timestampRaw = valueFor(values, ["validation_at_utc", "timestamp", "time", "datetime", "date", "observed_at_utc"]);
     const timestampNumber = Number(timestampRaw);
     const timestamp = Number.isFinite(timestampNumber) ? (timestampNumber < 10_000_000_000 ? timestampNumber * 1000 : timestampNumber) : Date.parse(timestampRaw);
     const asset = valueFor(values, ["asset", "symbol"]).toUpperCase();
@@ -885,9 +1123,27 @@ export const parseBacktestCsv = (text: string): { rows: BacktestRow[]; rejected:
     const upAsk = numberFor(values, ["up_ask", "yes_ask", "higher_ask"]);
     const downAsk = numberFor(values, ["down_ask", "no_ask", "lower_ask"]);
     if (!Number.isFinite(timestamp) || !asset || reference === null || spot === null || upAsk === null || downAsk === null) { rejected += 1; continue; }
-    rows.push({ timestamp, asset, duration, reference, spot, upAsk, downAsk, outcome: outcomeFor(values), remainingSeconds: numberFor(values, ["remaining_seconds", "seconds_left"]) ?? undefined, marketId: valueFor(values, ["market_id", "market"]) || undefined });
+    const rawAction = valueFor(values, ["validation_decision", "model_action", "initial_decision"]).toUpperCase();
+    const modelAction: PaperSide | "PASS" | null = rawAction === "UP" || rawAction === "DOWN" || rawAction === "PASS" ? rawAction : null;
+    rows.push({
+      timestamp,
+      asset,
+      duration,
+      reference,
+      spot,
+      upAsk,
+      downAsk,
+      outcome: outcomeFor(values),
+      remainingSeconds: numberFor(values, ["remaining_seconds", "seconds_left"]) ?? undefined,
+      marketId: valueFor(values, ["market_id", "market"]) || undefined,
+      modelFairUp: numberFor(values, ["validation_probability_up", "model_fair_up", "fair_up"]),
+      modelAction,
+      modelEdge: numberFor(values, ["validation_edge", "model_edge", "selected_edge"]),
+      modelEntryPrice: numberFor(values, ["validation_entry_price", "model_entry_price", "entry_price"]),
+      modelStakeUsd: numberFor(values, ["validation_stake_usd", "model_stake_usd", "simulated_stake_usd"]),
+    });
   }
   return { rows, rejected };
 };
 
-export const backtestCsvTemplate = "timestamp,asset,duration,market_id,reference,spot,up_ask,down_ask,outcome,remaining_seconds\n";
+export const backtestCsvTemplate = "timestamp,asset,duration,market_id,reference,spot,up_ask,down_ask,outcome,remaining_seconds,validation_probability_up,validation_decision,validation_edge,validation_entry_price,validation_stake_usd\n";

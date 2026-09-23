@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+STATE_DIR=/var/lib/polymarket-quant-engine
+export STATE_DIR
+exec /usr/bin/node /opt/polymarket-quant-engine/scripts/daemon-control.mjs "$@"

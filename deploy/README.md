@@ -1,0 +1,222 @@
+# Hostinger VPS: 24/7 paper trading setup
+
+This guide deploys the repository's headless, **paper-only** trading daemon on an Ubuntu VPS. The trading engine deterministically reads public Polymarket/Coinbase data, checks risk and reconciliation rules, and records a local simulated ledger. systemd keeps it running. Hermes is an optional, low-usage operator for alerts and on-demand commands; it does not choose trades or manage live orders.
+
+The VPS is not created automatically by this repo. Never send passwords, API keys, or wallet secrets in chat or commit them to GitHub. This daemon does not need trading credentials.
+
+## Recommended low-cost host
+
+For this workload, choose **Hostinger KVM 1, Ubuntu 24.04 LTS**: 1 vCPU, 4 GB RAM, 50 GB NVMe, and 4 TB monthly bandwidth. Hostinger currently advertises $6.49/month for its 2-year introductory term and $11.99/month on renewal; the first term is charged upfront, so check the total, taxes, and term at checkout. Prices and promotions vary by country and date. See [Hostinger VPS plans](https://www.hostinger.com/vps-hosting).
+
+Any ordinary x86-64 Ubuntu 24.04 VPS with at least 2 GB RAM should run the paper daemon; 4 GB is preferable if you also install Hermes. The instructions below also work on another provider if it gives you root/sudo access and an Ubuntu 24.04 image. Do not choose shared website/PHP hosting: the worker needs a persistent Linux process and systemd.
+
+## 1. Put the deployment code in your GitHub repository
+
+The deployment changes need to be pushed to the repository before the VPS can clone them. Apply the provided patch to your local checkout of `polymarket-quant-engine`, inspect the changed files, commit, and push to your own branch. Do not push unreviewed changes to `main` if you do not normally do that.
+
+From Windows PowerShell, with the patch downloaded and your project checkout path substituted:
+
+```powershell
+cd C:\path\to\polymarket-quant-engine
+git apply C:\path\to\polymarket-quant-engine-paper-daemon.patch
+git status --short
+git diff --check
+git add .gitignore README.md app/lib/engines.ts app/lib/polymarket-data.ts deploy package.json pnpm-lock.yaml scripts/daemon-control.mjs scripts/trading-daemon.ts
+git commit -m "Add headless paper trading daemon"
+git push -u origin HEAD
+```
+
+Wait for the push to finish, then open the repository on GitHub and confirm it contains `scripts/trading-daemon.ts` and `deploy/install-host.sh`. If the patch is already on your GitHub branch, skip this step. The repository is public and can be cloned over HTTPS without a deploy key.
+
+## 2. Create the Hostinger VPS
+
+In Hostinger hPanel:
+
+1. Choose **VPS → KVM 1** and select **Ubuntu 24.04**. Choose a region with reliable access to Polymarket and Coinbase public APIs.
+2. Add an SSH public key during setup if offered. On your Windows computer, create a key with `ssh-keygen -t ed25519 -C "pqe-hostinger"`, then display the public key with `Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub`. Add only the `.pub` contents under the VPS **Settings → SSH keys** page. Keep the private key on your computer.
+3. In the provider firewall, allow inbound SSH (normally TCP 22). Restrict it to your current public IP if practical. Do not open ports 8787 or 8788.
+4. Wait for the VPS to finish installing. In the VPS overview, note its IP and the SSH username. Hostinger offers a browser-based Web Console as an alternative to SSH; see [Hostinger's SSH connection guide](https://www.hostinger.com/support/5723772-how-to-connect-to-your-vps-via-ssh-at-hostinger/).
+
+Connect from PowerShell using the username shown in hPanel (commonly `root`):
+
+```powershell
+ssh root@YOUR_VPS_IP
+```
+
+Replace `root` if hPanel shows a different username. If prompted about the host key on first connection, check the VPS IP in hPanel before accepting it.
+
+## 3. Update and firewall the VPS
+
+Run these commands in the VPS terminal. If your SSH port is not 22, allow your actual port before enabling UFW or you could disconnect yourself.
+
+```bash
+sudo apt-get update
+sudo apt-get upgrade -y
+sudo apt-get install -y ca-certificates curl git gnupg logrotate python3 util-linux ufw
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow OpenSSH
+sudo ufw --force enable
+sudo ufw status verbose
+```
+
+Confirm SSH remains allowed. The daemon health endpoint is bound to `127.0.0.1` only; do not create a public firewall rule for it.
+
+## 4. Install Node.js, pnpm, and service accounts
+
+The repo requires Node.js 22.13 or newer and pins pnpm 11.25.0. These steps install Node.js 24 and create separate non-login service accounts for the daemon and Hermes.
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_24.x -o /tmp/nodesource_setup.sh
+sudo -E bash /tmp/nodesource_setup.sh
+sudo apt-get install -y nodejs
+node --version
+npm install --global pnpm@11.25.0
+pnpm --version
+
+sudo adduser --system --group --home /nonexistent --no-create-home --shell /usr/sbin/nologin pqe
+sudo adduser --disabled-password --gecos '' hermes
+sudo passwd --lock hermes
+```
+
+Check that Node is v22.13+ and pnpm is exactly 11.25.0 before continuing.
+
+## 5. Clone the public GitHub repository
+
+Clone the branch you pushed in step 1. Replace `main` if you pushed to another branch:
+
+```bash
+sudo git clone --branch main https://github.com/coopermsick-67/polymarket-quant-engine.git /opt/polymarket-quant-engine
+sudo chown -R root:pqe /opt/polymarket-quant-engine
+sudo chmod -R u=rwX,g=rX,o= /opt/polymarket-quant-engine
+cd /opt/polymarket-quant-engine
+sudo pnpm install --prod --frozen-lockfile
+```
+
+## 6. Install and start the paper daemon
+
+The installer creates `/etc/polymarket-quant-engine/engine.env` from a paper-only template, installs systemd and logrotate configuration, and enables restart-on-failure. No wallet, CLOB, or trading API credentials are used.
+
+```bash
+cd /opt/polymarket-quant-engine
+sudo bash deploy/install-host.sh
+sudo systemd-analyze verify /etc/systemd/system/polymarket-quant-engine.service
+sudo logrotate --debug /etc/logrotate.d/polymarket-quant-engine
+sudo cat /etc/polymarket-quant-engine/engine.env
+```
+
+The engine environment file contains the following paper-only settings. Defaults are conservative simulation settings; no trading/API secrets are required or read by this daemon.
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `TRADING_MODE` | `paper` | Required; the daemon exits if this is not `paper`. |
+| `STATE_DIR` | `/var/lib/polymarket-quant-engine` | Persistent simulated ledger and halt switches. |
+| `POLL_INTERVAL_MS` | `15000` | Time between public market-data cycles. |
+| `DATA_STALE_HALT_MS` | `90000` | Latch a halt when complete fresh data is missing this long. |
+| `PAPER_STARTING_CASH` | `1000` | Simulated initial cash, used only when creating a new ledger. |
+| `PAPER_MIN_BET_USD` | `1` | Minimum simulated entry amount; the daemon also limits a bet to available cash. |
+| `PAPER_MIN_BET_PCT` | `0.005` | Lowest bankroll fraction per bet (0.5%). |
+| `PAPER_MAX_BET_PCT` | `0.03` | Highest bankroll fraction per bet (3%); confidence maps linearly from 0.5% at 66% confidence to 3% at 96%. |
+| `PAPER_MAX_EXPOSURE_PCT` | `0.09` | Maximum total deployed simulated cost as a fraction of current equity (9%), subject to the $1 minimum bet. Below $11.11 equity, the $1 floor can exceed this portfolio cap; below $33.33, it can exceed the 3% per-bet maximum. |
+| `PAPER_MAX_OPEN_POSITIONS` | `3` | Maximum simultaneous simulated positions. |
+| `PAPER_MAX_DAILY_LOSS_PCT` | `0.05` | Daily loss fraction that halts new entries. Open positions remain exposed and may lose more than this threshold before they settle or close. |
+| `PAPER_MIN_NET_EDGE` | `0.04` | Minimum estimated net edge required for paper entry. |
+| `PAPER_FEE_RATE` | `0.02` | Conservative notional-fee floor; the simulator also applies the CLOB market fee schedule when available and a conservative crypto schedule when it is not. |
+| `PAPER_SLIPPAGE_BPS` | `15` | Assumed slippage in basis points for the simulation. |
+
+Edit the environment file only if you understand these simulated limits. Do not add wallet, Polymarket, or messaging secrets to it.
+
+The daemon saves state in `/var/lib/polymarket-quant-engine/paper-state.json`, checks the paper ledger's cash/positions/P&L reconciliation on every cycle, and halts new entries on stale data or risk-limit violations. A daily-loss halt blocks new entries; it does not force-close open positions, which can continue losing beyond the configured threshold. Kill, pause, and halt files are persistent until an operator changes them. Logs rotate daily and are compressed.
+
+Verify the daemon before installing Hermes:
+
+```bash
+sudo systemctl is-enabled polymarket-quant-engine.service
+sudo systemctl is-active polymarket-quant-engine.service
+curl --fail --silent http://127.0.0.1:8788/healthz | python3 -m json.tool
+sudo -u pqe /usr/local/bin/pqe-control status
+sudo tail -n 50 /var/log/polymarket-quant-engine/trading.log
+```
+
+Expected: service is `enabled` and `active`; health returns `ok: true`; status says `mode: paper`, `reconciliation: PASS`, and `WAITING_FOR_DATA` or `PAPER_RUNNING`. `WAITING_FOR_DATA` can occur while public endpoints load; if the data stays stale, the daemon latches a halt instead of trading.
+
+## 7. Install Hermes as the optional, low-usage operator
+
+systemd alone keeps the daemon running, so Hermes is optional for uptime. Hermes adds a watchdog and, if configured, Telegram or another messaging channel. The recurring five-minute watchdog uses Hermes cron's `--no-agent --script` mode, so the health checks and restarts do not use model tokens. A natural-language summary or chat command calls your chosen model only when you invoke it.
+
+Install Hermes as the separate `hermes` user, follow its setup prompts, and configure the messaging channel you want. Keep any messaging token and model-provider key in Hermes's host-side profile only. The Hermes installer and system gateway instructions are in the [official quickstart](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/getting-started/quickstart.md) and [gateway documentation](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/messaging/index.md).
+
+```bash
+sudo -u hermes -H bash -lc 'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash'
+sudo -u hermes -H bash -lc 'hermes setup'
+sudo -u hermes -H bash -lc 'hermes gateway setup'
+```
+
+Install the repository's restricted operator skill and watchdog script, then install the gateway as a system service:
+
+```bash
+sudo install -d -o hermes -g hermes -m 0750 /home/hermes/.hermes/skills/polymarket-ops /home/hermes/.hermes/scripts
+sudo install -o hermes -g hermes -m 0640 /opt/polymarket-quant-engine/deploy/hermes/SKILL.md /home/hermes/.hermes/skills/polymarket-ops/SKILL.md
+sudo install -o hermes -g hermes -m 0750 /opt/polymarket-quant-engine/deploy/hermes/polymarket-watchdog.sh /home/hermes/.hermes/scripts/polymarket-watchdog.sh
+
+HERMES_BIN="$(sudo -u hermes -H bash -lc 'command -v hermes')"
+sudo env HOME=/home/hermes HERMES_HOME=/home/hermes/.hermes "$HERMES_BIN" gateway install --system --run-as-user hermes
+sudo systemctl status hermes-gateway --no-pager
+```
+
+After connecting your chosen messaging channel, register the script-only watchdog. `telegram` is the Hermes delivery name for Telegram; use the delivery name for the channel you configured:
+
+```bash
+sudo -u hermes -H bash -lc 'hermes cron create "every 5m" --no-agent --script /home/hermes/.hermes/scripts/polymarket-watchdog.sh --deliver telegram --name polymarket-paper-watchdog'
+sudo -u hermes -H bash -lc 'hermes cron list'
+sudo -u hermes -H bash -lc 'hermes cron status'
+```
+
+The watchdog checks systemd and the local `/healthz`, restarts an unhealthy process with a ten-minute cooldown, and reports state changes/actionable halts. It does not clear a kill or risk halt. Use messaging commands only for status, pause/resume, or kill; clearing a halt requires an explicit operator action. Keep Hermes permissions restricted as installed by `deploy/install-host.sh`.
+
+## 8. Operator commands and final checks
+
+Run on the VPS:
+
+```bash
+sudo systemctl is-enabled polymarket-quant-engine.service
+sudo systemctl is-active polymarket-quant-engine.service
+curl --fail --silent http://127.0.0.1:8788/healthz | python3 -m json.tool
+sudo -u pqe /usr/local/bin/pqe-control status
+sudo logrotate --debug /etc/logrotate.d/polymarket-quant-engine
+sudo -u hermes -H bash -lc 'hermes cron list'
+sudo -u hermes -H bash -lc 'hermes cron status'
+```
+
+Useful controls:
+
+```bash
+sudo -u pqe /usr/local/bin/pqe-control pause
+sudo -u pqe /usr/local/bin/pqe-control resume
+sudo -u pqe /usr/local/bin/pqe-control kill
+sudo -u pqe /usr/local/bin/pqe-control clear-halt
+sudo -u pqe /usr/local/bin/pqe-control status
+sudo systemctl restart polymarket-quant-engine.service
+sudo journalctl -u polymarket-quant-engine.service -n 100 --no-pager
+```
+
+To watch the live paper ledger from an interactive SSH terminal, open a second SSH session and run:
+
+```bash
+cd /opt/polymarket-quant-engine
+pnpm run dashboard
+```
+
+The terminal clock, position countdowns, and dashboard view refresh every second. The daemon keeps market discovery on its 15-second REST cycle and updates marks from Coinbase and Polymarket WebSocket feeds as quotes arrive; the Polymarket stream subscribes only to the assets held in open positions. If the dashboard says the endpoint cannot be reached, keep the daemon running in another terminal or check that systemd is active. Press `q` to close only the monitor; systemd continues running the daemon. Press `r` for an immediate refresh. The dashboard reads the local-only status endpoint and does not expose a public web page.
+
+`kill` latches the kill switch and blocks new paper entries. `clear-halt` removes halt flags, so inspect the status and logs first. `pause` blocks new entries without stopping settlement/cashout processing. The service's `/healthz` and `/status` bind to localhost only; never expose port 8788 publicly.
+
+For source updates, review the target commit first, stop the service, back up `/var/lib/polymarket-quant-engine`, install the reviewed code and frozen production dependencies, then start the service and repeat the final checks. Do not deploy an unreviewed `git pull` automatically.
+
+## What this does and does not do
+
+- This host runs the headless **paper** daemon. Its `TRADING_MODE` must remain `paper`; it exits for any other value.
+- No live orders are submitted. Do not add wallet private keys or Polymarket trading credentials for this daemon.
+- Paper results are simulated and the strategy is heuristic, not a verified profit claim.
+- The deterministic engine owns market signals, paper risk limits, stale-data halts, reconciliation, and simulated execution. Hermes only supervises the process and responds to explicit operator requests.
+- Hermes watchdog polls every five minutes without model inference. Chat summaries and natural-language commands are on demand and use the model/API you configure.

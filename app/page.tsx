@@ -46,6 +46,7 @@ import {
   discoverCryptoMarkets,
   fetchCandleHistories,
   fetchOrderBooks,
+  fetchResolvedMarketOutcomes,
   fetchSpotPrices,
   replaceLiveMarketBook,
   updateLiveMarketBookLevel,
@@ -67,9 +68,10 @@ import {
   closePaperPositions,
   createPaperAccount,
   markAccount,
+  paperStakeUsd,
   parseBacktestCsv,
   runBacktest,
-  settleResolvedPaperPositions,
+  settlePaperPositionsByOutcome,
   type BacktestResult,
   type BacktestRow,
   type CostConfig,
@@ -78,9 +80,9 @@ import {
 } from "./lib/engines";
 import LiveExecutionPanel, { type LiveExecutionStatus, type LiveSessionState } from "./components/live-execution-panel";
 import PaperLabPanel, { type PaperTestViewState, type TelegramViewState } from "./components/paper-lab-panel";
-import { computeLedgerMetrics, decisionLedgerCsv, ledgerResultFor, type MarketDecisionRow } from "./lib/decision-ledger";
+import { ACTIVE_MODEL_VERSION, computeLedgerMetrics, decisionLedgerCsv, ledgerResultFor, type MarketDecisionRow } from "./lib/decision-ledger";
 import { DEFAULT_PAPER_EARLY_EXIT, evaluateModelAwareExit, normalizeEarlyExitPolicy, type EarlyExitPolicy } from "./lib/early-exit";
-import { normalizeLiveRiskConfig, type LiveRiskConfig } from "./lib/live-risk";
+import { enforceLiveExecutionRisk, type LiveRiskConfig } from "./lib/live-risk";
 
 type View = "overview" | "paper" | "account" | "live" | "backtest";
 type Tone = "positive" | "warning" | "negative" | "neutral";
@@ -101,7 +103,7 @@ const ACCOUNT_WALLET_STORAGE_KEY = "polymarket-quant-account-wallet-v1";
 const LIVE_RISK_STORAGE_KEY = "polymarket-quant-live-risk-v1";
 const LEDGER_STORAGE_KEY = "polymarket-quant-decision-ledger-v1";
 const TELEGRAM_LAST_SENT_KEY = "polymarket-quant-telegram-last-sent-v1";
-const DEFAULT_CONFIG: Config = { minEdge: 0.03, maxTrade: 25, maxLoss: 0.05, feeRate: 0.02, slippageBps: 15, ...DEFAULT_PAPER_EARLY_EXIT };
+const DEFAULT_CONFIG: Config = { minEdge: 0.04, maxTrade: 25, maxLoss: 0.05, feeRate: 0.02, slippageBps: 15, ...DEFAULT_PAPER_EARLY_EXIT };
 const EMPTY_ACCOUNT_CONNECTION: AccountConnection = { walletAddress: "", privateKey: "", signatureType: "3" };
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
@@ -115,7 +117,8 @@ const formatTime = (timestamp: number | null) => timestamp ? new Date(timestamp)
 const formatAge = (timestamp: number | null, now: number) => timestamp ? `${Math.max(0, now - timestamp)} ms ago` : "waiting";
 const assetTone = (asset: string) => asset === "BTC" ? "asset-btc" : asset === "ETH" ? "asset-eth" : asset === "SOL" ? "asset-sol" : "asset-xrp";
 const quantity = (value: number | null) => value === null || !Number.isFinite(value) ? "—" : value.toFixed(2);
-const marketOutcome = (market: LiveMarket): PaperSide | null => market.reference === null || market.spot === null ? null : market.spot >= market.reference ? "UP" : "DOWN";
+const PAPER_MAX_EXPOSURE_PCT = 0.09;
+const PAPER_MAX_OPEN_POSITIONS = 3;
 
 const readStoredJson = <T,>(key: string): T | null => {
   if (typeof window === "undefined") return null;
@@ -177,8 +180,6 @@ function MetricCard({ label, value, delta, deltaTone = "positive", detail, icon,
   return <article className="metric-card"><div className="metric-topline"><span className="metric-label">{label}</span><span className="metric-icon">{icon}</span></div><div className="metric-value">{value}</div><div className="metric-bottom"><span className={`delta ${deltaTone}`}>{delta}</span><span className="metric-detail">{detail}</span></div>{spark && spark.length > 1 ? <Sparkline values={spark} color={deltaTone === "negative" ? "#ff7d8a" : "#6cf2c4"} /> : null}</article>;
 }
 
-const marketEdge = (market: LiveMarket, config: Config) => bestCandidateFor(market, { feeRate: config.feeRate, slippageBps: config.slippageBps }, config.maxTrade, config.minEdge);
-
 function MarketCard({ market, selected, config, onSelect }: { market: LiveMarket; selected: boolean; config: Config; onSelect: () => void }) {
   const signal = analyzeMarketSignal(market, { feeRate: config.feeRate, slippageBps: config.slippageBps }, config.maxTrade, config.minEdge);
   const action: { label: string; tone: Tone } = signal.action === "PASS"
@@ -231,17 +232,19 @@ export default function Home() {
   const [engineRunning, setEngineRunning] = useState(false); const [paused, setPaused] = useState(false); const [killSwitch, setKillSwitch] = useState(false); const [runnerDialogOpen, setRunnerDialogOpen] = useState(false); const [selectedRange, setSelectedRange] = useState("ALL"); const [startingCashInput, setStartingCashInput] = useState("1000");
   const [recordedTicks, setRecordedTicks] = useState<BacktestRow[]>([]); const [backtestRows, setBacktestRows] = useState<BacktestRow[]>([]); const [backtestRejected, setBacktestRejected] = useState(0); const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null); const [backtestStartingCash, setBacktestStartingCash] = useState(1000);
   const [accountConnection, setAccountConnection] = useState<AccountConnection>(() => ({ ...EMPTY_ACCOUNT_CONNECTION, walletAddress: readStoredJson<{ walletAddress?: string }>(ACCOUNT_WALLET_STORAGE_KEY)?.walletAddress ?? "" })); const [connectedAccount, setConnectedAccount] = useState<ConnectedAccount | null>(null); const [accountLoading, setAccountLoading] = useState(false); const [accountError, setAccountError] = useState(""); const [accountDialogOpen, setAccountDialogOpen] = useState(false);
-  const [liveRisk, setLiveRisk] = useState<LiveRiskConfig>(() => normalizeLiveRiskConfig(readStoredJson<Partial<LiveRiskConfig>>(LIVE_RISK_STORAGE_KEY))); const [liveSession, setLiveSession] = useState<LiveSessionState | null>(null); const [liveRunning, setLiveRunning] = useState(false); const [livePaused, setLivePaused] = useState(false); const [liveConsent, setLiveConsent] = useState(false); const [liveStatus, setLiveStatus] = useState<LiveExecutionStatus>({ lastAction: "", lastDetail: "", lastError: "", lastLatencyMs: null });
+  const [liveRisk, setLiveRisk] = useState<LiveRiskConfig>(() => enforceLiveExecutionRisk(readStoredJson<Partial<LiveRiskConfig>>(LIVE_RISK_STORAGE_KEY))); const [liveSession, setLiveSession] = useState<LiveSessionState | null>(null); const [liveRunning, setLiveRunning] = useState(false); const [livePaused, setLivePaused] = useState(false); const [liveConsent, setLiveConsent] = useState(false); const [liveStatus, setLiveStatus] = useState<LiveExecutionStatus>({ lastAction: "", lastDetail: "", lastError: "", lastLatencyMs: null });
   const [ledgerRows, setLedgerRows] = useState<MarketDecisionRow[]>(() => readStoredJson<MarketDecisionRow[]>(LEDGER_STORAGE_KEY) ?? []);
   const [paperTestStartingBalanceInput, setPaperTestStartingBalanceInput] = useState("1000"); const [paperTestDurationDaysInput, setPaperTestDurationDaysInput] = useState("1");
   const [paperTest, setPaperTest] = useState<PaperTestViewState>({ status: "IDLE", startingBalance: 1000, days: 1, startedAt: null, endsAt: null, balance: 1000, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null });
   const [telegram, setTelegram] = useState<TelegramViewState>({ connected: false, botUsername: "", botName: "", chatId: "", chatTitle: "", expiresAt: null, lastStatus: "", lastError: "" });
   const previousSpots = useRef(new Map<Asset, number>()); const priceHistoryByAsset = useRef(new Map<Asset, MarketPriceTick[]>()); const autoLastFill = useRef(new Map<string, number>()); const dataLogState = useRef(""); const hydrated = useRef(false); const refreshBusy = useRef(false); const paperAutoStarted = useRef(false); const liveBusy = useRef(false); const liveAttempted = useRef(new Map<string, number>()); const liveReason = useRef(""); const paperExitObservations = useRef(new Map<string, { count: number; lastSeen: number }>()); const livePositionsRef = useRef<LivePositionSnapshot[]>([]); const liveExitObservations = useRef(new Map<string, { count: number; lastSeen: number }>()); const livePositionRefreshBusy = useRef(false); const livePositionRefreshedAt = useRef(0);
+  const paperAccountRef = useRef(account); const resolutionBusy = useRef(false); const resolutionCheckedAt = useRef(new Map<string, number>()); const completedTestLogAt = useRef<number | null>(null);
   const ledgerSnapshots = useRef(new Map<string, { market: LiveMarket; observedAt: number }>()); const ledgerLastScan = useRef(0); const telegramSendBusy = useRef(false);
 
   const appendLog = useCallback((message: string, detail: string, tone: Tone = "neutral") => { setLogs((current) => [{ id: `${Date.now()}-${message}`, time: new Date().toLocaleTimeString("en-US", { hour12: false }), message, detail, tone }, ...current].slice(0, 18)); }, []);
 
   useEffect(() => { if (typeof window === "undefined") return; const rawAccount = readStoredJson<PaperAccount>(PAPER_STORAGE_KEY); const rawConfig = readStoredJson<Partial<Config>>(CONFIG_STORAGE_KEY); if (rawAccount?.startingCash) setAccount(rawAccount); if (rawConfig) setConfig({ ...DEFAULT_CONFIG, ...rawConfig, ...normalizeEarlyExitPolicy(rawConfig, DEFAULT_PAPER_EARLY_EXIT) }); setStartingCashInput(String(rawAccount?.startingCash ?? 1000)); hydrated.current = true; }, []);
+  useEffect(() => { paperAccountRef.current = account; }, [account]);
   useEffect(() => { if (hydrated.current && typeof window !== "undefined") window.localStorage.setItem(PAPER_STORAGE_KEY, JSON.stringify(account)); }, [account]);
   useEffect(() => { if (typeof window !== "undefined") window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config)); }, [config]);
   useEffect(() => { if (typeof window !== "undefined") window.localStorage.setItem(LIVE_RISK_STORAGE_KEY, JSON.stringify(liveRisk)); }, [liveRisk]);
@@ -317,8 +320,7 @@ export default function Home() {
     const now = Date.now();
     if (now - ledgerLastScan.current < 4500) return;
     ledgerLastScan.current = now;
-    const activeIds = new Set(liveMarkets.map((market) => market.id));
-    for (const market of liveMarkets) ledgerSnapshots.current.set(market.id, { market, observedAt: now });
+      for (const market of liveMarkets) ledgerSnapshots.current.set(market.id, { market, observedAt: now });
     setLedgerRows((current) => {
       const rows = new Map(current.map((row) => [row.id, row]));
       let changed = false;
@@ -327,6 +329,21 @@ export default function Home() {
         const previous = rows.get(market.id);
         const decision = signal.action;
         const outcome = previous?.outcome ?? null;
+        const isCurrentModel = previous?.modelVersion === ACTIVE_MODEL_VERSION;
+        let validationDecision = isCurrentModel ? previous?.validationDecision ?? "PASS" : "PASS";
+        let validationFairUp = isCurrentModel ? previous?.validationFairUp ?? null : null;
+        let validationEdge = isCurrentModel ? previous?.validationEdge ?? null : null;
+        let validationEntryPrice = isCurrentModel ? previous?.validationEntryPrice ?? null : null;
+        let validationStakeUsd = isCurrentModel ? previous?.validationStakeUsd ?? null : null;
+        let validationAt = isCurrentModel ? previous?.validationAt ?? null : null;
+        if (validationDecision === "PASS" && decision !== "PASS" && signal.fairUp !== null && market.referenceSource === "POLYMARKET") {
+          validationDecision = decision;
+          validationFairUp = signal.fairUp;
+          validationEdge = signal.edge;
+          validationEntryPrice = signal.entryPrice;
+          validationStakeUsd = signal.estimatedFill?.totalCost ?? null;
+          validationAt = now;
+        }
         const next: MarketDecisionRow = previous ? {
           ...previous,
           lastUpdatedAt: now,
@@ -347,7 +364,7 @@ export default function Home() {
           reference: market.reference,
           spot: market.spot,
           remainingSeconds: market.remaining,
-          result: ledgerResultFor(decision, outcome),
+          result: ledgerResultFor(validationDecision, outcome),
           simulatedStake: signal.estimatedFill?.totalCost ?? 0,
           simulatedUnits: signal.estimatedFill?.shares ?? 0,
           signalConfidence: signal.confidence,
@@ -356,6 +373,13 @@ export default function Home() {
           trend15m: signal.trend15m,
           reason: signal.reason,
           changeCount: previous.changeCount + (previous.decision === decision ? 0 : 1),
+          modelVersion: ACTIVE_MODEL_VERSION,
+          validationDecision,
+          validationFairUp,
+          validationEdge,
+          validationEntryPrice,
+          validationStakeUsd,
+          validationAt,
         } : {
           id: market.id,
           marketId: market.id,
@@ -381,7 +405,7 @@ export default function Home() {
           spot: market.spot,
           remainingSeconds: market.remaining,
           outcome: null,
-          result: ledgerResultFor(decision, null),
+          result: ledgerResultFor(decision !== "PASS" && market.referenceSource === "POLYMARKET" ? decision : "PASS", null),
           outcomeAt: null,
           simulatedStake: signal.estimatedFill?.totalCost ?? 0,
           simulatedUnits: signal.estimatedFill?.shares ?? 0,
@@ -391,24 +415,90 @@ export default function Home() {
           trend15m: signal.trend15m,
           reason: signal.reason,
           changeCount: 0,
+          modelVersion: ACTIVE_MODEL_VERSION,
+          validationDecision: decision !== "PASS" && market.referenceSource === "POLYMARKET" ? decision : "PASS",
+          validationFairUp: decision !== "PASS" && market.referenceSource === "POLYMARKET" ? signal.fairUp : null,
+          validationEdge: decision !== "PASS" && market.referenceSource === "POLYMARKET" ? signal.edge : null,
+          validationEntryPrice: decision !== "PASS" && market.referenceSource === "POLYMARKET" ? signal.entryPrice : null,
+          validationStakeUsd: decision !== "PASS" && market.referenceSource === "POLYMARKET" ? signal.estimatedFill?.totalCost ?? null : null,
+          validationAt: decision !== "PASS" && market.referenceSource === "POLYMARKET" ? now : null,
         };
         if (!previous || JSON.stringify(previous) !== JSON.stringify(next)) { rows.set(market.id, next); changed = true; }
-      }
-      for (const [marketId, snapshot] of ledgerSnapshots.current) {
-        const previous = rows.get(marketId);
-        if (!previous || activeIds.has(marketId) || snapshot.market.countdownEndsAt > now - 1500) continue;
-        const outcome = previous.outcome ?? marketOutcome(snapshot.market);
-        if (!outcome) continue;
-        const next = { ...previous, remainingSeconds: 0, outcome, outcomeAt: previous.outcomeAt ?? now, result: ledgerResultFor(previous.decision, outcome), lastUpdatedAt: now };
-        if (JSON.stringify(previous) !== JSON.stringify(next)) { rows.set(marketId, next); changed = true; }
-        ledgerSnapshots.current.delete(marketId);
       }
       return changed ? [...rows.values()].sort((left, right) => right.observedAt - left.observedAt) : current;
     });
   }, [config.maxTrade, config.minEdge, costs, liveMarkets]);
+
+  useEffect(() => {
+    let disposed = false;
+    const resolveExpired = async () => {
+      if (resolutionBusy.current) return;
+      const now = Date.now();
+      const pending = new Map<string, { id: string; upTokenId?: string; downTokenId?: string }>();
+      for (const [marketId, snapshot] of ledgerSnapshots.current) {
+        if (snapshot.market.endTime <= now - 1500 && now - (resolutionCheckedAt.current.get(marketId) ?? 0) >= 60_000) {
+          pending.set(marketId, { id: marketId, upTokenId: snapshot.market.upTokenId, downTokenId: snapshot.market.downTokenId });
+        }
+      }
+      for (const position of paperAccountRef.current.positions) {
+        if (position.endTime <= now - 1500 && now - (resolutionCheckedAt.current.get(position.marketId) ?? 0) >= 60_000 && !pending.has(position.marketId)) {
+          pending.set(position.marketId, { id: position.marketId });
+        }
+      }
+      const batch = [...pending.values()].slice(0, 24);
+      if (!batch.length) return;
+      for (const market of batch) resolutionCheckedAt.current.set(market.id, now);
+      resolutionBusy.current = true;
+      try {
+        const outcomes = await fetchResolvedMarketOutcomes(batch);
+        if (disposed || !outcomes.size) return;
+        const settledAt = Date.now();
+        setAccount((current) => settlePaperPositionsByOutcome(current, outcomes, "market resolution", settledAt).account);
+        setLedgerRows((current) => current.map((row) => {
+          const outcome = outcomes.get(row.marketId);
+          if (!outcome || row.outcome) return row;
+          return {
+            ...row,
+            remainingSeconds: 0,
+            outcome,
+            outcomeAt: row.outcomeAt ?? settledAt,
+            result: ledgerResultFor(row.validationDecision ?? "PASS", outcome),
+            lastUpdatedAt: settledAt,
+          };
+        }));
+        for (const marketId of outcomes.keys()) {
+          ledgerSnapshots.current.delete(marketId);
+          resolutionCheckedAt.current.delete(marketId);
+        }
+        appendLog("Gamma market results confirmed", `${outcomes.size} expired market${outcomes.size === 1 ? "" : "s"} resolved from final Polymarket outcomes.`, "positive");
+      } catch {
+        // Keep expired positions open and retry on a later poll when Gamma is unavailable.
+      } finally {
+        resolutionBusy.current = false;
+      }
+    };
+    void resolveExpired();
+    const timer = window.setInterval(() => void resolveExpired(), 15_000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [appendLog]);
+  useEffect(() => {
+    if (paperTest.status !== "PENDING_RESOLUTION" || account.positions.length > 0) return;
+    if (paperTest.startedAt !== null && completedTestLogAt.current === paperTest.startedAt) return;
+    completedTestLogAt.current = paperTest.startedAt;
+    setPaperTest((current) => current.status === "PENDING_RESOLUTION" ? {
+      ...current,
+      status: "COMPLETE",
+      balance: accountEquity(account, liveMarketMap),
+      trades: account.fills.filter((fill) => fill.action === "BUY").length,
+      openPositions: 0,
+      realizedPnl: account.realizedPnl,
+      winRate: accountWinRate(account),
+    } : current);
+    appendLog("Forward paper test complete", `${paperTest.days} day${paperTest.days === 1 ? "" : "s"} elapsed · all positions received final Gamma outcomes.`, "positive");
+  }, [account, liveMarketMap, paperTest.days, paperTest.startedAt, paperTest.status, appendLog]);
   const equity = useMemo(() => accountEquity(account, marketMap), [account, marketMap]); const unrealized = useMemo(() => accountUnrealized(account, marketMap), [account, marketMap]); const winRate = useMemo(() => accountWinRate(account), [account]); const deployed = useMemo(() => accountDeployed(account), [account]); const todayPnl = equity - account.startingCash;
   const paperTestView = useMemo<PaperTestViewState>(() => ({ ...paperTest, balance: accountEquity(account, liveMarketMap), trades: account.fills.filter((fill) => fill.action === "BUY").length, openPositions: account.positions.length, realizedPnl: account.realizedPnl, winRate: accountWinRate(account) }), [account, liveMarketMap, paperTest]);
-  const maxDrawdown = useMemo(() => { let peak = 0; let drawdown = 0; for (const point of account.equityHistory) { peak = Math.max(peak, point.equity); if (peak > 0) drawdown = Math.max(drawdown, (peak - point.equity) / peak); } return drawdown; }, [account.equityHistory]); const equitySeries = useMemo(() => account.equityHistory.map((point) => point.equity), [account.equityHistory]); const selectedSignal = selectedMarket ? analyzeMarketSignal(selectedMarket, costs, config.maxTrade, config.minEdge) : null; const currentAction = !selectedSignal || selectedSignal.action === "PASS" ? { label: "PASS", tone: "warning" as Tone } : { label: `${selectedSignal.tier} ${selectedSignal.action}`, tone: selectedSignal.action === "UP" ? "positive" as Tone : "negative" as Tone };
+  const maxDrawdown = useMemo(() => { let peak = 0; let drawdown = 0; for (const point of account.equityHistory) { peak = Math.max(peak, point.equity); if (peak > 0) drawdown = Math.max(drawdown, (peak - point.equity) / peak); } return drawdown; }, [account.equityHistory]); const equitySeries = useMemo(() => account.equityHistory.map((point) => point.equity), [account.equityHistory]); const paperStakeTarget = Math.min(config.maxTrade, paperStakeUsd(equity, account.cash)); const selectedSignal = selectedMarket ? analyzeMarketSignal(selectedMarket, costs, paperStakeTarget, config.minEdge) : null; const currentAction = !selectedSignal || selectedSignal.action === "PASS" ? { label: "PASS", tone: "warning" as Tone } : { label: `${selectedSignal.tier} ${selectedSignal.action}`, tone: selectedSignal.action === "UP" ? "positive" as Tone : "negative" as Tone };
 
   useEffect(() => { const timer = window.setInterval(() => setClock(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
 
@@ -563,18 +653,10 @@ export default function Home() {
     const simulationMarkets = new Map(liveMarketMap);
     for (const [marketId, snapshot] of ledgerSnapshots.current) if (!simulationMarkets.has(marketId)) simulationMarkets.set(marketId, snapshot.market);
     if (paperTest.status === "RUNNING" && paperTest.endsAt !== null && now >= paperTest.endsAt) {
-      const settled = settleResolvedPaperPositions(account, simulationMarkets, "timeframe test complete", now);
-      const completed = markAccount(settled.account, simulationMarkets, now);
-      setAccount(completed);
-      setPaperTest((current) => ({ ...current, status: "COMPLETE", balance: accountEquity(completed, simulationMarkets), trades: completed.fills.filter((fill) => fill.action === "BUY").length, openPositions: completed.positions.length, realizedPnl: completed.realizedPnl, winRate: accountWinRate(completed) }));
+      const complete = account.positions.length === 0;
+      setPaperTest((current) => ({ ...current, status: complete ? "COMPLETE" : "PENDING_RESOLUTION", balance: accountEquity(account, simulationMarkets), trades: account.fills.filter((fill) => fill.action === "BUY").length, openPositions: account.positions.length, realizedPnl: account.realizedPnl, winRate: accountWinRate(account) }));
       setEngineRunning(false); setPaused(true);
-      appendLog("Forward paper test complete", `${paperTest.days} day${paperTest.days === 1 ? "" : "s"} elapsed · ${settled.closed} market${settled.closed === 1 ? "" : "s"} resolved · ${completed.fills.filter((fill) => fill.action === "BUY").length} entries recorded.`, "positive");
-      return;
-    }
-    const settlement = settleResolvedPaperPositions(account, simulationMarkets, "market resolution", now);
-    if (settlement.closed) {
-      setAccount(markAccount(settlement.account, marketMap, now));
-      appendLog("Paper markets resolved", `${settlement.closed} position${settlement.closed === 1 ? "" : "s"} settled · ${signedDollars(settlement.realized)} realized and returned to shared cash.`, settlement.realized >= 0 ? "positive" : "negative");
+      appendLog(complete ? "Forward paper test complete" : "Forward paper test ended; awaiting Gamma", complete ? `${paperTest.days} day${paperTest.days === 1 ? "" : "s"} elapsed · no open positions · ${account.fills.filter((fill) => fill.action === "BUY").length} entries recorded.` : `${paperTest.days} day${paperTest.days === 1 ? "" : "s"} elapsed · ${account.positions.length} positions remain open until their final Polymarket outcomes are available.`, complete ? "positive" : "warning");
       return;
     }
     if (!killSwitch && account.positions.length) {
@@ -584,7 +666,7 @@ export default function Home() {
       for (const key of paperExitObservations.current.keys()) if (!activePositionIds.has(key)) paperExitObservations.current.delete(key);
       for (const position of account.positions) {
         const market = simulationMarkets.get(position.marketId);
-        if (!market || market.fairUp === null) {
+        if (!market || market.fairUp === null || market.remaining <= 0) {
           paperExitObservations.current.delete(position.id);
           continue;
         }
@@ -617,8 +699,20 @@ export default function Home() {
     }
     if (paused || killSwitch || !markets.length) return;
     if (maxDrawdown >= config.maxLoss) { setEngineRunning(false); setPaused(true); appendLog("Daily loss halt triggered", `Drawdown reached ${percentage(maxDrawdown)} against the ${percentage(config.maxLoss)} guardrail.`, "negative"); return; }
-    const candidates = liveMarkets.map((market) => ({ market, candidate: marketEdge(market, config) })).filter((item): item is { market: LiveMarket; candidate: NonNullable<ReturnType<typeof marketEdge>> } => Boolean(item.candidate && item.candidate.edge >= config.minEdge && item.market.liquidity >= config.maxTrade)); const next = candidates.sort((left, right) => right.candidate.edge - left.candidate.edge)[0]; if (!next || account.cash <= 0 || account.positions.some((position) => position.marketId === next.market.id)) return;
-    const last = autoLastFill.current.get(next.market.id) ?? 0; if (now - last < 15000) return; const result = buyPaper(account, next.market, next.candidate.side, config.maxTrade, costs, "auto engine candidate", now); if (!result.fill) return; autoLastFill.current.set(next.market.id, now); setAccount(markAccount(result.account, marketMap, now)); appendLog(`${next.market.asset} ${next.market.duration} paper fill`, `${next.candidate.side} · ${result.fill.shares.toFixed(2)} shares @ ${cents(result.fill.price)} · edge ${percentage(next.candidate.edge)}`, "positive");
+    const bankroll = accountEquity(account, marketMap);
+    const stakeUsd = Math.min(config.maxTrade, paperStakeUsd(bankroll, account.cash));
+    const exposureLimit = Math.max(1, bankroll * PAPER_MAX_EXPOSURE_PCT);
+    if (stakeUsd < 1 || account.positions.length >= PAPER_MAX_OPEN_POSITIONS || accountDeployed(account) + stakeUsd > exposureLimit) return;
+    const candidates = liveMarkets.map((market) => ({ market, candidate: bestCandidateFor(market, costs, stakeUsd, config.minEdge) })).filter((item): item is { market: LiveMarket; candidate: NonNullable<ReturnType<typeof bestCandidateFor>> } => Boolean(item.candidate && item.candidate.edge >= config.minEdge && item.market.liquidity >= stakeUsd && !account.positions.some((position) => position.marketId === item.market.id)));
+    const next = candidates.sort((left, right) => right.candidate.edge - left.candidate.edge)[0];
+    if (!next) return;
+    const last = autoLastFill.current.get(next.market.id) ?? 0;
+    if (now - last < 15_000) return;
+    const result = buyPaper(account, next.market, next.candidate.side, stakeUsd, costs, "auto engine candidate", now);
+    if (!result.fill) return;
+    autoLastFill.current.set(next.market.id, now);
+    setAccount(markAccount(result.account, marketMap, now));
+    appendLog(`${next.market.asset} ${next.market.duration} paper fill`, `${next.candidate.side} · ${result.fill.shares.toFixed(2)} shares @ ${cents(result.fill.price)} · ${dollars(result.fill.totalCost)} stake · edge ${percentage(next.candidate.edge)}`, "positive");
   }, [account, config, costs, engineRunning, killSwitch, liveMarketMap, liveMarkets, marketMap, markets.length, paused, maxDrawdown, appendLog, paperTest.days, paperTest.endsAt, paperTest.status]);
 
   const startEngine = () => { if (killSwitch) { appendLog("Start blocked by kill switch", "Reset the paper session before enabling the engine.", "negative"); return; } setEngineRunning(true); setPaused(false); setPaperTest((current) => current.status === "PAUSED" ? { ...current, status: "RUNNING" } : current); setView("paper"); appendLog("Paper engine started", "The Paper Trader and Paper Lab now use the same shared account, positions, and resolution ledger.", "positive"); };
@@ -626,8 +720,8 @@ export default function Home() {
   const cancelOrders = () => { setAccount((current) => ({ ...current, openOrders: 0 })); appendLog("Paper order queue cleared", "Immediate paper fills are already ledgered; there were no live orders to cancel.", "warning"); };
   const closePositions = () => { const result = closePaperPositions(account, marketMap, costs, "manual close all"); setAccount(markAccount(result.account, marketMap)); appendLog(result.closed ? "Paper positions closed" : "No executable paper exits", `${result.closed} closed · ${result.skipped} held because no current bid was available.`, result.closed ? "positive" : "warning"); };
   const triggerKillSwitch = () => { setKillSwitch(true); setEngineRunning(false); setPaused(true); setPaperTest((current) => current.status === "RUNNING" ? { ...current, status: "PAUSED" } : current); setAccount((current) => ({ ...current, openOrders: 0 })); appendLog("EMERGENCY KILL SWITCH", "Auto execution disabled and new shared paper orders blocked.", "negative"); };
-  const resetPaperSession = () => { const startingCash = Number(startingCashInput); const next = createPaperAccount(Number.isFinite(startingCash) && startingCash > 0 ? startingCash : 1000); setAccount(next); setPaperTest({ status: "IDLE", startingBalance: next.startingCash, days: 1, startedAt: null, endsAt: null, balance: next.startingCash, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null }); setKillSwitch(false); setEngineRunning(false); setPaused(false); appendLog("Shared paper account reset", `New empty ledger created with ${dollars(next.startingCash)} starting cash.`, "neutral"); };
-  const manualBuy = (side: PaperSide) => { if (!selectedMarket) return; if (selectedSignal?.action !== side) { appendLog(`${side} paper entry blocked`, selectedSignal?.reason ?? "No chart signal is available.", "warning"); return; } const result = buyPaper(account, selectedMarket, side, config.maxTrade, costs, `chart signal ${selectedSignal.tier}`); if (!result.fill) { appendLog(`${side} paper order rejected`, result.error ?? "No executable public ask depth.", "warning"); return; } setAccount(markAccount(result.account, marketMap)); setView("paper"); appendLog(`${selectedMarket.asset} ${selectedMarket.duration} paper fill`, `${side} · ${result.fill.shares.toFixed(2)} shares @ ${cents(result.fill.price)} · ${dollars(result.fill.totalCost)} including fee`, "positive"); };
+  const resetPaperSession = () => { if ((account.positions.length || account.fills.length || account.closedTrades.length) && typeof window !== "undefined" && !window.confirm("Reset this paper balance and discard its browser-local trade ledger?")) return; const startingCash = Number(startingCashInput); const next = createPaperAccount(Number.isFinite(startingCash) && startingCash > 0 ? startingCash : 1000); setAccount(next); setPaperTest({ status: "IDLE", startingBalance: next.startingCash, days: 1, startedAt: null, endsAt: null, balance: next.startingCash, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null }); setKillSwitch(false); setEngineRunning(false); setPaused(false); appendLog("Shared paper account reset", `New empty ledger created with ${dollars(next.startingCash)} starting cash.`, "neutral"); };
+  const manualBuy = (side: PaperSide) => { if (!selectedMarket) return; const stakeUsd = Math.min(config.maxTrade, paperStakeUsd(equity, account.cash)); if (stakeUsd < 1 || account.positions.length >= PAPER_MAX_OPEN_POSITIONS || accountDeployed(account) + stakeUsd > Math.max(1, equity * PAPER_MAX_EXPOSURE_PCT)) { appendLog(`${side} paper entry blocked`, "Paper exposure, open-position, or minimum-cash limit was reached.", "warning"); return; } if (selectedSignal?.action !== side) { appendLog(`${side} paper entry blocked`, selectedSignal?.reason ?? "No chart signal is available.", "warning"); return; } const result = buyPaper(account, selectedMarket, side, stakeUsd, costs, `chart signal ${selectedSignal.tier}`); if (!result.fill) { appendLog(`${side} paper order rejected`, result.error ?? "No executable public ask depth.", "warning"); return; } setAccount(markAccount(result.account, marketMap)); setView("paper"); appendLog(`${selectedMarket.asset} ${selectedMarket.duration} paper fill`, `${side} · ${result.fill.shares.toFixed(2)} shares @ ${cents(result.fill.price)} · ${dollars(result.fill.totalCost)} including fee`, "positive"); };
   const handleCsvUpload = async (file: File | undefined) => { if (!file) return; const parsed = parseBacktestCsv(await file.text()); setBacktestRows(parsed.rows); setBacktestRejected(parsed.rejected); setBacktestResult(null); appendLog("Backtest dataset loaded", `${parsed.rows.length} valid rows · ${parsed.rejected} rejected rows · ${file.name}`, parsed.rows.length ? "positive" : "warning"); };
   const useRecordedTicks = () => { setBacktestRows(recordedTicks); setBacktestRejected(0); setBacktestResult(null); appendLog("Recorded public ticks selected", `${recordedTicks.length} rows from this browser session; outcomes are not invented.`, recordedTicks.length ? "positive" : "warning"); };
   const downloadTemplate = () => { const blob = new Blob([backtestCsvTemplate], { type: "text/csv" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = "polymarket-backtest-template.csv"; anchor.click(); URL.revokeObjectURL(url); };
@@ -841,6 +935,7 @@ export default function Home() {
         const exitCandidate = exitCandidates[0];
         if (exitCandidate) {
           liveBusy.current = true;
+          let stopAfterResponse = false;
           try {
             const response = await liveRequest({ action: "exit", marketId: exitCandidate.market.id, tokenID: exitCandidate.tokenID, amount: exitCandidate.position.size, requestId: `exit:${exitCandidate.tokenID}:${Math.floor(now / 10_000)}`, confirmLive: true, config: liveRisk }, true);
             const payload = await response.json() as { ok?: boolean; status?: string; reason?: string; error?: string; uncertain?: boolean; latencyMs?: number; balanceAfter?: number | null; sizing?: { shares?: number; netProfit?: number; modelGap?: number } };
@@ -850,7 +945,9 @@ export default function Home() {
             liveExitObservations.current.delete(exitCandidate.tokenID);
             const balanceAfter = typeof payload.balanceAfter === "number" ? payload.balanceAfter : null;
             if (balanceAfter !== null) setLiveSession((current) => current ? { ...current, balance: balanceAfter } : current);
-            if (payload.uncertain || response.status === 401 || response.status === 403) {
+            if (payload.status === "DISABLED") {
+              stopAfterResponse = true; setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", payload.error || "Live order submissions are disabled by the server.", "warning");
+            } else if (payload.uncertain || response.status === 401 || response.status === 403) {
               setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", payload.error || "Live exit authorization or submission state needs reconciliation.", "negative");
             } else if (payload.status === "EXECUTED") {
               appendLog(`${exitCandidate.market.asset} ${exitCandidate.market.duration} live early exit`, `${exitCandidate.side} · ${detail} · ${latencyMs ?? "—"} ms`, "positive");
@@ -863,7 +960,7 @@ export default function Home() {
             liveExitObservations.current.delete(exitCandidate.tokenID);
           }
           liveBusy.current = false;
-          timer = window.setTimeout(() => void loop(), 1_100);
+          if (!stopAfterResponse) timer = window.setTimeout(() => void loop(), 1_100);
           return;
         }
       }
@@ -876,6 +973,7 @@ export default function Home() {
       }
       liveBusy.current = true;
       const startedAt = Date.now();
+      let stopAfterResponse = false;
       try {
         const requestId = next.market.id + ":" + Math.floor(now / 10000);
         const response = await liveRequest({ action: "execute", marketId: next.market.id, requestId, confirmLive: true, config: liveRisk }, true);
@@ -886,7 +984,9 @@ export default function Home() {
         const balanceAfter = typeof payload.balanceAfter === "number" ? payload.balanceAfter : null;
         if (balanceAfter !== null) setLiveSession((current) => current ? { ...current, balance: balanceAfter } : current);
         liveAttempted.current.set(next.market.id, Date.now());
-        if (payload.uncertain || response.status === 401 || response.status === 403) {
+        if (payload.status === "DISABLED") {
+          stopAfterResponse = true; setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", payload.error || "Live order submissions are disabled by the server.", "warning");
+        } else if (payload.uncertain || response.status === 401 || response.status === 403) {
           setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", payload.error || "Live authorization or submission state needs reconciliation.", "negative");
         } else if (payload.status === "EXECUTED") {
           appendLog(next.market.asset + " " + next.market.duration + " LIVE order", String(next.signal.action) + " · " + dollars(payload.sizing?.stakeUsd ?? null) + " · " + String(payload.sizing?.units ?? 0) + " units · " + String(latencyMs) + " ms", "warning");
@@ -898,7 +998,7 @@ export default function Home() {
         setLiveStatus({ lastAction: "ERROR", lastDetail: detail, lastError: detail, lastLatencyMs: Date.now() - startedAt }); setLiveRunning(false); setLivePaused(true); appendLog("Live executor stopped", detail, "negative");
       } finally {
         liveBusy.current = false;
-        if (!disposed) timer = window.setTimeout(() => void loop(), 1100);
+        if (!disposed && !stopAfterResponse) timer = window.setTimeout(() => void loop(), 1100);
       }
     };
     void loop();

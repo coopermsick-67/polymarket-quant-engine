@@ -1,6 +1,6 @@
 # Polymarket Quant Engine
 
-Polymarket Quant Engine is a paper-first terminal for active crypto Up/Down markets. It discovers 5m and 15m markets, shows public books and Coinbase chart context, produces UP/DOWN/PASS decisions, records a complete market ledger, and keeps the Paper Trader and Paper Lab on one shared account.
+Polymarket Quant Engine is a paper-first terminal for active crypto Up/Down markets. It discovers 5m and 15m markets, shows public books and Coinbase chart context, produces heuristic UP/DOWN/PASS decisions, records a complete market ledger, and keeps the Paper Trader and Paper Lab on one shared account.
 
 ## Included
 
@@ -24,7 +24,7 @@ git clone https://github.com/coopermsick-67/polymarket-quant-engine.git
 cd polymarket-quant-engine
 ```
 
-The repository is private. Your GitHub account must have access to clone it.
+The repository is public and can be cloned without GitHub credentials.
 
 ## Run locally
 
@@ -78,21 +78,32 @@ bash scripts/run_forever.sh
 
 Use `systemd`, `launchd`, or a login service to start that script after reboot. The browser tab requirement still applies for the client-side market loop.
 
+## Headless Linux paper daemon
+
+The separate `pnpm run daemon` process runs the deterministic strategy without a browser tab. It is deliberately paper-only: it refuses `TRADING_MODE=live`, uses public market data, records a persistent simulated account, and checks final outcomes against Gamma before settling expired positions. It does not sign or submit live orders.
+
+The daemon exposes loopback-only `/healthz` and `/status` endpoints on port 8788. It latches a stale-data halt after 90 seconds without a complete fresh market snapshot, has paper exposure and daily-loss limits, validates the paper ledger on every cycle, and supports pause and kill switches. Daily-loss limits halt new entries but do not force-close open positions. The Linux systemd unit, log rotation, restricted Hermes watchdog permissions, and host commands are in [`deploy/README.md`](deploy/README.md).
+
+For an interactive terminal monitor, start the daemon in one terminal and run `pnpm run dashboard` in another. The monitor clock, countdowns, and display refresh every second with account cash/equity/P&L, open positions, recent fills and closed trades, current signals, feed freshness, and halt state. The daemon updates marks from Coinbase and subscribes to Polymarket book streams for open positions while keeping market discovery on its 15-second REST cycle. Press `q` to exit the monitor without stopping the daemon or `r` to refresh immediately. If it reports that the endpoint is unreachable, start `pnpm run daemon` in a separate terminal. It reads the daemon's loopback-only status endpoint and does not place orders.
+
+Paper mode requires no API keys or wallet credentials. Keep any future live credentials in host-only secret storage; this daemon has no live executor, and the dashboard's browser-authenticated live routes are not part of this service.
+
 ## Local environment
 
 Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by production live execution.
 
-Live linking retries transient Polymarket credential, balance, and open-order reads. If the upstream socket is reset, the request returns a readable error and no order is retried or assumed successful; reconcile the Account view before trying any uncertain execution again.
+Live linking retries transient Polymarket credential, balance, and open-order reads. If the upstream socket is reset, the request returns a readable error and no order is retried or assumed successful; reconcile the Account view before trying any uncertain execution again. Live buy and sell submissions are disabled unless the server-side `POLYMARKET_LIVE_EXECUTION_ENABLED` value is exactly `true`; keep it `false` for paper operation. The daemon's `TRADING_MODE` setting is separate and remains paper-only.
 
 For live execution on a trusted localhost machine, explicitly opt in to the loopback-only gate and provide a 32-byte session secret:
 
 ```text
 POLYMARKET_LIVE_ALLOW_LOCALHOST=true
 POLYMARKET_LIVE_SESSION_SECRET=<64 hexadecimal characters>
+POLYMARKET_LIVE_EXECUTION_ENABLED=false
 POLYMARKET_TELEGRAM_SESSION_SECRET=<another 64 hexadecimal characters>
 ```
 
-Generate each session secret with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, restart the server, and then link the wallet or Telegram bot in the local dashboard. Local live and Telegram sessions are encrypted and bound to loopback requests. This flag must remain `false` on shared or production deployments.
+Generate each session secret with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, restart the server, and then link the wallet or Telegram bot in the local dashboard. Local live and Telegram sessions are encrypted, and the local bypass requires a matching localhost request host without forwarding headers. The Fetch API does not expose the socket peer, so bind the app directly to loopback and never put this bypass behind a reverse proxy. Keep `POLYMARKET_LIVE_EXECUTION_ENABLED=false` unless you have independently established live readiness and deliberately intend to submit real orders. The localhost flag must remain `false` on shared or production deployments.
 
 ## Safety and live integration boundary
 

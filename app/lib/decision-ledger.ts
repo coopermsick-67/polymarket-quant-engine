@@ -3,6 +3,7 @@ import type { MarketSignal, PaperSide } from "./engines";
 
 export type LedgerDecision = PaperSide | "PASS";
 export type LedgerResult = "WIN" | "LOSS" | "PENDING" | "NOT TRADED";
+export const ACTIVE_MODEL_VERSION = "chainlink-vol-v2";
 
 export type MarketDecisionRow = {
   id: string;
@@ -39,6 +40,13 @@ export type MarketDecisionRow = {
   trend15m: string;
   reason: string;
   changeCount: number;
+  modelVersion?: string;
+  validationDecision?: LedgerDecision;
+  validationFairUp?: number | null;
+  validationEdge?: number | null;
+  validationEntryPrice?: number | null;
+  validationStakeUsd?: number | null;
+  validationAt?: number | null;
 };
 
 export type LedgerMetrics = {
@@ -57,6 +65,9 @@ export type LedgerMetrics = {
   combinedWinRate: number | null;
   upWinRate: number | null;
   downWinRate: number | null;
+  validationPredictions: number;
+  brierScore: number | null;
+  averageEdge: number | null;
 };
 
 const round = (value: number, digits = 6) => Number(value.toFixed(digits));
@@ -69,29 +80,32 @@ export const ledgerResultFor = (decision: LedgerDecision, outcome: PaperSide | n
 };
 
 export const computeLedgerMetrics = (rows: MarketDecisionRow[]): LedgerMetrics => {
-  const upRows = rows.filter((row) => row.decision === "UP");
-  const downRows = rows.filter((row) => row.decision === "DOWN");
-  const settledRows = rows.filter((row) => row.result === "WIN" || row.result === "LOSS");
-  const wins = settledRows.filter((row) => row.result === "WIN").length;
-  const upSettledRows = upRows.filter((row) => row.result === "WIN" || row.result === "LOSS");
-  const downSettledRows = downRows.filter((row) => row.result === "WIN" || row.result === "LOSS");
+  const modelRows = rows.filter((row) => row.modelVersion === ACTIVE_MODEL_VERSION && (row.validationDecision === "UP" || row.validationDecision === "DOWN"));
+  const settledRows = modelRows.filter((row) => row.outcome !== null);
+  const wins = settledRows.filter((row) => row.validationDecision === row.outcome).length;
+  const upSettledRows = settledRows.filter((row) => row.validationDecision === "UP");
+  const downSettledRows = settledRows.filter((row) => row.validationDecision === "DOWN");
+  const probabilityRows = settledRows.filter((row) => row.validationFairUp !== null && row.validationFairUp !== undefined && Number.isFinite(row.validationFairUp));
   const rate = (won: number, total: number) => total ? won / total : null;
   return {
     tracked: rows.length,
-    up: upRows.length,
-    down: downRows.length,
-    pass: rows.filter((row) => row.decision === "PASS").length,
+    up: modelRows.filter((row) => row.validationDecision === "UP").length,
+    down: modelRows.filter((row) => row.validationDecision === "DOWN").length,
+    pass: rows.filter((row) => row.modelVersion === ACTIVE_MODEL_VERSION && row.validationDecision === "PASS").length,
     settled: settledRows.length,
     wins,
     losses: settledRows.length - wins,
-    pending: rows.filter((row) => row.result === "PENDING").length,
+    pending: modelRows.filter((row) => row.outcome === null).length,
     upSettled: upSettledRows.length,
-    upWins: upSettledRows.filter((row) => row.result === "WIN").length,
+    upWins: upSettledRows.filter((row) => row.validationDecision === row.outcome).length,
     downSettled: downSettledRows.length,
-    downWins: downSettledRows.filter((row) => row.result === "WIN").length,
+    downWins: downSettledRows.filter((row) => row.validationDecision === row.outcome).length,
     combinedWinRate: rate(wins, settledRows.length),
-    upWinRate: rate(upSettledRows.filter((row) => row.result === "WIN").length, upSettledRows.length),
-    downWinRate: rate(downSettledRows.filter((row) => row.result === "WIN").length, downSettledRows.length),
+    upWinRate: rate(upSettledRows.filter((row) => row.validationDecision === row.outcome).length, upSettledRows.length),
+    downWinRate: rate(downSettledRows.filter((row) => row.validationDecision === row.outcome).length, downSettledRows.length),
+    validationPredictions: modelRows.length,
+    brierScore: probabilityRows.length ? probabilityRows.reduce((sum, row) => sum + ((row.validationFairUp! - (row.outcome === "UP" ? 1 : 0)) ** 2), 0) / probabilityRows.length : null,
+    averageEdge: modelRows.length ? modelRows.reduce((sum, row) => sum + (Number.isFinite(row.validationEdge) ? row.validationEdge! : 0), 0) / modelRows.length : null,
   };
 };
 
@@ -108,7 +122,8 @@ export const decisionLedgerCsv = (rows: MarketDecisionRow[]) => {
     "selected_edge", "entry_price", "up_ask", "down_ask", "reference", "spot", "remaining_seconds", "outcome",
     "result", "outcome_at_utc", "simulated_stake_usd", "simulated_units", "signal_confidence", "bias_confidence",
     "trend_5m", "trend_15m", "change_count", "reason", "tracked_markets", "settled_markets", "pass_count",
-    "up_win_rate", "down_win_rate", "combined_win_rate",
+    "up_win_rate", "down_win_rate", "combined_win_rate", "model_version", "validation_decision",
+    "validation_probability_up", "validation_edge", "validation_entry_price", "validation_stake_usd", "validation_at_utc",
   ];
   const lines = rows.slice().sort((left, right) => left.observedAt - right.observedAt).map((row) => [
     row.id,
@@ -151,6 +166,13 @@ export const decisionLedgerCsv = (rows: MarketDecisionRow[]) => {
     metrics.upWinRate,
     metrics.downWinRate,
     metrics.combinedWinRate,
+    row.modelVersion ?? "",
+    row.validationDecision ?? "",
+    numberOrNull(row.validationFairUp),
+    numberOrNull(row.validationEdge),
+    numberOrNull(row.validationEntryPrice),
+    numberOrNull(row.validationStakeUsd),
+    row.validationAt ? new Date(row.validationAt).toISOString() : "",
   ].map(csvCell).join(","));
   return [headers.join(","), ...lines].join("\n") + "\n";
 };

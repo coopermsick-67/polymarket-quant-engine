@@ -11,8 +11,30 @@ export const localLiveEnabled = () => truthy(env.POLYMARKET_LIVE_ALLOW_LOCALHOST
 
 export const isLoopbackRequest = (request: Request) => {
   try {
-    const hostname = new URL(request.url).hostname.toLowerCase();
-    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    const requestUrl = new URL(request.url);
+    const hostname = requestUrl.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    const isLocalHostname = (value: string) => {
+      const normalized = value.toLowerCase().replace(/^\[|\]$/g, "");
+      return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+    };
+    if (!isLocalHostname(hostname)) return false;
+
+    // The Fetch Request API does not expose the socket peer. Avoid the local
+    // owner bypass when any proxy/forwarding header is present, and require a
+    // matching Host/Origin so a forwarded external request cannot opt in by
+    // supplying only a localhost Host header.
+    if (["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "cf-connecting-ip"]
+      .some((header) => Boolean(request.headers.get(header)?.trim()))) return false;
+    const hostHeader = request.headers.get("host");
+    if (!hostHeader) return false;
+    const hostUrl = new URL(`http://${hostHeader}`);
+    if (!isLocalHostname(hostUrl.hostname) || hostUrl.hostname.toLowerCase() !== requestUrl.hostname.toLowerCase()) return false;
+    const originHeader = request.headers.get("origin");
+    if (originHeader) {
+      const origin = new URL(originHeader);
+      if (origin.host.toLowerCase() !== requestUrl.host.toLowerCase() || !isLocalHostname(origin.hostname)) return false;
+    }
+    return true;
   } catch {
     return false;
   }

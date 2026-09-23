@@ -35,6 +35,16 @@ export type KellySizing = {
   reason: string;
 };
 
+export type LiveExposureAssessment = {
+  existingExposureUsd: number;
+  proposedExposureUsd: number;
+  aggregateExposureUsd: number;
+  exposureCapUsd: number;
+  remainingExposureUsd: number;
+  approved: boolean;
+  reason: string;
+};
+
 export const DEFAULT_LIVE_RISK: LiveRiskConfig = {
   ...DEFAULT_LIVE_EARLY_EXIT,
   unitBalancePct: 0.01,
@@ -53,6 +63,44 @@ const finite = (value: unknown, fallback: number) => typeof value === "number" &
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const round = (value: number, digits = 4) => Number(value.toFixed(digits));
 
+/**
+ * Applies the configured exposure ceiling to all currently open positions plus
+ * the proposed order. Inputs are expected to be reconciled USD cost basis; bad
+ * inputs fail closed instead of silently treating unreadable positions as zero.
+ */
+export const assessLiveExposure = (
+  balance: number,
+  existingExposureUsd: number,
+  proposedExposureUsd: number,
+  config: LiveRiskConfig,
+): LiveExposureAssessment => {
+  const valuesAreReadable = [balance, existingExposureUsd, proposedExposureUsd].every(Number.isFinite)
+    && balance >= 0
+    && existingExposureUsd >= 0
+    && proposedExposureUsd >= 0;
+  const safeBalance = valuesAreReadable ? balance : 0;
+  const safeExisting = valuesAreReadable ? existingExposureUsd : 0;
+  const safeProposed = valuesAreReadable ? proposedExposureUsd : 0;
+  const exposureCapUsd = safeBalance * config.maxExposurePct;
+  const aggregateExposureUsd = safeExisting + safeProposed;
+  const remainingExposureUsd = Math.max(0, exposureCapUsd - safeExisting);
+  const approved = valuesAreReadable && aggregateExposureUsd <= exposureCapUsd + 1e-8;
+  const reason = !valuesAreReadable
+    ? "Existing portfolio exposure could not be established; live entry is blocked."
+    : approved
+      ? "Aggregate portfolio exposure remains within the configured cap."
+      : "The proposed order would exceed the configured aggregate exposure cap.";
+  return {
+    existingExposureUsd: round(safeExisting),
+    proposedExposureUsd: round(safeProposed),
+    aggregateExposureUsd: round(aggregateExposureUsd),
+    exposureCapUsd: round(exposureCapUsd),
+    remainingExposureUsd: round(remainingExposureUsd),
+    approved,
+    reason,
+  };
+};
+
 export const normalizeLiveRiskConfig = (input: Partial<LiveRiskConfig> | null | undefined): LiveRiskConfig => {
   const allowed = Array.isArray(input?.allowedDurations)
     ? input.allowedDurations.filter((value): value is Horizon => value === "5m" || value === "15m")
@@ -69,6 +117,32 @@ export const normalizeLiveRiskConfig = (input: Partial<LiveRiskConfig> | null | 
     slippageBps: clamp(finite(input?.slippageBps, DEFAULT_LIVE_RISK.slippageBps), 0, 100),
     allowedDurations: allowed.length ? allowed : DEFAULT_LIVE_RISK.allowedDurations,
     requireLock: input?.requireLock ?? DEFAULT_LIVE_RISK.requireLock,
+  };
+};
+
+/**
+ * Server-side live limits. The browser may tighten these settings, but it cannot
+ * weaken the minimum edge, maximum size, portfolio cap, execution price buffer,
+ * or repeated-confirmation requirements enforced by the live route.
+ */
+export const enforceLiveExecutionRisk = (input: Partial<LiveRiskConfig> | null | undefined): LiveRiskConfig => {
+  const risk = normalizeLiveRiskConfig(input);
+  return {
+    ...risk,
+    unitBalancePct: Math.min(risk.unitBalancePct, 0.01),
+    unitsPerTrade: Math.min(risk.unitsPerTrade, 1),
+    kellyFraction: Math.min(risk.kellyFraction, 0.25),
+    maxTradeUsd: Math.min(risk.maxTradeUsd, 5),
+    maxExposurePct: Math.min(risk.maxExposurePct, 0.1),
+    minEdge: Math.max(risk.minEdge, 0.04),
+    feeRate: Math.max(risk.feeRate, 0.05),
+    slippageBps: Math.min(risk.slippageBps, 25),
+    requireLock: true,
+    earlyExitMinProfitUsd: Math.max(risk.earlyExitMinProfitUsd, DEFAULT_LIVE_RISK.earlyExitMinProfitUsd),
+    earlyExitMinProfitPct: Math.max(risk.earlyExitMinProfitPct, DEFAULT_LIVE_RISK.earlyExitMinProfitPct),
+    earlyExitModelGap: Math.max(risk.earlyExitModelGap, DEFAULT_LIVE_RISK.earlyExitModelGap),
+    earlyExitMinRemainingSeconds: Math.max(risk.earlyExitMinRemainingSeconds, DEFAULT_LIVE_RISK.earlyExitMinRemainingSeconds),
+    earlyExitConfirmations: Math.max(risk.earlyExitConfirmations, DEFAULT_LIVE_RISK.earlyExitConfirmations),
   };
 };
 
