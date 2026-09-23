@@ -11,18 +11,19 @@ Pricing, paper/shadow trading, replay backtesting, and limit-priced live executi
 - **One decision function** (`evaluateSignal`) shared by the dashboard, the headless runner, the live order route, and the backtester.
 - **Paper/shadow engine.** Decides now, fills after a simulated latency at the decision's limit price, settles only on official resolutions, and enforces daily-loss and drawdown halts.
 - **Replay backtester.** Runs recorded sessions through the live code with latency and depth limits. Reports EV, realized vs predicted edge, markouts, Sharpe, Wilson intervals, calibration against the book, and a walk-forward split.
-- **Live execution** (opt-in, owner-only). Fill-and-kill limit orders; the server rebuilds the market itself; Kelly sizing on all-in cost; one position per market; exposure, correlated-window, daily-loss, and rate limits; a server-held key option; submissions are never retried.
-- **24/7 headless runner.** No browser tab needed. Persists state atomically, records replayable JSONL, and sends Telegram alerts.
+- **Live execution controls.** The server route has risk checks and fill-and-kill order construction, but order submissions are hard-disabled until the evidence and execution gates in `STRATEGY.md` pass. No real order path has passed CLOB integration testing.
+- **24/7 headless runner.** No browser tab needed. Persists paper state atomically, records daily SQLite files with raw exchange and Polymarket messages, snapshots, decisions, fills and settlement data, and sends Telegram alerts.
 
 ## Quick start
 
 ```bash
 corepack enable && corepack prepare pnpm@11.25.0 --activate
 pnpm install
-pnpm run check                               # typecheck, lint, prettier, 75 tests
+pnpm run check                               # typecheck, lint, prettier, 81 tests
 pnpm run dev                                 # dashboard
-pnpm run headless -- --auto --record         # paper engine + recorder, no browser
-pnpm run replay -- data/replay-*.jsonl --walk-forward
+pnpm run headless -- --auto                  # paper engine + daily SQLite recorder, no browser
+pnpm run backfill -- --data-dir data         # official outcomes and open/close prices
+pnpm run replay -- data/recordings/recording-*.sqlite* --walk-forward
 ```
 
 Supervised 24/7: `bash scripts/run_forever.sh headless` (or `scripts/run_forever.ps1 headless` on Windows).
@@ -33,6 +34,6 @@ Supervised 24/7: `bash scripts/run_forever.sh headless` (or `scripts/run_forever
 - `RISK.md`: every gate and limit.
 - `ARCHITECTURE.md`: modules and data flow.
 - `API.md`: server routes.
-- `SETUP.md`: environment variables and the checklist before trading live.
+- `SETUP.md`: environment variables and the evidence checklist; live orders are disabled until every required gate passes.
 
 Never commit keys or tokens. `.env*` and `data/` are git-ignored.

@@ -17,7 +17,8 @@
     "format:check": "prettier --check \"app/**/*.{ts,tsx}\" \"scripts/*.ts\" \"tests/**/*.ts\"",
     "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm test",
     "headless": "node --import tsx scripts/headless.ts",
-    "replay": "node --import tsx scripts/replay.ts"
+    "replay": "node --import tsx scripts/replay.ts",
+    "backfill": "node --import tsx scripts/backfill.ts"
   },
   "dependencies": {
     "@polymarket/clob-client-v2": "1.1.0",
