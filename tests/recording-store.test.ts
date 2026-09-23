@@ -92,6 +92,7 @@ describe("SQLite recording store", () => {
       } finally {
         await opened.close();
       }
+      assert.throws(() => opened.db.prepare("SELECT 1"));
     } finally {
       try {
         store.close();

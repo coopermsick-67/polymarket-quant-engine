@@ -276,7 +276,10 @@ export const listRecordingFiles = (dataDir: string) => {
 };
 
 export const openRecordingFile = async (path: string, writable = false) => {
-  if (!path.endsWith(".gz")) return { db: new DatabaseSync(path), close: () => {} };
+  if (!path.endsWith(".gz")) {
+    const db = new DatabaseSync(path);
+    return { db, close: () => db.close() };
+  }
   const directory = await mkdtemp(join(tmpdir(), "pqe-recording-"));
   const restored = join(directory, "recording.sqlite");
   try {

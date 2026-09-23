@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { readFile } from "node:fs/promises";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
@@ -135,12 +136,19 @@ const waitForDevServer = async (server: ChildProcess) => {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (server.exitCode !== null) throw new Error(`Dashboard server exited early:\n${output.join("").slice(-6000)}`);
-    try {
-      const response = await fetch(origin);
-      if (response.ok) return;
-    } catch {
-      // Wait for Vite to bind its local port.
-    }
+    const status = await new Promise<number>((resolve) => {
+      const request = httpRequest(origin, { timeout: 1_000 }, (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+      request.on("error", () => resolve(0));
+      request.on("timeout", () => {
+        request.destroy();
+        resolve(0);
+      });
+      request.end();
+    });
+    if (status >= 200 && status < 500) return;
     await delay(300);
   }
   throw new Error(`Dashboard server did not become ready:\n${output.join("").slice(-6000)}`);
