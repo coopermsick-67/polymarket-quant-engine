@@ -65,6 +65,10 @@ const pauseFile = path.join(stateDir, "PAUSED");
 const staleHaltFile = path.join(stateDir, "STALE_DATA_HALT");
 const riskHaltFile = path.join(stateDir, "RISK_HALT");
 const healthPort = 8788;
+const dashboardOrigins = new Set((process.env.PQE_DASHBOARD_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean));
 const pollIntervalMs = integerSetting("POLL_INTERVAL_MS", 15_000, 5_000, 60_000);
 const staleAfterMs = integerSetting("DATA_STALE_HALT_MS", 90_000, 30_000, 600_000);
 const paperStartingCash = numberSetting("PAPER_STARTING_CASH", 1_000, 1, 1_000_000_000);
@@ -376,14 +380,43 @@ async function statusPayload() {
 }
 
 const healthServer = createServer(async (request, response) => {
+  const origin = request.headers.origin;
+  const browserRequest = typeof origin === "string";
+  if (browserRequest && !dashboardOrigins.has(origin)) {
+    response.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store", Vary: "Origin" });
+    response.end(JSON.stringify({ ok: false, error: "This browser origin is not allowed to read daemon status." }));
+    return;
+  }
+  const corsHeaders = browserRequest ? {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Private-Network": "true",
+    "Vary": "Origin",
+  } : {};
+  if (request.method === "OPTIONS" && request.url === "/status" && browserRequest) {
+    const requestedMethod = request.headers["access-control-request-method"];
+    const requestedHeaders = request.headers["access-control-request-headers"];
+    if (requestedMethod !== "GET" || requestedHeaders) {
+      response.writeHead(403, { ...corsHeaders, "Content-Type": "application/json", "Cache-Control": "no-store" });
+      response.end(JSON.stringify({ ok: false, error: "Only header-free GET requests are allowed." }));
+      return;
+    }
+    response.writeHead(204, {
+      ...corsHeaders,
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Max-Age": "600",
+    });
+    response.end();
+    return;
+  }
   if (request.method !== "GET" || (request.url !== "/healthz" && request.url !== "/status")) {
-    response.writeHead(404, { "Content-Type": "application/json" });
+    response.writeHead(404, { ...corsHeaders, "Content-Type": "application/json" });
     response.end(JSON.stringify({ ok: false, error: "Not found." }));
     return;
   }
   const payload = await statusPayload();
   const healthy = lastCycleInMemory !== null && Date.now() - lastCycleInMemory <= Math.max(60_000, pollIntervalMs * 4);
   response.writeHead(request.url === "/healthz" && !healthy ? 503 : 200, {
+    ...corsHeaders,
     "Cache-Control": "no-store",
     "Content-Type": "application/json",
   });
