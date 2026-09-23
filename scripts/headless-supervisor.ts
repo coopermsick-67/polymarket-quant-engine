@@ -157,8 +157,6 @@ export const runHeadlessSupervisor = async (
           heartbeatHealthySince ??= at;
         }
       }, monitorIntervalMs);
-      monitor.unref?.();
-
       const result = await childExit(child);
       clearInterval(monitor);
       if (killStaleTimer) clearTimeout(killStaleTimer);
