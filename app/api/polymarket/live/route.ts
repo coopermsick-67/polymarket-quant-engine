@@ -9,6 +9,7 @@ import {
   checkPortfolioRisk,
   computeKellySizing,
   equityOf,
+  isLiveOrderSubmissionEnabled,
   normalizeLiveRiskConfig,
   parseCollateralBalance,
   parseLivePosition,
@@ -334,6 +335,10 @@ export async function POST(request: Request) {
     } catch (error) {
       return json({ ok: false, error: errorMessage(error) }, 502);
     }
+  }
+
+  if (!isLiveOrderSubmissionEnabled(input.action)) {
+    return json({ ok: false, status: "DISABLED", error: "Real order placement is disabled until the strategy evidence and execution safety gates pass." }, 423);
   }
 
   const session = await readLiveSession(request, userId);

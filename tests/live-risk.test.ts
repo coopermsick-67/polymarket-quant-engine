@@ -5,6 +5,9 @@ import {
   checkPortfolioRisk,
   computeKellySizing,
   DEFAULT_LIVE_RISK,
+  isLiveOrderSubmissionEnabled,
+  LIVE_EXECUTION_DISABLED_REASON,
+  LIVE_EXECUTION_ENABLED,
   normalizeLiveRiskConfig,
   parseCollateralBalance,
   parseLivePosition,
@@ -12,6 +15,17 @@ import {
 } from "../app/lib/live-risk";
 
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/data-api-position.json", import.meta.url), "utf8"));
+
+describe("live execution gate", () => {
+  it("fails closed for buy and sell submissions while preserving read and cancel actions", () => {
+    assert.equal(LIVE_EXECUTION_ENABLED, false);
+    assert.match(LIVE_EXECUTION_DISABLED_REASON, /edge/);
+    assert.equal(isLiveOrderSubmissionEnabled("execute"), false);
+    assert.equal(isLiveOrderSubmissionEnabled("exit"), false);
+    assert.equal(isLiveOrderSubmissionEnabled("cancel-all"), true);
+    assert.equal(isLiveOrderSubmissionEnabled("positions"), true);
+  });
+});
 
 describe("collateral balance parsing", () => {
   it("reads integer micro-USDC strings and decimal dollar strings without magnitude guessing", () => {

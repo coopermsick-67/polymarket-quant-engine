@@ -1,7 +1,7 @@
 "use client";
 
 import { AlertTriangle, Check, LockKeyhole, Pause, Play, RefreshCw, ShieldCheck, SlidersHorizontal, Wallet, X, Zap } from "lucide-react";
-import type { LiveRiskConfig } from "../lib/live-risk";
+import { LIVE_EXECUTION_DISABLED_REASON, LIVE_EXECUTION_ENABLED, type LiveRiskConfig } from "../lib/live-risk";
 import type { Horizon, SignalParams } from "../lib/signal";
 import { dollars, percentage, points } from "./format";
 
@@ -89,7 +89,7 @@ export default function LiveExecutionPanel({
 }: Props) {
   const balance = session?.balance ?? null;
   const unitCap = balance === null ? null : Math.min(balance * risk.unitBalancePct * risk.unitsPerTrade, risk.maxTradeUsd);
-  const canStart = Boolean(session?.connected && consent && !running);
+  const canStart = Boolean(LIVE_EXECUTION_ENABLED && session?.connected && consent && !running);
   const ttl = session?.expiresAt ? Math.max(0, Math.floor((session.expiresAt - now) / 1000)) : null;
   const toggle = <T extends string>(list: T[], item: T) => (list.includes(item) ? list.filter((value) => value !== item) : [...list, item]);
 
@@ -103,6 +103,7 @@ export default function LiveExecutionPanel({
             Every order is a fill-and-kill LIMIT at the highest price that still clears the edge floor after the fee curve. The server rebuilds the market from
             Gamma, the CLOB and the official price to beat, checks your positions, exposure and daily loss, and never retries an uncertain submission.
           </p>
+          {!LIVE_EXECUTION_ENABLED && <p className="live-disabled-note">{LIVE_EXECUTION_DISABLED_REASON}</p>}
         </div>
         <span className={`result-badge ${session?.connected ? "ready" : "waiting"}`}>
           <span className={`status-dot ${session?.connected ? "status-ready" : "status-locked"}`} />
@@ -194,13 +195,15 @@ export default function LiveExecutionPanel({
               <label className="live-consent">
                 <input checked={consent} onChange={(event) => onConsentChange(event.target.checked)} type="checkbox" />
                 <span>
-                  I understand this places real orders with the linked wallet. Limit prices cap the price paid; they do not guarantee a fill or a profit.
+                  {LIVE_EXECUTION_ENABLED
+                    ? "I understand this places real orders with the linked wallet. Limit prices cap the price paid; they do not guarantee a fill or a profit."
+                    : "Order placement is currently disabled while the strategy and execution evidence gates remain unmet."}
                 </span>
               </label>
               <div className="live-actions">
                 <button className="button-primary" disabled={!canStart} onClick={onStart} type="button">
                   <Play fill="currentColor" size={14} />
-                  {running ? "RUNNING" : "START LIVE"}
+                  {running ? "RUNNING" : LIVE_EXECUTION_ENABLED ? "START LIVE" : "LIVE DISABLED"}
                 </button>
                 <button className="button-secondary" disabled={!running} onClick={onPause} type="button">
                   <Pause size={14} />

@@ -5,6 +5,12 @@ import { DEFAULT_LIVE_EARLY_EXIT, normalizeEarlyExitPolicy, type EarlyExitPolicy
 import { clamp, finiteNumber, round } from "./num";
 import { DEFAULT_SIGNAL_PARAMS, normalizeSignalParams, type Horizon, type Side, type SignalParams } from "./signal";
 
+/** Real order placement remains disabled until the required evidence and execution gates pass. */
+export const LIVE_EXECUTION_ENABLED = false;
+export const LIVE_EXECUTION_DISABLED_REASON = "Real order placement is disabled: out-of-sample edge and live execution safety gates have not passed.";
+
+export const isLiveOrderSubmissionEnabled = (action: string): boolean => LIVE_EXECUTION_ENABLED || (action !== "execute" && action !== "exit");
+
 export type LiveRiskConfig = EarlyExitPolicy & {
   signal: SignalParams;
   unitBalancePct: number;

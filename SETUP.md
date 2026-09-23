@@ -6,25 +6,26 @@ Requirements: Node.js 22.13+ and pnpm 11.25.0 (`corepack enable && corepack prep
 pnpm install
 pnpm run check        # typecheck + lint + prettier + tests
 pnpm run dev          # dashboard
-pnpm run headless -- --auto --record   # 24/7 paper/shadow engine, no browser
-pnpm run replay -- data/replay-YYYY-MM-DD.jsonl --walk-forward
+pnpm run headless -- --auto            # 24/7 paper/shadow engine and SQLite recorder, no browser
+pnpm run backfill -- --data-dir data   # fill official outcomes and boundary prices into recordings
+pnpm run replay -- data/recordings/recording-YYYY-MM-DD.sqlite.gz --walk-forward
 ```
 
 ## Environment (`.env.local`, never committed)
 
-| Variable | Purpose |
-| --- | --- |
-| `POLYMARKET_LIVE_SESSION_SECRET` | 64 hex chars. Seals live-session and daily-risk cookies. Required for live. |
-| `POLYMARKET_TELEGRAM_SESSION_SECRET` | 64 hex chars. Seals the Telegram cookie. |
-| `POLYMARKET_LIVE_ALLOWED_USER_ID` | Owner id on hosted deployments. |
-| `POLYMARKET_LIVE_ALLOW_LOCALHOST` | `true` only on a trusted single-user machine; enables loopback owner access. |
-| `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE` | Server-held signer (recommended). The key never reaches the browser. |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Alerts from the headless runner. |
+| Variable                                                                           | Purpose                                                                      |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `POLYMARKET_LIVE_SESSION_SECRET`                                                   | 64 hex chars. Seals live-session and daily-risk cookies. Required for live.  |
+| `POLYMARKET_TELEGRAM_SESSION_SECRET`                                               | 64 hex chars. Seals the Telegram cookie.                                     |
+| `POLYMARKET_LIVE_ALLOWED_USER_ID`                                                  | Owner id on hosted deployments.                                              |
+| `POLYMARKET_LIVE_ALLOW_LOCALHOST`                                                  | `true` only on a trusted single-user machine; enables loopback owner access. |
+| `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE` | Server-held signer (recommended). The key never reaches the browser.         |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`                                           | Alerts from the headless runner.                                             |
 
 Generate secrets with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
 
-## Before trading real money
+## Live order status: disabled
 
-1. Run the headless runner with `--record` for days, not hours.
-2. `pnpm run replay -- data/*.jsonl --walk-forward` and require, out of sample: positive realized edge with a confidence interval that excludes zero, a model (or posterior) Brier score below the book's, and non-negative 5 s markouts.
-3. Start live with the default policy (LOCK tier, $25 max trade, 5% daily stop, BTC/ETH/SOL/XRP) and compare live fills against the paper engine's simulated fills.
+The API rejects new buys and sells with HTTP 423. Linking a wallet, viewing balances and positions, and cancelling open orders remain available. Do not set up this app to place real orders: the current measured strategy loses to the book and the CLOB order path has not passed integration or canary tests.
+
+Keep the headless runner recording continuously. Data is stored under `data/recordings/` in daily SQLite databases; closed days are gzip-compressed. Backfill official market outcomes and prices with `pnpm run backfill -- --data-dir data`. Review `STRATEGY.md` for the current G1–G6 counts and results. All six gates are required before enabling any real-money mode; at least 7 days and 3,000 resolved markets are required before promoting B or C research.
