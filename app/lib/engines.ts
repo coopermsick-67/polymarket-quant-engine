@@ -431,6 +431,7 @@ export const paperEntryBookEconomics = (
   side: PaperSide,
   costs: CostConfig,
   minimumUsd = 1,
+  minimumSharesOverride = 0,
 ) => {
   const book = orderBookFor(market, side);
   const asks = (book?.asks ?? []).filter((level) => Number.isFinite(level.price) && level.price > 0 && level.price < 1 && Number.isFinite(level.size) && level.size > 0).sort((a, b) => a.price - b.price);
@@ -440,13 +441,16 @@ export const paperEntryBookEconomics = (
   const slippageMultiplier = 1 + Math.max(0, Number.isFinite(costs.slippageBps) ? costs.slippageBps : 0) / 10_000;
   // Only near-touch asks count toward the sizing liquidity cap. Far-away
   // shares cannot justify a large affordable stake at the displayed price.
-  const nearTouchAsks = asks.filter((level) => bestAsk !== null && level.price <= bestAsk + 0.025);
+  const nearTouchAsks = asks.filter((level) => bestAsk !== null && level.price <= bestAsk * slippageMultiplier + 1e-10);
   const availableDepthUsd = nearTouchAsks.reduce((sum, level) => {
     const price = level.price * slippageMultiplier;
     return price < 1 ? sum + level.size * (price + feePerShareAt(market, price, costs)) : sum;
   }, 0);
-  const minShares = book?.minOrderSize;
-  let remainingMinimumShares = minShares !== null && minShares !== undefined && Number.isFinite(minShares) && minShares > 0 ? minShares : 0;
+  const venueMinShares = book?.minOrderSize;
+  const minimumSharesKnown = venueMinShares !== null && venueMinShares !== undefined && Number.isFinite(venueMinShares) && venueMinShares > 0;
+  const minShares = Math.max(minimumSharesKnown ? venueMinShares : 0,
+    Number.isFinite(minimumSharesOverride) && minimumSharesOverride > 0 ? minimumSharesOverride : 0);
+  let remainingMinimumShares = minShares;
   let minimumSharesCost = 0;
   for (const level of asks) {
     if (remainingMinimumShares <= 0) break;
@@ -461,8 +465,9 @@ export const paperEntryBookEconomics = (
     bestAsk,
     spreadPct,
     availableDepthUsd: round(availableDepthUsd, 5),
-    minimumExecutableOrderUsd: minimumDepthAvailable ? Math.max(minimumUsd, Math.ceil((minimumSharesCost + (minShares ? 0.00001 : 0)) * 100) / 100) : Number.MAX_SAFE_INTEGER,
-    minimumSharesKnown: minShares !== null && minShares !== undefined && minShares > 0,
+    minimumExecutableOrderUsd: minimumDepthAvailable ? Math.max(minimumUsd, Math.ceil((minimumSharesCost + (minShares > 0 ? 0.00001 : 0)) * 100) / 100) : Number.MAX_SAFE_INTEGER,
+    minimumShares: minShares,
+    minimumSharesKnown,
     minimumDepthAvailable,
   };
 };

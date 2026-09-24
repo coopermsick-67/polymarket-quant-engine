@@ -194,6 +194,8 @@ export type BankrollSizingInput = {
   minNetEdge?: number;
   /** Net proceeds at risk of disappearing if current open positions resolve to zero. */
   openPositionRiskUsd?: number;
+  /** Optional caller-owned profile for isolated live sizing policies. */
+  profile?: BankrollProfile;
 };
 
 export type BankrollPortfolioAssessment = {
@@ -239,7 +241,7 @@ export type BankrollSizingDecision = {
 
 /** Binary-contract Kelly is computed for auditability, never applied raw. */
 export const calculateBankrollAwareStake = (input: BankrollSizingInput): BankrollSizingDecision => {
-  const profile = bankrollProfile(input.equityUsd);
+  const profile = input.profile ?? bankrollProfile(input.equityUsd);
   const risk = assessBankrollRisk({ equityUsd: input.equityUsd, dayStartEquityUsd: input.dayStartEquityUsd, peakEquityUsd: input.peakEquityUsd, profile,
     consecutiveLosses: input.consecutiveLosses, recentWinAfterDrawdown: input.recentWinAfterDrawdown });
   const errors: string[] = [];

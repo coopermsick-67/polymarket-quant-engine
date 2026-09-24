@@ -1,4 +1,4 @@
-import { bankrollProfile, calculateBankrollAwareStake, scoreBankrollOpportunity, type BankrollSizingDecision } from "./bankroll-policy";
+import { bankrollProfile, calculateBankrollAwareStake, scoreBankrollOpportunity, type BankrollProfile, type BankrollSizingDecision } from "./bankroll-policy";
 import { accountLiquidationEquity, analyzeMarketSignal, estimatePaperExitFill, paperEntryBookEconomics, type CostConfig, type MarketSignal, type PaperAccount } from "./engines";
 import type { LiveMarket } from "./polymarket-data";
 
@@ -39,19 +39,22 @@ export const evaluatePaperMarket = (input: {
   maxExposurePct?: number;
   maxOpenPositions?: number;
   minNetEdge?: number;
+  minimumSharesOverride?: number;
+  profileOverride?: BankrollProfile;
   now?: number;
 }): PaperOpportunity => {
   const { market, markets, account, costs } = input;
   const decisionAt = input.now ?? Date.now();
   const equity = input.liquidationEquityUsd ?? accountLiquidationEquity(account, markets, costs);
-  const profile = bankrollProfile(equity);
+  const profile = input.profileOverride ?? bankrollProfile(equity);
   const minOrderUsd = Math.max(1, input.minOrderUsd ?? 1);
-  const upBook = paperEntryBookEconomics(market, "UP", costs, minOrderUsd);
-  const downBook = paperEntryBookEconomics(market, "DOWN", costs, minOrderUsd);
+  const upBook = paperEntryBookEconomics(market, "UP", costs, minOrderUsd, input.minimumSharesOverride);
+  const downBook = paperEntryBookEconomics(market, "DOWN", costs, minOrderUsd, input.minimumSharesOverride);
   const visibleMinimums = [upBook.minimumExecutableOrderUsd, downBook.minimumExecutableOrderUsd].filter((value) => Number.isFinite(value) && value < Number.MAX_SAFE_INTEGER);
-  // Signal analysis can inspect an exchange-sized order even when that order
-  // would exceed the account cap. The sizing gate then explains the PASS.
-  const inspectBudget = Math.min(10_000, Math.max(minOrderUsd, equity * profile.maxStakePct, ...visibleMinimums));
+  // Reprice at the largest amount this caller is allowed to submit. If the
+  // exchange minimum exceeds that cap, the sizing gate below reports it.
+  const callerCap = input.maxTradeUsd ?? equity * profile.maxStakePct;
+  const inspectBudget = Math.min(10_000, Math.max(minOrderUsd, Math.min(callerCap, Math.max(equity * profile.maxStakePct, ...visibleMinimums))));
   const edgeFloor = Math.max(profile.minNetEdge, input.minNetEdge ?? 0);
   let signal = analyzeMarketSignal(market, costs, inspectBudget, edgeFloor, decisionAt);
   const base = { liquidationEquityUsd: equity, signal, sizing: null, score: null, book: null, stakeUsd: 0 } as const;
@@ -116,6 +119,7 @@ export const evaluatePaperMarket = (input: {
     maxOpenPositions: input.maxOpenPositions,
     minNetEdge: input.minNetEdge,
     openPositionRiskUsd,
+    profile,
   });
   let sizing = size(signal);
   if (!sizing.approved) return { ...base, book, sizing, approved: false, reason: `PASS: ${sizing.reason}` };
