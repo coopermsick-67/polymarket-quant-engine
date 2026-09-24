@@ -6,27 +6,24 @@ The VPS is not created automatically by this repo. Never send passwords, API key
 
 ## Recommended low-cost host
 
-For this workload, choose **Hostinger KVM 1, Ubuntu 24.04 LTS**: 1 vCPU, 4 GB RAM, 50 GB NVMe, and 4 TB monthly bandwidth. Hostinger currently advertises $6.49/month for its 2-year introductory term and $11.99/month on renewal; the first term is charged upfront, so check the total, taxes, and term at checkout. Prices and promotions vary by country and date. See [Hostinger VPS plans](https://www.hostinger.com/vps-hosting).
+For this workload, a small Ubuntu 24.04 VPS is sufficient. Confirm current capacity, price, billing term, and region before purchasing. See [Hostinger VPS plans](https://www.hostinger.com/vps-hosting).
 
 Any ordinary x86-64 Ubuntu 24.04 VPS with at least 2 GB RAM should run the paper daemon; 4 GB is preferable if you also install Hermes. The instructions below also work on another provider if it gives you root/sudo access and an Ubuntu 24.04 image. Do not choose shared website/PHP hosting: the worker needs a persistent Linux process and systemd.
 
-## 1. Put the deployment code in your GitHub repository
+## 1. Put the reviewed code in your GitHub repository
 
-The deployment changes need to be pushed to the repository before the VPS can clone them. Apply the provided patch to your local checkout of `polymarket-quant-engine`, inspect the changed files, commit, and push to your own branch. Do not push unreviewed changes to `main` if you do not normally do that.
-
-From Windows PowerShell, with the patch downloaded and your project checkout path substituted:
+Review the current checkout, commit the deployment changes, and push the branch that the VPS will clone. From Windows PowerShell:
 
 ```powershell
 cd C:\path\to\polymarket-quant-engine
-git apply C:\path\to\polymarket-quant-engine-paper-daemon.patch
 git status --short
 git diff --check
-git add .gitignore README.md app/lib/engines.ts app/lib/polymarket-data.ts deploy package.json pnpm-lock.yaml scripts/daemon-control.mjs scripts/trading-daemon.ts
-git commit -m "Add headless paper trading daemon"
+git add README.md deploy app scripts package.json pnpm-lock.yaml
+git commit -m "Update bankroll-aware paper daemon"
 git push -u origin HEAD
 ```
 
-Wait for the push to finish, then open the repository on GitHub and confirm it contains `scripts/trading-daemon.ts` and `deploy/install-host.sh`. If the patch is already on your GitHub branch, skip this step. The repository is public and can be cloned over HTTPS without a deploy key.
+Wait for the push to finish, then open the repository on GitHub and confirm it contains `scripts/trading-daemon.ts` and `deploy/install-host.sh`. If the reviewed commit is already on your GitHub branch, skip this step. The repository is public and can be cloned over HTTPS without a deploy key.
 
 ## 2. Create the Hostinger VPS
 
@@ -111,34 +108,36 @@ The engine environment file contains the following paper-only settings. Defaults
 | --- | ---: | --- |
 | `TRADING_MODE` | `paper` | Required; the daemon exits if this is not `paper`. |
 | `STATE_DIR` | `/var/lib/polymarket-quant-engine` | Persistent simulated ledger and halt switches. |
-| `POLL_INTERVAL_MS` | `15000` | Time between public market-data cycles. |
+| `POLL_INTERVAL_MS` | `15000` | Time between public market discovery, candle, and REST book refreshes. |
+| `DECISION_INTERVAL_MS` | `1000` | Time between paper decision scans using current cached and streaming market data. |
+| `PQE_DASHBOARD_ORIGINS` | empty | Exact browser origins permitted to read the local, read-only daemon status endpoint. Do not use a wildcard. |
 | `DATA_STALE_HALT_MS` | `90000` | Latch a halt when complete fresh data is missing this long. |
-| `PAPER_STARTING_CASH` | `1000` | Simulated initial cash, used only when creating a new ledger. |
-| `PAPER_MIN_BET_USD` | `1` | Minimum simulated entry amount; the daemon also limits a bet to available cash. |
-| `PAPER_MIN_BET_PCT` | `0.005` | Lowest bankroll fraction per bet (0.5%). |
-| `PAPER_MAX_BET_PCT` | `0.03` | Highest bankroll fraction per bet (3%); confidence maps linearly from 0.5% at 66% confidence to 3% at 96%. |
-| `PAPER_MAX_EXPOSURE_PCT` | `0.09` | Maximum total deployed simulated cost as a fraction of current equity (9%), subject to the $1 minimum bet. Below $11.11 equity, the $1 floor can exceed this portfolio cap; below $33.33, it can exceed the 3% per-bet maximum. |
-| `PAPER_MAX_OPEN_POSITIONS` | `3` | Maximum simultaneous simulated positions. |
-| `PAPER_MAX_DAILY_LOSS_PCT` | `0.05` | Daily loss fraction that halts new entries. Open positions remain exposed and may lose more than this threshold before they settle or close. |
-| `PAPER_MIN_NET_EDGE` | `0.04` | Minimum estimated net edge required for paper entry. |
+| `PAPER_STARTING_CASH` | `100` | Simulated initial cash, used only when creating a new ledger. `pqe-control reset-paper <amount>` archives an offline, position-free paper ledger and sets the next starting balance. |
+| `PAPER_MIN_BET_USD` | `1` | Operator minimum paper spend. A market minimum or this floor never overrides a bankroll tier's hard stake, cash reserve, exposure, or liquidity cap. |
+| `PAPER_MAX_BET_PCT` | `0.05` | Operator ceiling on one trade, further tightened by the bankroll tier (MICRO 5%, SMALL 4%, GROWTH 3%, STANDARD 2.5%, LARGE 2%). |
+| `PAPER_MAX_EXPOSURE_PCT` | `0.15` | Operator ceiling on total cost at risk, further tightened by the tier and correlated crypto exposure caps. |
+| `PAPER_MAX_OPEN_POSITIONS` | `5` | Operator ceiling, further tightened by tier limits of 1–5 positions. |
+| `PAPER_MAX_DAILY_LOSS_PCT` | `0.05` | Operator daily liquidation-loss ceiling, further tightened to 4% for MICRO and 4.5% for SMALL. A halt blocks new entries; open positions can still lose more. |
+| `PAPER_MIN_NET_EDGE` | `0.04` | Operator net-edge floor, further raised by tier to 8% for MICRO, 7% for SMALL, 6% for GROWTH, and 5% for STANDARD. |
 | `PAPER_FEE_RATE` | `0.02` | Conservative notional-fee floor; the simulator also applies the CLOB market fee schedule when available and a conservative crypto schedule when it is not. |
 | `PAPER_SLIPPAGE_BPS` | `15` | Assumed slippage in basis points for the simulation. |
 
-Edit the environment file only if you understand these simulated limits. Do not add wallet, Polymarket, or messaging secrets to it.
+`PAPER_MIN_BET_PCT` is no longer read. Bankroll sizing comes from typed profiles in `app/lib/bankroll-policy.ts`; environment ceilings can only tighten those profiles. The engine does not force a $1 trade. It PASSes when the CLOB minimum share size is missing, visible ask depth cannot fill that minimum, or the minimum executable cost exceeds any hard cap. A $20 account may have no safe executable opportunities. Edit the environment file only if you understand these simulated limits. Do not add wallet, Polymarket, or messaging secrets to it.
 
-The daemon saves state in `/var/lib/polymarket-quant-engine/paper-state.json`, checks the paper ledger's cash/positions/P&L reconciliation on every cycle, and halts new entries on stale data or risk-limit violations. When Gamma omits the opening reference, paper mode can use the matching Coinbase candle open as a labeled estimate; Polymarket's Chainlink TWAP may differ, and live execution still requires a Polymarket reference. A daily-loss halt blocks new entries; it does not force-close open positions, which can continue losing beyond the configured threshold. Kill, pause, and halt files are persistent until an operator changes them. Logs rotate daily and are compressed.
+The daemon saves state in `/var/lib/polymarket-quant-engine/paper-state.json`, checks the paper ledger's cash/positions/P&L reconciliation on every cycle, and halts new entries on stale data or risk-limit violations. It admits new paper entries only with a verified Polymarket 60-second TWAP opening Price to Beat and a fresh current price from the matching oracle feed. Coinbase spot or candle-open estimates cannot replace the market's oracle price. A daily-loss halt blocks new entries; it does not force-close open positions, which can continue losing beyond the configured threshold. Kill, pause, and halt files are persistent until an operator changes them. Logs rotate daily and are compressed.
 
 Verify the daemon before installing Hermes:
 
 ```bash
 sudo systemctl is-enabled polymarket-quant-engine.service
 sudo systemctl is-active polymarket-quant-engine.service
-curl --fail --silent http://127.0.0.1:8788/healthz | python3 -m json.tool
+curl --fail --silent http://127.0.0.1:8788/livez | python3 -m json.tool
+curl --silent http://127.0.0.1:8788/status | python3 -m json.tool
 sudo -u pqe /usr/local/bin/pqe-control status
 sudo tail -n 50 /var/log/polymarket-quant-engine/trading.log
 ```
 
-Expected: service is `enabled` and `active`; health returns `ok: true`; status says `mode: paper`, `reconciliation: PASS`, and `WAITING_FOR_DATA` or `PAPER_RUNNING`. `WAITING_FOR_DATA` can occur while public endpoints load; if the data stays stale, the daemon latches a halt instead of trading.
+Expected: service is `enabled` and `active`; liveness returns `ok: true`; status says `mode: paper`, `reconciliation: PASS`, and `WAITING_FOR_DATA` or `PAPER_RUNNING`. `/healthz` and `/readyz` return 503 whenever current entry conditions are not ready, including while public endpoints load or a halt is active. If data stays stale, the daemon latches a halt instead of trading.
 
 ## 7. Install Hermes as the optional, low-usage operator
 
@@ -172,7 +171,7 @@ sudo -u hermes -H bash -lc 'hermes cron list'
 sudo -u hermes -H bash -lc 'hermes cron status'
 ```
 
-The watchdog checks systemd and the local `/healthz`, restarts an unhealthy process with a ten-minute cooldown, and reports state changes/actionable halts. It does not clear a kill or risk halt. Use messaging commands only for status, pause/resume, or kill; clearing a halt requires an explicit operator action. Keep Hermes permissions restricted as installed by `deploy/install-host.sh`.
+The watchdog checks systemd and the local `/livez`, restarts an unhealthy process with a ten-minute cooldown, and reports state changes/actionable halts. It does not clear a kill or risk halt. Use messaging commands only for status, pause/resume, or kill; clearing a halt requires an explicit operator action. Keep Hermes permissions restricted as installed by `deploy/install-host.sh`.
 
 ## 8. Operator commands and final checks
 
@@ -181,7 +180,8 @@ Run on the VPS:
 ```bash
 sudo systemctl is-enabled polymarket-quant-engine.service
 sudo systemctl is-active polymarket-quant-engine.service
-curl --fail --silent http://127.0.0.1:8788/healthz | python3 -m json.tool
+curl --fail --silent http://127.0.0.1:8788/livez | python3 -m json.tool
+curl --silent http://127.0.0.1:8788/status | python3 -m json.tool
 sudo -u pqe /usr/local/bin/pqe-control status
 sudo logrotate --debug /etc/logrotate.d/polymarket-quant-engine
 sudo -u hermes -H bash -lc 'hermes cron list'
@@ -200,6 +200,15 @@ sudo systemctl restart polymarket-quant-engine.service
 sudo journalctl -u polymarket-quant-engine.service -n 100 --no-pager
 ```
 
+To intentionally start a fresh paper account while preserving the old ledger, stop the service first. Reset is refused while the daemon is listening or if the saved account has open positions.
+
+```bash
+sudo systemctl stop polymarket-quant-engine.service
+sudo -u pqe /usr/local/bin/pqe-control reset-paper 100
+sudo systemctl start polymarket-quant-engine.service
+sudo -u pqe /usr/local/bin/pqe-control status
+```
+
 To watch the live paper ledger from an interactive SSH terminal, open a second SSH session and run:
 
 ```bash
@@ -207,9 +216,9 @@ cd /opt/polymarket-quant-engine
 pnpm run dashboard
 ```
 
-The terminal clock, position countdowns, and dashboard view refresh every second. The daemon keeps market discovery on its 15-second REST cycle and updates marks from Coinbase and Polymarket WebSocket feeds as quotes arrive; the Polymarket stream subscribes only to the assets held in open positions. If the dashboard says the endpoint cannot be reached, keep the daemon running in another terminal or check that systemd is active. Press `q` to close only the monitor; systemd continues running the daemon. Press `r` for an immediate refresh. The dashboard reads the local-only status endpoint and does not expose a public web page.
+The terminal clock, position countdowns, dashboard view, and paper decision scans target one second. Market discovery, candles, and REST book snapshots refresh in the background every 15 seconds; live WebSocket updates are applied between snapshots. Status reports decision-cycle duration and overrun count. If the dashboard says the endpoint cannot be reached, keep the daemon running in another terminal or check that systemd is active. Press `q` to close only the monitor; systemd continues running the daemon. Press `r` for an immediate refresh. The dashboard reads the local-only status endpoint and does not expose a public web page.
 
-`kill` latches the kill switch and blocks new paper entries. `clear-halt` removes halt flags, so inspect the status and logs first. `pause` blocks new entries without stopping settlement/cashout processing. The service's `/healthz` and `/status` bind to localhost only; never expose port 8788 publicly.
+`kill` latches the kill switch and blocks new paper entries. `clear-halt` removes halt flags, so inspect the status and logs first. `pause` blocks new entries without stopping settlement/cashout processing. The service's `/livez`, `/healthz`, `/readyz`, and `/status` bind to localhost only; never expose port 8788 publicly. `/livez` is process liveness; `/healthz` and `/readyz` are trading readiness.
 
 For source updates, review the target commit first, stop the service, back up `/var/lib/polymarket-quant-engine`, install the reviewed code and frozen production dependencies, then start the service and repeat the final checks. Do not deploy an unreviewed `git pull` automatically.
 

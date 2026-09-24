@@ -2,7 +2,7 @@
 set -u
 
 UNIT=polymarket-quant-engine.service
-HEALTH_URL=http://127.0.0.1:8788/healthz
+HEALTH_URL=http://127.0.0.1:8788/livez
 STATUS_URL=http://127.0.0.1:8788/status
 HOME_DIR="${HOME:-/home/hermes}"
 STATE_DIR="${HOME_DIR}/.hermes/scripts"

@@ -1,13 +1,16 @@
 import {
+  anchoredFairUp,
   bestAskFor,
   bestBidFor,
   CONSERVATIVE_CRYPTO_FEE_SCHEDULE,
   estimateFairProbability,
+  marketImpliedProbabilityUp,
   orderBookFor,
   sideFairProbability,
   type Horizon,
   type LiveMarket,
   type MarketCandle,
+  type OrderBook,
 } from "./polymarket-data";
 
 export type PaperSide = "UP" | "DOWN";
@@ -64,6 +67,9 @@ export type EquityPoint = { timestamp: number; equity: number };
 export type PaperAccount = {
   startingCash: number;
   cash: number;
+  riskDayKey?: string;
+  riskDayStartEquityUsd?: number;
+  peakLiquidationEquityUsd?: number;
   realizedPnl: number;
   fees: number;
   openOrders: number;
@@ -94,7 +100,17 @@ export type MarketSignal = {
   biasConfidence: number | null;
   /** Compatibility field; this is a directional heuristic score, not a calibrated win probability. */
   confidence: number | null;
+  /** Market-anchored P(UP); every edge in this signal is priced against it. */
   fairUp: number | null;
+  /** Unanchored candle-model P(UP), shown for transparency only. */
+  rawModelUp: number | null;
+  /** Midpoint indication only; orders pay the executable ask and fees. */
+  marketProbabilityUp: number | null;
+  /** Heuristic uncertainty penalty, not a calibrated confidence interval. */
+  modelUncertainty: number;
+  microScore: number | null;
+  executableCostProbability: number | null;
+  expectedNetProfitUsd: number | null;
   upEdge: number | null;
   downEdge: number | null;
   entryPrice: number | null;
@@ -193,6 +209,9 @@ export const createPaperAccount = (startingCash: number, timestamp = Date.now())
   return {
     startingCash: safeCash,
     cash: safeCash,
+    riskDayKey: new Date(timestamp).toISOString().slice(0, 10),
+    riskDayStartEquityUsd: safeCash,
+    peakLiquidationEquityUsd: safeCash,
     realizedPnl: 0,
     fees: 0,
     openOrders: 0,
@@ -222,9 +241,8 @@ export const accountUnrealized = (account: PaperAccount, markets: Map<string, Li
 export const accountDeployed = (account: PaperAccount) => account.positions.reduce((total, position) => total + position.totalCost, 0);
 
 /**
- * Paper sizing stays at the minimum bankroll fraction until the probability
- * model has enough settled, out-of-sample observations to justify scaling up.
- * The $1 floor intentionally takes precedence for bankrolls at or below $100.
+ * Legacy paper sizing for callers that have not yet supplied market-specific
+ * liquidity and fee inputs. A venue minimum never overrides the risk cap.
  */
 export const paperStakeUsd = (
   bankroll: number,
@@ -239,8 +257,8 @@ export const paperStakeUsd = (
   const minPct = Math.max(0, Number.isFinite(minFraction) ? minFraction : 0.005);
   const maxPct = Math.max(minPct, Number.isFinite(maxFraction) ? maxFraction : 0.03);
   const target = Math.max(floor, safeBankroll * minPct);
-  const cap = Math.max(floor, safeBankroll * maxPct);
-  return round(Math.min(safeCash, target, cap));
+  const cap = Math.min(safeCash, safeBankroll * maxPct);
+  return cap + 0.00000001 < floor ? 0 : round(Math.min(target, cap));
 };
 
 /** Conservative net proceeds estimate for the daily-loss guard. */
@@ -256,12 +274,24 @@ export const accountLiquidationEquity = (account: PaperAccount, markets: Map<str
   return round(account.cash + liquidatableProceeds, 4);
 };
 
+export const updatePaperRiskBaselines = (account: PaperAccount, liquidationEquityUsd: number, timestamp = Date.now()): PaperAccount => {
+  if (!Number.isFinite(liquidationEquityUsd) || liquidationEquityUsd < 0) return account;
+  const riskDayKey = new Date(timestamp).toISOString().slice(0, 10);
+  const sameDay = account.riskDayKey === riskDayKey && Number.isFinite(account.riskDayStartEquityUsd)
+    && (account.riskDayStartEquityUsd ?? 0) > 0;
+  const riskDayStartEquityUsd = sameDay ? account.riskDayStartEquityUsd! : liquidationEquityUsd;
+  const peakLiquidationEquityUsd = Math.max(account.peakLiquidationEquityUsd ?? account.startingCash, liquidationEquityUsd);
+  if (account.riskDayKey === riskDayKey && account.riskDayStartEquityUsd === riskDayStartEquityUsd
+    && account.peakLiquidationEquityUsd === peakLiquidationEquityUsd) return account;
+  return { ...account, riskDayKey, riskDayStartEquityUsd, peakLiquidationEquityUsd };
+};
+
 export const accountWinRate = (account: PaperAccount): number | null => {
   if (!account.closedTrades.length) return null;
   return account.closedTrades.filter((trade) => trade.pnl > 0).length / account.closedTrades.length;
 };
 
-export const markAccount = (account: PaperAccount, markets: Map<string, LiveMarket>, timestamp = Date.now()): PaperAccount => {
+export const markAccount = (account: PaperAccount, markets: Map<string, LiveMarket>, timestamp = Date.now(), costs: CostConfig = { feeRate: 0, slippageBps: 0 }): PaperAccount => {
   const positions = account.positions.map((position) => {
     const market = markets.get(position.marketId);
     return {
@@ -271,15 +301,16 @@ export const markAccount = (account: PaperAccount, markets: Map<string, LiveMark
     };
   });
   const marked = { ...account, positions };
-  const equity = accountEquity(marked, markets);
-  const last = marked.equityHistory[marked.equityHistory.length - 1];
+  const withRiskBaselines = updatePaperRiskBaselines(marked, accountLiquidationEquity(marked, markets, costs), timestamp);
+  const equity = accountEquity(withRiskBaselines, markets);
+  const last = withRiskBaselines.equityHistory[withRiskBaselines.equityHistory.length - 1];
   const shouldAppend = !last || timestamp - last.timestamp >= 2500;
-  return shouldAppend ? { ...marked, equityHistory: [...marked.equityHistory, { timestamp, equity }].slice(-5000) } : marked;
+  return shouldAppend ? { ...withRiskBaselines, equityHistory: [...withRiskBaselines.equityHistory, { timestamp, equity }].slice(-5000) } : withRiskBaselines;
 };
 
 const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: CostConfig): FillResult | null => {
   const book = orderBookFor(market, side);
-  if (!book?.asks.length || budget <= 0) return null;
+  if (!isBookFreshForExecution(book) || !book.asks.length || budget <= 0) return null;
   const slippageBps = Number.isFinite(costs.slippageBps) ? Math.max(0, costs.slippageBps) : 0;
   const slippageMultiplier = 1 + slippageBps / 10_000;
   let remainingBudget = budget;
@@ -309,9 +340,12 @@ const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: Co
   return { shares: round(shares), price: round(notional / shares), notional: round(notional), fee: round(fee, 5), totalCost: round(notional + fee, 5), levels };
 };
 
-const walkBids = (market: LiveMarket, side: PaperSide, requestedShares: number, costs: CostConfig): FillResult | null => {
+const isBookFreshForExecution = (book: OrderBook | null, now = Date.now()): book is OrderBook =>
+  Boolean(book && book.timestamp !== null && book.timestamp <= now + 30_000 && now - book.timestamp <= MAX_ORDER_BOOK_AGE_MS);
+
+const walkBids = (market: LiveMarket, side: PaperSide, requestedShares: number, costs: CostConfig, now = Date.now()): FillResult | null => {
   const book = orderBookFor(market, side);
-  if (!book?.bids.length || requestedShares <= 0) return null;
+  if (!isBookFreshForExecution(book, now) || !book.bids.length || requestedShares <= 0) return null;
   const slippageBps = Number.isFinite(costs.slippageBps) ? Math.max(0, costs.slippageBps) : 0;
   const slippageMultiplier = Math.max(0, 1 - slippageBps / 10_000);
   let remainingShares = requestedShares;
@@ -335,6 +369,57 @@ const walkBids = (market: LiveMarket, side: PaperSide, requestedShares: number, 
   if (shares <= 0) return null;
   const netProceeds = Math.max(0, notional - fee);
   return { shares: round(shares), price: round(notional / shares), notional: round(notional), fee: round(fee, 5), totalCost: round(netProceeds, 5), levels };
+};
+
+/** What a paper cashout could actually receive from the visible bid book. */
+export const estimatePaperExitFill = (
+  market: LiveMarket,
+  side: PaperSide,
+  shares: number,
+  costs: CostConfig,
+  now = Date.now(),
+): FillResult | null => walkBids(market, side, shares, costs, now);
+
+/** Per-side order economics from the current ask book, for bankroll gates. */
+export const paperEntryBookEconomics = (
+  market: LiveMarket,
+  side: PaperSide,
+  costs: CostConfig,
+  minimumUsd = 1,
+) => {
+  const book = orderBookFor(market, side);
+  const asks = (book?.asks ?? []).filter((level) => Number.isFinite(level.price) && level.price > 0 && level.price < 1 && Number.isFinite(level.size) && level.size > 0).sort((a, b) => a.price - b.price);
+  const bestAsk = asks[0]?.price ?? null;
+  const bestBid = bestBidFor(market, side);
+  const spreadPct = bestAsk !== null && bestBid !== null ? Math.max(0, bestAsk - bestBid) / bestAsk : null;
+  const slippageMultiplier = 1 + Math.max(0, Number.isFinite(costs.slippageBps) ? costs.slippageBps : 0) / 10_000;
+  // Only near-touch asks count toward the sizing liquidity cap. Far-away
+  // shares cannot justify a large affordable stake at the displayed price.
+  const nearTouchAsks = asks.filter((level) => bestAsk !== null && level.price <= bestAsk + 0.025);
+  const availableDepthUsd = nearTouchAsks.reduce((sum, level) => {
+    const price = level.price * slippageMultiplier;
+    return price < 1 ? sum + level.size * (price + feePerShareAt(market, price, costs)) : sum;
+  }, 0);
+  const minShares = book?.minOrderSize;
+  let remainingMinimumShares = minShares !== null && minShares !== undefined && Number.isFinite(minShares) && minShares > 0 ? minShares : 0;
+  let minimumSharesCost = 0;
+  for (const level of asks) {
+    if (remainingMinimumShares <= 0) break;
+    const price = level.price * slippageMultiplier;
+    if (price >= 1) continue;
+    const taken = Math.min(remainingMinimumShares, level.size);
+    minimumSharesCost += taken * (price + feePerShareAt(market, price, costs));
+    remainingMinimumShares -= taken;
+  }
+  const minimumDepthAvailable = remainingMinimumShares <= 0;
+  return {
+    bestAsk,
+    spreadPct,
+    availableDepthUsd: round(availableDepthUsd, 5),
+    minimumExecutableOrderUsd: minimumDepthAvailable ? Math.max(minimumUsd, Math.ceil((minimumSharesCost + (minShares ? 0.00001 : 0)) * 100) / 100) : Number.MAX_SAFE_INTEGER,
+    minimumSharesKnown: minShares !== null && minShares !== undefined && minShares > 0,
+    minimumDepthAvailable,
+  };
 };
 
 export const buyPaper = (
@@ -423,7 +508,7 @@ export const closePaperPositions = (
       continue;
     }
     const market = markets.get(position.marketId);
-    const fill = market ? walkBids(market, position.side, position.shares, costs) : null;
+    const fill = market ? walkBids(market, position.side, position.shares, costs, timestamp) : null;
     if (!fill) {
       remaining.push(position);
       skipped += 1;
@@ -718,16 +803,14 @@ const newestCompletedCandleAt = (history: MarketCandle[], barSeconds: number, no
   return Math.max(...candles.map((candle) => candle.timestamp + barSeconds * 1000));
 };
 
-export const marketDataFreshnessIssue = (
-  market: LiveMarket,
-  now = market.sourceTimestamp || Date.now(),
-  // Opt in only for the paper daemon; browser and live callers remain strict.
-  options: { allowCoinbaseReferenceEstimate?: boolean } = {},
-): string | null => {
-  if (market.reference === null || market.reference <= 0 || market.spot === null || market.spot <= 0) return "Missing live spot or market reference.";
-  if (market.referenceSource !== "POLYMARKET" && !(options.allowCoinbaseReferenceEstimate && market.referenceSource === "COINBASE ESTIMATE")) {
-    return "Waiting for the Polymarket opening reference. Coinbase candle opens are only a proxy for the Chainlink settlement price.";
+/** Feed/book health, independent of whether this market's exact opening tick was observed. */
+export const marketStreamingDataFreshnessIssue = (market: LiveMarket, now = Date.now()): string | null => {
+  if (market.priceFeed === "UNSUPPORTED") return "This market uses an unsupported price-resolution feed; waiting for a supported Polymarket oracle market.";
+  if (market.spot === null || market.spot <= 0 || market.spotSource !== "POLYMARKET"
+    || market.spotUpdatedAt === null || market.spotUpdatedAt > now + 1_000) {
+    return "Waiting for a current observation from this market's Polymarket oracle feed.";
   }
+  if (now - market.spotUpdatedAt > 10_000) return "Polymarket oracle data is stale; waiting for a fresh tick.";
   if (market.chartUpdatedAt === null || now - market.chartUpdatedAt > 120_000) return "Chart feed is stale; waiting for a fresh candle snapshot.";
   for (const orderBook of [market.upBook, market.downBook]) {
     if (!orderBook || orderBook.timestamp === null || now - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - now > 30_000) {
@@ -739,6 +822,21 @@ export const marketDataFreshnessIssue = (
   if (newest5mClose === null || now - newest5mClose > 2 * 300_000
     || newest15mClose === null || now - newest15mClose > 2 * 900_000) {
     return "Completed 5m or 15m candle data is stale; waiting for fresh usable bars on both charts.";
+  }
+  return null;
+};
+
+export const marketDataFreshnessIssue = (
+  market: LiveMarket,
+  now = Date.now(),
+): string | null => {
+  if (market.priceFeed === "UNSUPPORTED") return "This market uses an unsupported price-resolution feed; waiting for a supported Polymarket oracle market.";
+  if (!market.startTimeVerified || market.startTime === null || market.startTime > now + 1_000) return "Market start time is missing or cannot be verified against the market interval.";
+  const liveIssue = marketStreamingDataFreshnessIssue(market, now);
+  if (liveIssue) return liveIssue;
+  if (market.reference === null || market.reference <= 0 || !market.referenceVerified
+    || market.referenceSource !== "POLYMARKET" || market.referenceUpdatedAt !== market.startTime) {
+    return "Waiting for the exact Polymarket opening oracle observation used as Price to Beat.";
   }
   return null;
 };
@@ -781,7 +879,7 @@ const trendLabel = (score: number | null): MarketSignal["trend5m"] => score === 
   ? "UNAVAILABLE"
   : score >= 0.16 ? "UP" : score <= -0.16 ? "DOWN" : "MIXED";
 
-type DirectionalRead = { bias: MarketSignal["bias"]; confidence: number | null; ageSeconds: number | null };
+type DirectionalRead = { bias: MarketSignal["bias"]; confidence: number | null; ageSeconds: number | null; microScore: number | null };
 
 const liveMicroScore = (history: { timestamp: number; price: number }[] | undefined, start: number, now: number, early: boolean): number | null => {
   const from = early ? start - 1500 : now - 30_000;
@@ -831,20 +929,51 @@ const directionalRead = (market: LiveMarket, stats5m: ChartTrendStats | null, st
     add(referenceScore, 0.27);
     add(micro, 0.15);
   }
-  if (!totalWeight) return { bias: "WARMING UP", confidence: null, ageSeconds };
+  if (!totalWeight) return { bias: "WARMING UP", confidence: null, ageSeconds, microScore: micro };
   const score = clampScore(weightedScore / totalWeight);
   const bias: MarketSignal["bias"] = score >= 0.08 ? "UP" : score <= -0.08 ? "DOWN" : "NEUTRAL";
   const confidence = Math.min(0.84, 0.5 + Math.abs(score) * 0.32 + Math.min(0.04, Math.max(0, sourceCount - 1) * 0.02));
-  return { bias, confidence, ageSeconds };
+  return { bias, confidence, ageSeconds, microScore: micro };
 };
 
-const passSignal = (reason: string, stats5m: ChartTrendStats | null = null, stats15m: ChartTrendStats | null = null, fairUp: number | null = null, read: DirectionalRead = { bias: "WARMING UP", confidence: null, ageSeconds: null }, upEdge: number | null = null, downEdge: number | null = null): MarketSignal => ({
+const modelUncertainty = (market: LiveMarket, stats5m: ChartTrendStats | null, stats15m: ChartTrendStats | null, read: DirectionalRead) => {
+  // The probability model has not been calibrated. Penalize an opening-reference
+  // proxy, missing early micro observations, and disagreement between realized
+  // volatility estimates normalized to the same one-minute scale.
+  const vol5 = stats5m?.volatility ? stats5m.volatility / Math.sqrt(5) : null;
+  const vol15 = stats15m?.volatility ? stats15m.volatility / Math.sqrt(15) : null;
+  const volDisagreement = vol5 && vol15 ? Math.min(0.2, Math.abs(Math.log(vol5 / vol15)) / Math.log(4) * 0.2) : 0.2;
+  return Math.min(1, 0.35 + volDisagreement
+    + (market.referenceSource === "POLYMARKET" ? 0 : 0.2)
+    + (read.ageSeconds !== null && read.ageSeconds <= 90 && read.microScore === null ? 0.2 : 0));
+};
+
+/**
+ * Asks below this are long shots: a few points of model error swamp the
+ * payoff, and the recorded paper runs lost 14 of 15 entries under 30c.
+ */
+export const MIN_ENTRY_PRICE = 0.15;
+
+/**
+ * When the raw model and the book disagree by more than this, stale or wrong
+ * inputs (reference, spot, volatility) are the likelier explanation than a
+ * mispriced market, so the signal passes instead of calling it edge.
+ */
+export const MAX_MODEL_MARKET_GAP = 0.25;
+
+const passSignal = (reason: string, stats5m: ChartTrendStats | null = null, stats15m: ChartTrendStats | null = null, fairUp: number | null = null, read: DirectionalRead = { bias: "WARMING UP", confidence: null, ageSeconds: null, microScore: null }, upEdge: number | null = null, downEdge: number | null = null, market: LiveMarket | null = null): MarketSignal => ({
   action: "PASS",
   tier: "PASS",
   bias: read.bias,
   biasConfidence: read.confidence,
   confidence: null,
   fairUp,
+  rawModelUp: market?.fairUp ?? null,
+  marketProbabilityUp: market ? marketImpliedProbabilityUp(market) : null,
+  modelUncertainty: market ? modelUncertainty(market, stats5m, stats15m, read) : 1,
+  microScore: read.microScore,
+  executableCostProbability: null,
+  expectedNetProfitUsd: null,
   upEdge,
   downEdge,
   entryPrice: null,
@@ -864,9 +993,8 @@ export const analyzeMarketSignal = (
   costs: CostConfig,
   budget = 25,
   minNetEdge = 0.04,
-  options: { allowCoinbaseReferenceEstimate?: boolean } = {},
+  now = Date.now(),
 ): MarketSignal => {
-  const now = market.sourceTimestamp || Date.now();
   const stats5m = chartTrendStats(market.chart5m, 300, now);
   const stats15m = chartTrendStats(market.chart15m, 900, now);
   const read = directionalRead(market, stats5m, stats15m, now);
@@ -879,11 +1007,12 @@ export const analyzeMarketSignal = (
       downEdge: downFill ? 1 - fairUp - downFill.totalCost / downFill.shares : null,
     };
   };
-  const pass = (reason: string, fairUp = market.fairUp) => {
+  const anchoredUp = anchoredFairUp(market);
+  const pass = (reason: string, fairUp = anchoredUp) => {
     const comparison = comparePrices(fairUp);
-    return passSignal(reason, stats5m, stats15m, fairUp, read, comparison.upEdge, comparison.downEdge);
+    return passSignal(reason, stats5m, stats15m, fairUp, read, comparison.upEdge, comparison.downEdge, market);
   };
-  const freshnessIssue = marketDataFreshnessIssue(market, now, options);
+  const freshnessIssue = marketDataFreshnessIssue(market, now);
   if (freshnessIssue) return pass(freshnessIssue);
 
   if (!stats5m || !stats15m) {
@@ -894,15 +1023,20 @@ export const analyzeMarketSignal = (
   }
   if (market.remaining < (market.duration === "5m" ? 30 : 60)) return pass("Too little time remains for a fresh entry.");
   if (market.fairUp === null) return pass("Candle volatility is unavailable, so probability is not estimated.");
+  if (anchoredUp === null) return pass("No two-sided order book quote to anchor the model probability.");
+  const marketUp = marketImpliedProbabilityUp(market);
+  if (marketUp !== null && Math.abs(market.fairUp - marketUp) > MAX_MODEL_MARKET_GAP) {
+    return pass(`Raw model P(UP) ${Math.round(market.fairUp * 100)}% is ${Math.round(Math.abs(market.fairUp - marketUp) * 100)} points from the market's ${Math.round(marketUp * 100)}%; a gap that large is more often stale or wrong inputs than edge.`);
+  }
   const target = market.duration === "5m" ? stats5m.score : stats15m.score;
   const context = market.duration === "5m" ? stats15m.score : stats5m.score;
   const chartAgreement = Math.sign(target) !== 0 && Math.sign(target) === Math.sign(context) && Math.abs(target) >= 0.2 && Math.abs(context) >= 0.14;
   if (!chartAgreement) return pass("5m and 15m chart trends do not confirm the same direction.");
   if (Math.sign(market.fairUp - 0.5) !== Math.sign(target)) return pass("Spot versus the market reference conflicts with the candle trend.");
 
-  // Use the candle-volatility probability as-is. Adding a trend-based probability
-  // uplift made the estimate look more certain without calibration evidence.
-  const fairUp = market.fairUp;
+  // Price every edge against the market-anchored probability. The raw candle
+  // probability alone treated any disagreement with the book as edge.
+  const fairUp = anchoredUp;
   const upFill = walkAsks(market, "UP", budget, costs);
   const downFill = walkAsks(market, "DOWN", budget, costs);
   const candidates = [
@@ -915,12 +1049,23 @@ export const analyzeMarketSignal = (
   const side = best.side;
   const fill = best.fill;
   const edge = best.edge;
+  const executionCostProbability = fill.totalCost / fill.shares;
+  const expectedNetProfitUsd = edge * fill.shares;
+  // The micro feed is the only within-window momentum evidence. During the
+  // opening 90 seconds, chart context alone is a WATCH rather than an ENTRY.
+  if (read.ageSeconds !== null && read.ageSeconds <= 90 &&
+    (read.microScore === null || Math.abs(read.microScore) < 0.08 || Math.sign(read.microScore) !== (side === "UP" ? 1 : -1))) {
+    return { ...pass(`WATCH ${side}: wait for fresh, aligned within-market spot observations before entering.`, fairUp),
+      entryPrice: fill.price, edge, estimatedFill: fill,
+      executableCostProbability: executionCostProbability, expectedNetProfitUsd };
+  }
+  if (fill.price < MIN_ENTRY_PRICE) return { ...pass(`Best value is ${side} at ${Math.round(fill.price * 1000) / 10}c, a long shot below the ${MIN_ENTRY_PRICE * 100}c entry floor.`, fairUp), upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill, executableCostProbability: executionCostProbability, expectedNetProfitUsd };
   const sideSpread = side === "UP" && market.upAsk !== null && market.upBid !== null ? market.upAsk - market.upBid : side === "DOWN" && market.downAsk !== null && market.downBid !== null ? market.downAsk - market.downBid : market.spread;
   if (sideSpread === null || sideSpread > 0.12) return { ...pass(`Best value is ${side}, but that side's spread is too wide for a reliable entry.`, fairUp), upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge };
 
   const confidence = read.confidence;
   const requiredEdge = Math.max(0.04, minNetEdge);
-  if (edge < requiredEdge) return { ...pass(`Best price edge is ${Math.round(edge * 1000) / 10}% on ${side}, below the ${Math.round(requiredEdge * 1000) / 10}% entry floor.`, fairUp), confidence, upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill };
+  if (edge < requiredEdge) return { ...pass(`Best price edge is ${Math.round(edge * 1000) / 10}% on ${side}, below the ${Math.round(requiredEdge * 1000) / 10}% entry floor.`, fairUp), confidence, upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill, executableCostProbability: executionCostProbability, expectedNetProfitUsd };
 
   const locked = edge >= Math.max(0.08, requiredEdge * 2) && Math.abs(target) >= 0.5 && Math.abs(context) >= 0.25;
   const referenceLabel = market.referenceSource === "COINBASE ESTIMATE" ? "Coinbase opening-reference estimate (paper only)" : "Polymarket reference";
@@ -931,6 +1076,12 @@ export const analyzeMarketSignal = (
     biasConfidence: read.confidence,
     confidence,
     fairUp,
+    rawModelUp: market.fairUp,
+    marketProbabilityUp: marketImpliedProbabilityUp(market),
+    modelUncertainty: modelUncertainty(market, stats5m, stats15m, read),
+    microScore: read.microScore,
+    executableCostProbability: executionCostProbability,
+    expectedNetProfitUsd,
     upEdge: priceComparison.upEdge,
     downEdge: priceComparison.downEdge,
     entryPrice: fill.price,
@@ -941,7 +1092,7 @@ export const analyzeMarketSignal = (
     score15m: stats15m.score,
     rsi5m: stats5m.rsi,
     rsi15m: stats15m.rsi,
-    reason: locked ? `5m and 15m trends align; ${referenceLabel}, order-book depth, and the stricter net-edge gate pass. Probability remains uncalibrated.` : `5m and 15m trends align; ${referenceLabel}, order-book depth, and the net-edge gate pass. Probability remains uncalibrated.`,
+    reason: locked ? `5m and 15m trends align; ${referenceLabel}, order-book depth, and the stricter net-edge gate pass. Edge uses the market-anchored probability; the model is not calibrated.` : `5m and 15m trends align; ${referenceLabel}, order-book depth, and the net-edge gate pass. Edge uses the market-anchored probability; the model is not calibrated.`,
     estimatedFill: fill,
   };
 };

@@ -4,6 +4,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 import { getChatGPTUser } from "../../../chatgpt-auth";
 import {
+  anchoredFairUp,
   buildLiveMarket,
   discoverCryptoMarkets,
   fetchCandleHistories,
@@ -12,7 +13,7 @@ import {
 } from "../../../lib/polymarket-data";
 import { analyzeMarketSignal, marketDataFreshnessIssue } from "../../../lib/engines";
 import { evaluateModelAwareExit } from "../../../lib/early-exit";
-import { assessLiveExposure, computeKellySizing, enforceLiveExecutionRisk } from "../../../lib/live-risk";
+import { assessLiveExposure, computeKellySizing, enforceLiveExecutionRisk, type LiveRiskConfig } from "../../../lib/live-risk";
 import {
   clearLiveSessionCookie,
   liveSessionCookie,
@@ -454,7 +455,8 @@ export async function POST(request: Request) {
       const freshnessIssue = marketDataFreshnessIssue(market);
       if (freshnessIssue) return json(pass(`Early exit blocked: ${freshnessIssue}`));
       const currentPrice = side === "UP" ? market.upBid : market.downBid;
-      const fairProbability = side === "UP" ? market.fairUp : market.fairUp === null ? null : 1 - market.fairUp;
+      const fairUp = anchoredFairUp(market);
+      const fairProbability = fairUp === null ? null : side === "UP" ? fairUp : 1 - fairUp;
       if (currentPrice === null || fairProbability === null) return json(pass("Current executable bid or model fair probability is unavailable."));
       const shares = Math.min(requestedShares, position.size);
       const evaluation = evaluateModelAwareExit({ policy: risk, entryPrice: position.averagePrice, currentPrice, fairProbability, shares, feeRate: risk.feeRate, remainingSeconds: market.remaining });

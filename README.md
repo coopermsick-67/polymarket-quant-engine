@@ -9,13 +9,14 @@ Polymarket Quant Engine is a paper-first terminal for active crypto Up/Down mark
 - One-second countdowns plus Coinbase and Polymarket market WebSocket updates with REST recovery refreshes.
 - Transparent chart signal fields: model P(UP), UP/DOWN asks, net edge, 5m/15m trends, confidence, liquidity, and reason.
 - One shared paper account for manual Paper Trader entries, automatic entries, timeframe tests, balance, open positions, closed positions, realized P&L, and resolution payouts.
+- Bankroll-adaptive paper sizing for MICRO ($20–49.99), SMALL ($50–99.99), GROWTH ($100–249.99), STANDARD ($250–999.99), and LARGE ($1,000+) liquidation equity, with tier-specific cash reserves, concentration, spread, depth, edge, and drawdown gates.
 - Resolution-aware paper settlement: winning shares pay $1, losing shares pay $0 when an expired market outcome is available; realized cash flows into the same balance used by newly opened markets.
 - Browser-local decision ledger for all active markets with UP/DOWN/PASS, outcomes, timestamps, sizing, and CSV export.
 - Timeframe paper tests with a chosen starting balance and duration, Telegram test/report delivery, and Sunday 9 PM Eastern browser-assisted scheduling.
 - Optional owner-authenticated Polymarket account reads and live execution gates in the hosted Site, with balance checks, risk limits, fractional Kelly sizing, duration filters, pause, and cancel-all controls.
 - Model-aware cashouts for paper positions and an opt-in live exit policy: the current executable bid must clear the model fair probability, minimum dollar/percentage profit, remaining-time, and repeated-confirmation checks before a sell is attempted. The server revalidates the position and market immediately before submitting a non-retried FAK sell.
 
-The model is heuristic and uncalibrated. Nothing in the interface guarantees a profit or a fill. Live orders use real funds and must be independently tested with paper data first.
+The raw model is heuristic and uncalibrated by default. Walk-forward calibration diagnostics require settled outcomes and sufficient prior samples; they do not establish profit. Nothing in the interface guarantees a profit or a fill. Live orders use real funds and must be independently tested with paper data first.
 
 ## Clone this repository
 
@@ -82,11 +83,37 @@ Use `systemd`, `launchd`, or a login service to start that script after reboot. 
 
 The separate `pnpm run daemon` process runs the deterministic strategy without a browser tab. It is deliberately paper-only: it refuses `TRADING_MODE=live`, uses public market data, records a persistent simulated account, and checks final outcomes against Gamma before settling expired positions. It does not sign or submit live orders.
 
-The daemon exposes loopback-only `/healthz` and `/status` endpoints on port 8788. It latches a stale-data halt after 90 seconds without a complete fresh market snapshot and clears only that latch after three consecutive fresh cycles with at least four usable markets and markable open positions. Kill, daily-loss, and manual-pause latches remain independent. It has paper exposure and daily-loss limits and validates the paper ledger on every cycle. Daily-loss limits halt new entries but do not force-close open positions. When Gamma omits the opening reference, paper mode can use the matching Coinbase candle open as a labeled estimate; Polymarket’s Chainlink TWAP may differ, and live execution still requires a Polymarket reference. The Linux systemd unit, log rotation, restricted Hermes watchdog permissions, and host commands are in [`deploy/README.md`](deploy/README.md).
+The daemon exposes loopback-only `/livez`, `/healthz`, `/readyz`, and `/status` endpoints on port 8788. `/livez` is process liveness; `/healthz` and `/readyz` report current trading readiness. It latches a stale-data halt after 90 seconds without fresh streaming data and clears only that latch after three distinct healthy oracle/book observations with at least one fresh market and markable open positions. Recovery checks shared stream health; each candidate still needs its own exact Polymarket oracle reference, current price, and executable book, so markets missing any input remain on HOLD. Kill, daily-loss, and manual-pause latches remain independent. It validates the paper ledger on every cycle. Daily-loss limits halt new entries but do not force-close open positions. New paper entries require the market's verified Polymarket 60-second TWAP opening Price to Beat and a fresh current price from the matching oracle feed; a Coinbase spot/open estimate cannot substitute for that market's oracle. A missed opening observation keeps that market on HOLD through its window; the engine waits for an exact tick at the next market start rather than estimating from a nearby price. The Linux systemd unit, log rotation, restricted Hermes watchdog permissions, and host commands are in [`deploy/README.md`](deploy/README.md).
 
-For an interactive terminal monitor, start the daemon in one terminal and run `pnpm run dashboard` in another. The monitor clock, countdowns, and display refresh every second with account cash/equity/P&L, open positions, recent fills and closed trades, current signals, feed freshness, and halt state. The daemon runs a 15-second decision cycle, caches market discovery for up to 60 seconds, updates marks from Coinbase, and subscribes to Polymarket book streams for open positions. Press `q` to exit the monitor without stopping the daemon or `r` to refresh immediately. If it reports that the endpoint is unreachable, start `pnpm run daemon` in a separate terminal. It reads the daemon's loopback-only status endpoint and does not place orders.
+The $20 tier threshold is an eligibility floor, not a promise that the account can place an order. The paper sizing policy selects a tier from current liquidation equity, then applies the stricter of its tier caps and any operator caps. A $1 operator floor or exchange minimum never overrides maximum stake, exposure, reserve, liquidity, or cash limits. If the CLOB minimum share size is missing or the minimum executable cost is too risky for the account, the engine records a PASS. At exactly $20, MICRO's 4% exposure cap is $0.80, below the $1 paper minimum, so that balance cannot enter; higher balances may also PASS when venue share minimums exceed their risk caps. MICRO and SMALL accounts can go long periods without a trade. No strategy or setting guarantees a trade for a small balance.
+
+The browser and headless daemon persist recently observed, verified opening ticks so a refresh or daemon restart can recover that exact market reference. If the process never observed the market's exact opening tick, it keeps the market on hold until a new window; it does not estimate the Price to Beat from a nearby tick.
+
+| Liquidation equity | Profile | Maximum stake | Cash reserve | Maximum exposure | Minimum net edge |
+| --- | --- | ---: | ---: | ---: | ---: |
+| $20–49.99 | MICRO | 5% | 50% | 4% | 8% |
+| $50–99.99 | SMALL | 4% | 40% | 4.5% | 7% |
+| $100–249.99 | GROWTH | 3% | 35% | 5% | 6% |
+| $250–999.99 | STANDARD | 2.5% | 30% | 5% | 5% |
+| $1,000+ | LARGE | 2% | 25% | 5% | 4% |
+
+These percentages are policy ceilings, not target allocations. The sizing code can recommend less or PASS based on fees, slippage, uncertainty, available ask depth, price region, correlated crypto exposure, daily loss, or recovery state.
+
+For an interactive terminal monitor, start the daemon in one terminal and run `pnpm run dashboard` in another. The monitor clock, countdowns, and display refresh every second with account cash/equity/P&L, open positions, recent fills and closed trades, current signals, feed freshness, and halt state. The daemon runs an independent one-second decision loop against its current cached and streaming data; REST market discovery, candles, and books refresh in the background every 15 seconds. Status reports the actual last decision duration and how many cycles exceeded the target. Press `q` to exit the monitor without stopping the daemon or `r` to refresh immediately. If it reports that the endpoint is unreachable, start `pnpm run daemon` in a separate terminal. It reads the daemon's loopback-only status endpoint and does not place orders.
 
 Paper mode requires no API keys or wallet credentials. Keep any future live credentials in host-only secret storage; this daemon has no live executor, and the dashboard's browser-authenticated live routes are not part of this service.
+
+## Multi-bankroll research replay
+
+Replay the **same recorded market-decision CSV** through $20, $25, $50, $75, $100, $250, $500, $1,000, $2,500, $5,000, and $10,000 paper accounts:
+
+```bash
+pnpm exec tsx scripts/backtest-bankrolls.ts recorded-market-history.csv
+```
+
+The CSV needs timestamps, market IDs, duration, an explicit matching `model_version`, recorded model action and P(UP), remaining time, asks, bids, ask depth, and the CLOB minimum share size or cost. Bid depth is needed for usable liquidation marks. Outcomes and resolution times are needed for settled return and calibration metrics. Use `--help` for optional fee/slippage and explicit research assumptions. Missing bid, depth, minimum, probability, model decision, or matching model version causes the row to be excluded or PASS; missing outcomes leave result fields unavailable. The repository does not ship a candidate/order-book history sufficient to establish historical profitability. A paper fill ledger alone cannot reconstruct missed candidates or executable books.
+
+The replay reports bankroll-specific trades, returns when settled, fees, slippage assumptions, exposure, minimum-order rejections, and probability buckets. When ask-level snapshots are present, it walks those levels separately for each bankroll and resizes against the resulting VWAP. Rows without a ladder use a fixed recorded entry price or the top ask plus configured slippage, so their price impact cannot be inferred. Liquidation equity uses each recorded top bid and bid depth with the flat exit-fee approximation; missing executable bid depth is valued at zero. Sparse rows cannot reproduce a full order-book exit or continuous intramarket drawdown. Its walk-forward probability adjustment waits for at least 200 previously resolved markets overall and 30 in the matching confidence bucket. Do not treat this replay as proof of live readiness.
 
 ## Local environment
 

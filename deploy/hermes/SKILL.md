@@ -17,7 +17,7 @@ Use this skill only for operator requests about the deployed Polymarket Quant En
 - The unattended daemon is paper-only. Never enable live execution, edit its environment file, add credentials, submit or cancel exchange orders, or claim a paper result is a live result.
 - Use the fixed operator commands below. Do not run arbitrary shell commands, edit source files, change risk limits, or alter systemd units.
 - A `KILLED`, `STALE_DATA_HALT`, or `RISK_HALT` state requires the user to request `clear-halt` explicitly. Never clear a halt automatically.
-- Restart the daemon only when its process or `/healthz` check is unhealthy. A stale-data or daily-loss halt is a strategy stop; restarting will not fix it.
+- Restart the daemon only when its process or `/livez` liveness check is unhealthy. `/healthz` and `/readyz` report trading readiness and can fail while the daemon is alive but safely holding on stale data, pause, or risk limits. A strategy halt is not a process failure; restarting will not fix it.
 - A pause blocks new paper entries. Existing paper positions may still cash out or settle.
 
 ## Commands
@@ -34,4 +34,4 @@ Run these through the host's restricted `sudoers` rules:
 
 For a status or log-summary request, read status and recent logs, then summarize the last successful data cycle, current halt state, paper cash/equity, open positions, reconciliation status, and any errors. Do not infer account or trading outcomes absent from the output.
 
-For a restart request, first check status and `curl --fail --silent http://127.0.0.1:8788/healthz`. Restart only if systemd is inactive or the health endpoint fails. Report whether health recovered.
+For a restart request, first check status and `curl --fail --silent http://127.0.0.1:8788/livez`. Restart only if systemd is inactive or the liveness endpoint fails. Report whether the process recovered; report trading readiness separately from `/status`.

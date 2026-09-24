@@ -1,19 +1,21 @@
 import { createServer } from "node:http";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { mkdir, open as openFile, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  anchoredFairUp,
+  applyPolymarketPriceTicks,
   buildLiveMarket,
-  chartFairProbability,
   discoverCryptoMarkets,
   fetchCandleHistories,
   fetchOrderBooks,
   fetchResolvedMarketOutcomes,
-  fetchSpotPrices,
   replaceLiveMarketBook,
   updateLiveCandles,
   updateLiveMarketBookLevel,
   type LiveMarket,
+  type PolymarketPriceTick,
 } from "../app/lib/polymarket-data";
 import {
   accountDeployed,
@@ -27,12 +29,21 @@ import {
   createPaperAccount,
   markAccount,
   marketDataFreshnessIssue,
-  paperStakeUsd,
+  marketStreamingDataFreshnessIssue,
+  estimatePaperExitFill,
   settlePaperPositionsByOutcome,
   type PaperAccount,
   type PaperSide,
 } from "../app/lib/engines";
-import { DEFAULT_PAPER_EARLY_EXIT, evaluateModelAwareExit } from "../app/lib/early-exit";
+import { DEFAULT_PAPER_EARLY_EXIT, evaluatePaperHoldExit } from "../app/lib/early-exit";
+import {
+  assessBankrollRisk,
+  bankrollProfile,
+  type BankrollOpportunityScore,
+} from "../app/lib/bankroll-policy";
+import { evaluatePaperMarket, paperLossHistory, type PaperOpportunity } from "../app/lib/paper-bankroll";
+import { subscribePolymarketPrices } from "../app/lib/polymarket-price-stream";
+import { StaleRecoveryTracker } from "../app/lib/stale-recovery";
 
 type ExitObservation = { count: number; lastSeen: number };
 type PersistedState = {
@@ -48,10 +59,12 @@ type PersistedState = {
   usableMarkets: number;
   utcDay: string;
   dayStartEquity: number | null;
+  peakLiquidationEquity: number | null;
   lastEntryByMarket: Record<string, number>;
   tokenIdsByMarket: Record<string, { upTokenId: string; downTokenId: string }>;
   exitObservations: Record<string, ExitObservation>;
   resolutionCheckedAt: Record<string, number>;
+  openingPriceTicks: Record<string, PolymarketPriceTick>;
 };
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -64,21 +77,90 @@ const killFile = path.join(stateDir, "KILL_SWITCH");
 const pauseFile = path.join(stateDir, "PAUSED");
 const staleHaltFile = path.join(stateDir, "STALE_DATA_HALT");
 const riskHaltFile = path.join(stateDir, "RISK_HALT");
+const resetStartingCashFile = path.join(stateDir, "PAPER_RESET_BALANCE");
+const stateOperationLockFile = path.join(stateDir, "STATE_OPERATION.lock");
+const stateOperationRecoveryLockFile = path.join(stateDir, "STATE_OPERATION_RECOVERY.lock");
 const healthPort = 8788;
 const dashboardOrigins = new Set((process.env.PQE_DASHBOARD_ORIGINS ?? "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean));
 const pollIntervalMs = integerSetting("POLL_INTERVAL_MS", 15_000, 5_000, 60_000);
+const decisionIntervalMs = integerSetting("DECISION_INTERVAL_MS", 1_000, 1_000, 5_000);
 const staleAfterMs = integerSetting("DATA_STALE_HALT_MS", 90_000, 30_000, 600_000);
 const staleRecoveryCyclesRequired = integerSetting("DATA_STALE_RECOVERY_CYCLES", 3, 2, 10);
-const staleRecoveryMinimumMarkets = integerSetting("DATA_STALE_RECOVERY_MIN_MARKETS", 4, 1, 100);
-const paperStartingCash = numberSetting("PAPER_STARTING_CASH", 1_000, 1, 1_000_000_000);
+// This only confirms that the shared market stream has recovered. Each
+// candidate still has to pass its own exact-oracle, quote, and book checks.
+const staleRecoveryMinimumMarkets = integerSetting("DATA_STALE_RECOVERY_MIN_MARKETS", 1, 1, 100);
+const configuredPaperStartingCash = numberSetting("PAPER_STARTING_CASH", 100, 1, 1_000_000_000);
+await mkdir(stateDir, { recursive: true, mode: 0o750 });
+async function openStateOperationLock() {
+  try {
+    return await openFile(stateOperationLockFile, "wx", 0o640);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  let recoveryLock;
+  try { recoveryLock = await openFile(stateOperationRecoveryLockFile, "wx", 0o640); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Another daemon startup or paper reset is using this state directory.");
+    throw error;
+  }
+  try {
+    const owner = Number((await readFile(stateOperationLockFile, "utf8")).trim());
+    if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("A daemon startup or paper reset is still initializing its lock.");
+    try {
+      process.kill(owner, 0);
+      throw new Error("Another daemon startup or paper reset is using this state directory.");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+    await rm(stateOperationLockFile, { force: true });
+    const lock = await openFile(stateOperationLockFile, "wx", 0o640).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "EEXIST") throw new Error("Another daemon startup or paper reset is using this state directory.");
+      throw error;
+    });
+    return lock;
+  } finally {
+    await recoveryLock.close();
+    await rm(stateOperationRecoveryLockFile, { force: true });
+  }
+}
+const stateOperationLock = await openStateOperationLock();
+await stateOperationLock.writeFile(`${process.pid}\n`);
+await stateOperationLock.sync();
+let stateOperationLockReleased = false;
+const removeStateOperationLock = () => {
+  if (stateOperationLockReleased) return;
+  stateOperationLockReleased = true;
+  try { rmSync(stateOperationLockFile, { force: true }); } catch {}
+};
+process.once("exit", removeStateOperationLock);
+const releaseStateOperationLock = async () => {
+  if (stateOperationLockReleased) return;
+  process.off("exit", removeStateOperationLock);
+  await stateOperationLock.close();
+  await rm(stateOperationLockFile, { force: true });
+  stateOperationLockReleased = true;
+};
+let requestedPaperStartingCash: number | null = null;
+const paperStartingCash = await (async () => {
+  try {
+    const requested = Number(await readFile(resetStartingCashFile, "utf8"));
+    if (!Number.isFinite(requested) || requested < 1 || requested > 1_000_000_000) {
+      throw new Error("PAPER_RESET_BALANCE contains an invalid starting balance.");
+    }
+    requestedPaperStartingCash = requested;
+    return requested;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return configuredPaperStartingCash;
+    throw error;
+  }
+})();
 const paperMinBetUsd = numberSetting("PAPER_MIN_BET_USD", 1, 1, 100_000);
-const paperMinBetPct = numberSetting("PAPER_MIN_BET_PCT", 0.005, 0.005, 0.03);
-const paperMaxBetPct = numberSetting("PAPER_MAX_BET_PCT", 0.03, paperMinBetPct, 0.03);
-const paperMaxExposurePct = numberSetting("PAPER_MAX_EXPOSURE_PCT", 0.09, 0.01, 0.5);
-const paperMaxOpenPositions = integerSetting("PAPER_MAX_OPEN_POSITIONS", 3, 1, 100);
+const paperMaxBetPct = numberSetting("PAPER_MAX_BET_PCT", 0.05, 0.001, 0.1);
+const paperMaxExposurePct = numberSetting("PAPER_MAX_EXPOSURE_PCT", 0.15, 0.01, 0.5);
+const paperMaxOpenPositions = integerSetting("PAPER_MAX_OPEN_POSITIONS", 5, 1, 100);
 const paperMaxDailyLossPct = numberSetting("PAPER_MAX_DAILY_LOSS_PCT", 0.05, 0.001, 0.5);
 const paperMinNetEdge = numberSetting("PAPER_MIN_NET_EDGE", 0.04, 0, 0.5);
 const costs = {
@@ -86,7 +168,7 @@ const costs = {
   slippageBps: numberSetting("PAPER_SLIPPAGE_BPS", 15, 0, 10_000),
 };
 const RESOLUTION_RECHECK_MS = 60_000;
-const EXIT_CONFIRMATION_WINDOW_MS = 20_000;
+const EXIT_CONFIRMATION_WINDOW_MS = Math.max(20_000, pollIntervalMs * 2 + 5_000);
 
 function numberSetting(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -99,11 +181,6 @@ function integerSetting(name: string, fallback: number, min: number, max: number
   const value = numberSetting(name, fallback, min, max);
   if (!Number.isInteger(value)) throw new Error(`${name} must be a whole number.`);
   return value;
-}
-
-function paperBetSize(bankroll: number, availableCash: number) {
-  const usd = paperStakeUsd(bankroll, availableCash, paperMinBetPct, paperMaxBetPct, paperMinBetUsd);
-  return { usd, fraction: bankroll > 0 ? usd / bankroll : 0 };
 }
 
 function log(level: "INFO" | "WARN" | "ERROR", message: string, details?: Record<string, unknown>) {
@@ -156,12 +233,40 @@ async function readFlag(filename: string): Promise<boolean> {
   }
 }
 
-async function saveState(state: PersistedState): Promise<void> {
-  await mkdir(stateDir, { recursive: true, mode: 0o750 });
+let statePersistenceQueue: Promise<void> = Promise.resolve();
+let statePersistenceSequence = 0;
+
+function saveState(state: PersistedState): Promise<void> {
   state.savedAt = Date.now();
-  const temporary = `${stateFile}.${process.pid}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(state)}\n`, { mode: 0o640 });
-  await rename(temporary, stateFile);
+  const contents = `${JSON.stringify(state)}\n`;
+  const pending = statePersistenceQueue.catch(() => undefined).then(async () => {
+    await mkdir(stateDir, { recursive: true, mode: 0o750 });
+    const temporary = `${stateFile}.${process.pid}.${Date.now()}.${statePersistenceSequence++}.tmp`;
+    const file = await openFile(temporary, "w", 0o640);
+    try {
+      await file.writeFile(contents);
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await rename(temporary, stateFile);
+  });
+  statePersistenceQueue = pending;
+  return pending;
+}
+
+function validOpeningPriceTicks(value: unknown, now = Date.now()): Record<string, PolymarketPriceTick> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const ticks: Record<string, PolymarketPriceTick> = {};
+  for (const raw of Object.values(value as Record<string, unknown>)) {
+    if (!raw || typeof raw !== "object") continue;
+    const tick = raw as Partial<PolymarketPriceTick>;
+    if (typeof tick.asset !== "string" || !tick.asset || (tick.priceFeed !== "TWAP_60" && tick.priceFeed !== "CHAINLINK_SPOT")
+      || !Number.isFinite(tick.timestamp) || tick.timestamp! < now - 24 * 60 * 60_000 || tick.timestamp! > now + 1000
+      || !Number.isFinite(tick.price) || tick.price! <= 0) continue;
+    ticks[`${tick.asset}:${tick.priceFeed}:${tick.timestamp}`] = tick as PolymarketPriceTick;
+  }
+  return ticks;
 }
 
 async function loadState(): Promise<PersistedState> {
@@ -185,10 +290,12 @@ async function loadState(): Promise<PersistedState> {
       usableMarkets: Number.isFinite(raw.usableMarkets) ? raw.usableMarkets! : 0,
       utcDay: typeof raw.utcDay === "string" ? raw.utcDay : new Date().toISOString().slice(0, 10),
       dayStartEquity: Number.isFinite(raw.dayStartEquity) ? raw.dayStartEquity! : null,
+      peakLiquidationEquity: Number.isFinite(raw.peakLiquidationEquity) ? raw.peakLiquidationEquity! : raw.account.startingCash,
       lastEntryByMarket: raw.lastEntryByMarket && typeof raw.lastEntryByMarket === "object" ? raw.lastEntryByMarket : {},
       tokenIdsByMarket: raw.tokenIdsByMarket && typeof raw.tokenIdsByMarket === "object" ? raw.tokenIdsByMarket : {},
       exitObservations: raw.exitObservations && typeof raw.exitObservations === "object" ? raw.exitObservations : {},
       resolutionCheckedAt: raw.resolutionCheckedAt && typeof raw.resolutionCheckedAt === "object" ? raw.resolutionCheckedAt : {},
+      openingPriceTicks: validOpeningPriceTicks(raw.openingPriceTicks),
     };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -206,10 +313,12 @@ async function loadState(): Promise<PersistedState> {
       usableMarkets: 0,
       utcDay: new Date(now).toISOString().slice(0, 10),
       dayStartEquity: paperStartingCash,
+      peakLiquidationEquity: paperStartingCash,
       lastEntryByMarket: {},
       tokenIdsByMarket: {},
       exitObservations: {},
       resolutionCheckedAt: {},
+      openingPriceTicks: {},
     };
     await saveState(state);
     log("INFO", "Created a new paper account", { startingCash: paperStartingCash });
@@ -218,7 +327,20 @@ async function loadState(): Promise<PersistedState> {
 }
 
 const state = await loadState();
+if (requestedPaperStartingCash !== null) {
+  if (Math.abs(state.account.startingCash - requestedPaperStartingCash) > 0.005) {
+    throw new Error("PAPER_RESET_BALANCE does not match the initialized paper ledger; the reset marker has been retained.");
+  }
+  await saveState(state);
+  await rm(resetStartingCashFile, { force: true });
+}
 let lastCycleInMemory: number | null = state.lastCycleAt;
+let lastMarketRefreshAt = 0;
+let marketRefreshInFlight = false;
+let resolutionCheckInFlight = false;
+let lastDecisionDurationMs = 0;
+let lastDecisionIntervalMs: number | null = null;
+let decisionCycleOverruns = 0;
 let stopping = false;
 const shutdownController = new AbortController();
 
@@ -250,15 +372,64 @@ let latestSignals: Array<{
   entryPrice: number | null;
   targetBetUsd: number;
   targetBetPct: number;
+  maximumAllowedStakeUsd: number;
+  minimumExecutableOrderUsd: number | null;
+  expectedNetProfitUsd: number | null;
+  opportunityScore: number;
+  scoreComponents: BankrollOpportunityScore["components"] | null;
+  bankrollTier: string;
+  strategy: string;
+  marketProbability: number | null;
+  /** Market-anchored P(UP) that the edge is priced against. */
+  fairProbability: number | null;
+  /** Unanchored candle-model P(UP). */
+  rawModelProbability: number | null;
+  spread: number | null;
+  availableDepthUsd: number | null;
+  smallAccountProtectionActive: boolean;
+  entryAllowed: boolean;
   reason: string;
   remainingSeconds: number;
 }> = [];
 let latestSignalsAt: number | null = null;
 let latestMarkets = new Map<string, LiveMarket>();
+const PRICE_TICK_BUFFER_MS = 18 * 60_000;
+const polymarketPriceTicks = new Map<string, PolymarketPriceTick>();
+for (const [key, tick] of Object.entries(state.openingPriceTicks)) polymarketPriceTicks.set(key, tick);
+let lastPricePruneAt = 0;
+let lastOfficialPriceAt: number | null = null;
+let priceStreamConnected = false;
+let priceSubscriptionKey = "";
+let stopPriceStream: (() => void) | null = null;
+
+function cachePolymarketPriceTicks(ticks: readonly PolymarketPriceTick[], now = Date.now()): void {
+  const cutoff = now - PRICE_TICK_BUFFER_MS;
+  for (const tick of ticks) {
+    if (tick.timestamp < cutoff || tick.timestamp > now + 1_000) continue;
+    polymarketPriceTicks.set(`${tick.asset}:${tick.priceFeed}:${tick.timestamp}`, tick);
+    if ([...latestMarkets.values()].some((market) => market.startTimeVerified && market.asset === tick.asset && market.priceFeed === tick.priceFeed && market.startTime === tick.timestamp)) {
+      const key = `${tick.asset}:${tick.priceFeed}:${tick.timestamp}`;
+      if (!state.openingPriceTicks[key]) {
+        state.openingPriceTicks[key] = tick;
+        void saveState(state).catch((error) => log("ERROR", "Could not immediately persist an exact Polymarket opening tick", { error: errorMessage(error) }));
+      }
+    }
+    lastOfficialPriceAt = Math.max(lastOfficialPriceAt ?? 0, tick.timestamp);
+  }
+  if (now - lastPricePruneAt >= 30_000) {
+    for (const [key, tick] of polymarketPriceTicks) {
+      if (tick.timestamp < cutoff) polymarketPriceTicks.delete(key);
+    }
+    for (const [key, tick] of Object.entries(state.openingPriceTicks)) {
+      if (tick.timestamp < now - 24 * 60 * 60_000) delete state.openingPriceTicks[key];
+    }
+    lastPricePruneAt = now;
+  }
+}
 let latestEligibleMarketCount = 0;
 let latestMarketDataIssues: Record<string, number> = {};
 let lastDataGapWarningAt = 0;
-let staleRecoveryHealthyCycles = 0;
+const staleRecoveryTracker = new StaleRecoveryTracker();
 let coinbaseSocket: WebSocket | null = null;
 let clobSocket: WebSocket | null = null;
 let coinbaseConnected = false;
@@ -282,13 +453,14 @@ function reconnectDelay(attempt: number): number {
   return Math.min(STREAM_RECONNECT_MAX_MS, STREAM_RECONNECT_BASE_MS * 2 ** Math.min(attempt, 10));
 }
 
-function tradingStateSnapshot(stale: boolean, killed: boolean, paused: boolean, riskHalted: boolean): string {
+function tradingStateSnapshot(stale: boolean, killed: boolean, paused: boolean, riskHalted: boolean, usableMarkets: number, readiness: string): string {
   if (killed) return "KILLED";
   if (riskHalted) return "RISK_HALT";
   if (stale) return "STALE_DATA_HALT";
   if (paused) return "PAUSED";
   if (state.lastError) return "DEGRADED";
-  if (state.usableMarkets === 0) return "WAITING_FOR_DATA";
+  if (usableMarkets === 0) return "WAITING_FOR_DATA";
+  if (readiness !== "READY") return "DEGRADED";
   return "PAPER_RUNNING";
 }
 
@@ -299,14 +471,17 @@ async function statusPayload() {
   const now = Date.now();
   const cycleAgeMs = lastCycleInMemory === null ? null : Math.max(0, now - lastCycleInMemory);
   const dataAgeMs = state.lastHealthyDataAt === null ? null : Math.max(0, now - state.lastHealthyDataAt);
+  const freshUsableMarkets = [...latestMarkets.values()].filter((market) => marketHasFreshInputs(market, now)).length;
   const portfolioMarkable = state.account.positions.every((position) => {
     const positionMarket = latestMarkets.get(position.marketId);
-    return Boolean(positionMarket && marketHasFreshInputs(positionMarket, now));
+    return Boolean(positionMarket && marketHasFreshStreamingData(positionMarket, now));
   });
-  const readiness = cycleAgeMs !== null && cycleAgeMs <= Math.max(60_000, pollIntervalMs * 4)
-    && state.lastError === null && dataAgeMs !== null && dataAgeMs <= staleAfterMs && portfolioMarkable
-    ? "READY"
-    : "DEGRADED";
+  const readiness = freshUsableMarkets === 0 ? "WAITING_FOR_DATA"
+    : !killed && !paused && !stale && !riskHalted
+      && cycleAgeMs !== null && cycleAgeMs <= Math.max(10_000, decisionIntervalMs * 4)
+      && state.lastError === null && dataAgeMs !== null && dataAgeMs <= staleAfterMs && portfolioMarkable
+      ? "READY"
+      : "DEGRADED";
   const expiredOpenPositions = state.account.positions.filter((position) => position.endTime <= now).length;
   const positions = state.account.positions.map((position) => {
     const mark = position.mark ?? position.avgEntry;
@@ -330,25 +505,54 @@ async function statusPayload() {
     };
   });
   const equity = accountEquity(state.account, latestMarkets);
+  const liquidationEquity = accountLiquidationEquity(state.account, latestMarkets, costs);
+  const riskEquity = portfolioMarkable ? liquidationEquity : null;
+  const profile = bankrollProfile(riskEquity ?? equity);
+  const recentRiskHistory = paperLossHistory(state.account, now);
+  const risk = riskEquity !== null && state.dayStartEquity !== null
+    ? assessBankrollRisk({
+      equityUsd: riskEquity,
+      dayStartEquityUsd: state.dayStartEquity,
+      peakEquityUsd: state.peakLiquidationEquity ?? state.account.startingCash,
+      profile,
+      ...recentRiskHistory,
+    })
+    : null;
+  const deployed = accountDeployed(state.account);
+  const exposureByAsset: Record<string, number> = {};
+  const exposureByDuration: Record<string, number> = {};
+  const directionalExposure = { UP: 0, DOWN: 0 };
+  for (const position of state.account.positions) {
+    exposureByAsset[position.asset] = (exposureByAsset[position.asset] ?? 0) + position.totalCost;
+    exposureByDuration[position.duration] = (exposureByDuration[position.duration] ?? 0) + position.totalCost;
+    directionalExposure[position.side] += position.totalCost;
+  }
   return {
     service: "polymarket-quant-engine",
     process: "running",
     readiness,
     mode: "paper",
-    referencePolicy: "Coinbase candle-open estimates are paper-only fallbacks; live execution still requires a Polymarket reference.",
-    tradingState: tradingStateSnapshot(stale, killed, paused, riskHalted),
+    referencePolicy: "Paper entries require a verified Polymarket 60-second TWAP Price to Beat and a fresh matching current price feed.",
+    tradingState: tradingStateSnapshot(stale, killed, paused, riskHalted, freshUsableMarkets, readiness),
     lastCycleAt: state.lastCycleAt,
+    decisionIntervalMs,
+    marketRefreshIntervalMs: pollIntervalMs,
+    lastMarketRefreshAt: lastMarketRefreshAt || null,
+    marketRefreshInFlight,
+    lastDecisionDurationMs,
+    lastDecisionIntervalMs,
+    decisionCycleOverruns,
     lastHealthyDataAt: state.lastHealthyDataAt,
     lastError: state.lastError,
     lastHealthyDataAgeMs: state.lastHealthyDataAt === null ? null : Math.max(0, now - state.lastHealthyDataAt),
     marketsTracked: state.marketsTracked,
-    usableMarkets: state.usableMarkets,
+    usableMarkets: freshUsableMarkets,
     controls: { paused, killed, staleDataHalt: stale, riskHalt: riskHalted },
     paper: {
       startingCash: state.account.startingCash,
       cash: state.account.cash,
       equity,
-      liquidationEquity: accountLiquidationEquity(state.account, latestMarkets, costs),
+      liquidationEquity,
       realizedPnl: state.account.realizedPnl,
       unrealizedPnl: accountUnrealized(state.account, latestMarkets),
       totalPnl: equity - state.account.startingCash,
@@ -357,7 +561,7 @@ async function statusPayload() {
       expiredAwaitingGammaResolution: expiredOpenPositions,
       buyFills: state.account.fills.filter((fill) => fill.action === "BUY").length,
       fees: state.account.fees,
-      deployed: accountDeployed(state.account),
+      deployed,
       totalFills: state.account.fills.length,
       closedTrades: state.account.closedTrades.length,
       positions,
@@ -369,13 +573,52 @@ async function statusPayload() {
     topSignals: latestSignals.slice(0, 8),
     betSizing: {
       minimumBetUsd: paperMinBetUsd,
-      minimumBetPct: paperMinBetPct,
-      maximumBetPct: paperMaxBetPct,
-      maximumExposurePct: paperMaxExposurePct,
+      minimumBetPct: 0,
+      maximumBetPct: Math.min(paperMaxBetPct, profile.maxStakePct),
+      maximumExposurePct: Math.min(paperMaxExposurePct, profile.maxExposurePct),
+    },
+    bankroll: {
+      tier: profile.tier,
+      strategy: profile.strategy,
+      smallAccountProtectionActive: profile.tier === "MICRO" || profile.tier === "SMALL",
+      valuationReady: riskEquity !== null,
+      liquidationEquity: riskEquity,
+      cashUsd: state.account.cash,
+      reserveUsd: riskEquity === null ? null : riskEquity * profile.reservePct,
+      cashAboveReserveUsd: riskEquity === null ? null : Math.max(0, state.account.cash - riskEquity * profile.reservePct),
+      maximumStakeUsd: riskEquity === null ? null : riskEquity * Math.min(profile.maxStakePct, paperMaxBetPct),
+      maximumExposureUsd: riskEquity === null ? null : riskEquity * Math.min(profile.maxExposurePct, paperMaxExposurePct),
+      maximumCorrelatedExposureUsd: riskEquity === null ? null : riskEquity * profile.maxCorrelatedExposurePct,
+      deployedUsd: deployed,
+      correlatedExposureUsd: deployed,
+      remainingExposureUsd: riskEquity === null ? null : Math.max(0, riskEquity * Math.min(profile.maxExposurePct, paperMaxExposurePct) - deployed),
+      remainingCorrelatedExposureUsd: riskEquity === null ? null : Math.max(0, riskEquity * profile.maxCorrelatedExposurePct - deployed),
+      directionalExposureUsd: directionalExposure,
+      exposureByAssetUsd: exposureByAsset,
+      exposureByDurationUsd: exposureByDuration,
+      openPositions: state.account.positions.length,
+      maximumOpenPositions: Math.min(profile.maxOpenPositions, paperMaxOpenPositions),
+      minimumNetEdge: Math.max(profile.minNetEdge, paperMinNetEdge),
+      maximumSpreadPct: profile.maxSpreadPct,
+      minimumExpectedProfitUsd: profile.minExpectedProfitUsd,
+      dailyLossLimitPct: Math.min(profile.maxDailyLossPct, paperMaxDailyLossPct),
+      dayStartLiquidationEquity: state.dayStartEquity,
+      peakLiquidationEquity: state.peakLiquidationEquity,
+      riskApproved: risk?.approved ?? false,
+      riskState: risk?.state ?? "UNAVAILABLE",
+      consecutiveLossesToday: recentRiskHistory.consecutiveLosses,
+      riskReason: risk?.reason ?? "Fresh executable portfolio marks are unavailable.",
+      dailyLossPct: risk?.dayLossPct ?? null,
+      dailyLossRemainingUsd: risk?.dailyLossRemainingUsd ?? null,
+      peakDrawdownPct: risk?.peakDrawdownPct ?? null,
+      drawdownAdjustment: risk?.drawdownAdjustment ?? null,
     },
     streams: {
       coinbaseConnected,
       clobConnected,
+      polymarketPriceConnected: priceStreamConnected,
+      lastOfficialPriceAt,
+      officialPriceAgeMs: lastOfficialPriceAt === null ? null : Math.max(0, now - lastOfficialPriceAt),
       clobRequired: state.account.positions.some((position) => latestMarkets.has(position.marketId)),
       lastUpdateAt: lastStreamUpdateAt,
       lastUpdateAgeMs: lastStreamUpdateAt === null ? null : Math.max(0, now - lastStreamUpdateAt),
@@ -383,11 +626,11 @@ async function statusPayload() {
     },
     dataQuality: {
       eligibleMarkets: latestEligibleMarketCount,
-      usableMarkets: state.usableMarkets,
+      usableMarkets: freshUsableMarkets,
       blockers: latestMarketDataIssues,
     },
     staleRecovery: {
-      healthyCycles: staleRecoveryHealthyCycles,
+      healthyCycles: staleRecoveryTracker.healthyObservations,
       requiredCycles: staleRecoveryCyclesRequired,
       minimumUsableMarkets: staleRecoveryMinimumMarkets,
     },
@@ -424,26 +667,35 @@ const healthServer = createServer(async (request, response) => {
     response.end();
     return;
   }
-  if (request.method !== "GET" || (request.url !== "/healthz" && request.url !== "/status")) {
+  if (request.method !== "GET" || !["/healthz", "/readyz", "/livez", "/status"].includes(request.url ?? "")) {
     response.writeHead(404, { ...corsHeaders, "Content-Type": "application/json" });
     response.end(JSON.stringify({ ok: false, error: "Not found." }));
     return;
   }
+  const now = Date.now();
+  const alive = lastCycleInMemory !== null && now - lastCycleInMemory <= Math.max(10_000, decisionIntervalMs * 4);
+  if (request.url === "/livez") {
+    response.writeHead(alive ? 200 : 503, { ...corsHeaders, "Cache-Control": "no-store", "Content-Type": "application/json" });
+    response.end(JSON.stringify({ ok: alive, process: alive ? "running" : "unhealthy", lastCycleAt: state.lastCycleAt }));
+    return;
+  }
   const payload = await statusPayload();
-  const healthy = lastCycleInMemory !== null && Date.now() - lastCycleInMemory <= Math.max(60_000, pollIntervalMs * 4);
-  response.writeHead(request.url === "/healthz" && !healthy ? 503 : 200, {
+  const ready = payload.readiness === "READY";
+  const isReadinessCheck = request.url === "/healthz" || request.url === "/readyz";
+  response.writeHead(isReadinessCheck && !ready ? 503 : 200, {
     ...corsHeaders,
     "Cache-Control": "no-store",
     "Content-Type": "application/json",
   });
-  response.end(JSON.stringify(request.url === "/healthz" ? { ok: healthy, ...payload } : payload));
+  response.end(JSON.stringify(isReadinessCheck ? { ok: ready, liveness: alive, ...payload } : payload));
 });
 
 await new Promise<void>((resolve, reject) => {
   healthServer.once("error", reject);
   healthServer.listen(healthPort, "127.0.0.1", () => resolve());
 });
-log("INFO", "Headless paper daemon started", { mode: "paper", health: `http://127.0.0.1:${healthPort}/healthz`, pollIntervalMs });
+await releaseStateOperationLock();
+log("INFO", "Headless paper daemon started", { mode: "paper", readiness: `http://127.0.0.1:${healthPort}/healthz`, liveness: `http://127.0.0.1:${healthPort}/livez`, decisionIntervalMs, marketRefreshIntervalMs: pollIntervalMs });
 const markTimer = setInterval(() => {
   if (latestMarkets.size) state.account = markAccount(state.account, latestMarkets, Date.now());
 }, 1000);
@@ -454,13 +706,44 @@ async function collectMarkets(): Promise<LiveMarket[]> {
   const definitions = await discoverCryptoMarkets(signal);
   const tokenIds = definitions.flatMap((market) => [market.upTokenId, market.downTokenId]);
   const assets = [...new Set(definitions.map((market) => market.asset))];
-  const [books, spots, candles] = await Promise.all([
+  const [books, candles] = await Promise.all([
     fetchOrderBooks(tokenIds, signal),
-    fetchSpotPrices(assets, signal),
     fetchCandleHistories(assets, signal),
   ]);
   const now = Date.now();
-  return definitions.map((definition) => buildLiveMarket(definition, books, spots, null, now, candles.get(definition.asset) ?? null));
+  const priceTicks = [...polymarketPriceTicks.values()];
+  return definitions.map((definition) => applyPolymarketPriceTicks(
+    buildLiveMarket(definition, books, new Map(), null, now, candles.get(definition.asset) ?? null), priceTicks, now));
+}
+
+async function refreshMarketSnapshot(): Promise<void> {
+  if (marketRefreshInFlight || stopping || shutdownController.signal.aborted) return;
+  marketRefreshInFlight = true;
+  try {
+    const refreshed = await collectMarkets();
+    if (stopping || shutdownController.signal.aborted) return;
+    latestMarkets = new Map(refreshed.map((market) => [market.id, market]));
+    pruneTrackingMaps(refreshed);
+    ensureMarketStreams(refreshed);
+    lastMarketRefreshAt = Date.now();
+    state.lastError = null;
+    log("INFO", "Market discovery and REST book refresh completed", { markets: refreshed.length });
+  } catch (error) {
+    state.lastError = errorMessage(error);
+    staleRecoveryTracker.reset();
+    log("WARN", "Market-data refresh failed; cached data remains subject to age checks", { error: state.lastError });
+  } finally {
+    marketRefreshInFlight = false;
+  }
+}
+
+function scheduleExpiredPositionResolution(now: number): void {
+  if (resolutionCheckInFlight || !state.account.positions.some((position) => position.endTime <= now
+    && now - (state.resolutionCheckedAt[position.marketId] ?? 0) >= RESOLUTION_RECHECK_MS)) return;
+  resolutionCheckInFlight = true;
+  void resolveExpiredPositions(now)
+    .catch((error) => log("WARN", "Background paper-position resolution failed", { error: errorMessage(error) }))
+    .finally(() => { resolutionCheckInFlight = false; });
 }
 
 function parseBookLevels(value: unknown): Array<{ price: number; size: number }> {
@@ -539,35 +822,10 @@ function connectCoinbase(key: string): void {
       for (const [id, market] of latestMarkets) {
         if (market.asset !== asset) continue;
         const candleUpdate = updateLiveCandles(market, spot, now);
-        const openingCandle = market.startTime === null ? null : candleUpdate.chart5m
-          .find((candle) => Math.abs(candle.timestamp - market.startTime!) <= 60_000) ?? null;
-        const reference = market.reference ?? openingCandle?.open ?? null;
-        const referenceSource = market.reference !== null ? market.referenceSource : openingCandle ? "COINBASE ESTIMATE" : "MISSING";
-        const remaining = Math.max(0, (market.countdownEndsAt - now) / 1000);
-        const spotHistory = market.spotHistory ?? [];
-        const lastPoint = spotHistory[spotHistory.length - 1];
-        const nextHistory = !lastPoint || now - lastPoint.timestamp >= 1000
-          ? [...spotHistory, { timestamp: now, price: spot }].filter((point) => now - point.timestamp <= 120_000).slice(-180)
-          : spotHistory;
-        const fairUp = chartFairProbability(reference, spot, remaining, market.duration,
-          market.duration === "5m" ? candleUpdate.chart5m : candleUpdate.chart15m, now);
-        const distance = reference !== null ? (spot - reference) / reference : null;
-        latestMarkets.set(id, {
-          ...market,
-          ...candleUpdate,
-          spotHistory: nextHistory,
-          reference,
-          referenceSource,
-          remaining,
-          spot,
-          fairUp,
-          distance,
-          momentum: market.spot ? Math.log(spot / market.spot) : market.momentum,
-          edgeUp: fairUp !== null && market.upAsk !== null ? fairUp - market.upAsk : null,
-          edgeDown: fairUp !== null && market.downAsk !== null ? 1 - fairUp - market.downAsk : null,
-          regime: reference === null ? "REFERENCE MISSING" : distance === null ? "SPOT MISSING" : Math.abs(distance) < 0.0002 ? "NEUTRAL" : distance > 0 ? "UP MOMENTUM" : "DOWN MOMENTUM",
-          sourceTimestamp: now,
-        });
+        // Coinbase updates secondary candle context only. It must never
+        // overwrite the displayed Polymarket TWAP spot, Price to Beat, or
+        // probability inputs used for an entry or an exit.
+        latestMarkets.set(id, { ...market, ...candleUpdate });
         updated = true;
       }
       if (updated) lastStreamUpdateAt = now;
@@ -697,6 +955,27 @@ function connectClob(key: string): void {
 }
 
 function ensureMarketStreams(markets: LiveMarket[]): void {
+  const priceKey = [...new Set(markets.map((market) => market.asset))].sort().join(",");
+  if (priceKey !== priceSubscriptionKey) {
+    stopPriceStream?.();
+    stopPriceStream = null;
+    priceStreamConnected = false;
+    priceSubscriptionKey = priceKey;
+    if (priceKey) {
+      stopPriceStream = subscribePolymarketPrices(priceKey.split(","), (ticks) => {
+        const now = Date.now();
+        cachePolymarketPriceTicks(ticks, now);
+        for (const [id, market] of latestMarkets) {
+          const updated = applyPolymarketPriceTicks(market, ticks, now);
+          if (updated !== market) latestMarkets.set(id, updated);
+        }
+        lastStreamUpdateAt = now;
+      }, (status) => {
+        priceStreamConnected = status === "CONNECTED";
+        if (status !== "CONNECTING") log(status === "CONNECTED" ? "INFO" : "WARN", `Polymarket oracle-aligned price stream ${status.toLowerCase()}`);
+      }, shutdownController.signal);
+    }
+  }
   const coinbaseKey = [...new Set(markets.map((market) => `${market.asset}-USD`))].sort().join(",");
   if (coinbaseKey !== coinbaseSubscriptionKey) {
     coinbaseSubscriptionKey = coinbaseKey;
@@ -734,6 +1013,9 @@ function ensureMarketStreams(markets: LiveMarket[]): void {
 }
 
 function closeMarketStreams(): void {
+  stopPriceStream?.();
+  stopPriceStream = null;
+  priceStreamConnected = false;
   const coinbase = coinbaseSocket as WebSocket | null;
   const clob = clobSocket as WebSocket | null;
   coinbaseSocket = null;
@@ -744,8 +1026,13 @@ function closeMarketStreams(): void {
 
 function marketHasFreshInputs(market: LiveMarket, now: number): boolean {
   return market.startTime !== null && market.startTime <= now && market.remaining >= 30 &&
-    market.upAsk !== null && market.upBid !== null && market.downAsk !== null && market.downBid !== null &&
-    marketDataFreshnessIssue(market, now, { allowCoinbaseReferenceEstimate: true }) === null;
+    marketHasFreshStreamingData(market, now) && market.referenceVerified && market.referenceSource === "POLYMARKET" &&
+    marketDataFreshnessIssue(market, now) === null;
+}
+
+function marketHasFreshStreamingData(market: LiveMarket, now: number): boolean {
+  return market.upAsk !== null && market.upBid !== null && market.downAsk !== null && market.downBid !== null &&
+    marketStreamingDataFreshnessIssue(market, now) === null;
 }
 
 async function resolveExpiredPositions(now: number): Promise<void> {
@@ -796,27 +1083,46 @@ function errorMessage(error: unknown): string {
 }
 
 function applyEarlyExits(markets: Map<string, LiveMarket>, now: number): void {
-  const exitIds = new Set<string>();
+  const fullyMarkable = state.account.positions.every((position) => {
+    const market = markets.get(position.marketId);
+    return Boolean(market && marketHasFreshInputs(market, now));
+  });
+  const profileEquity = fullyMarkable
+    ? accountLiquidationEquity(state.account, markets, costs)
+    : state.account.cash + accountDeployed(state.account);
+  const profile = bankrollProfile(profileEquity);
+  const policy = {
+    ...DEFAULT_PAPER_EARLY_EXIT,
+    earlyExitMinProfitUsd: Math.min(DEFAULT_PAPER_EARLY_EXIT.earlyExitMinProfitUsd, Math.max(0.02, profile.minExpectedProfitUsd)),
+    earlyExitMinProfitPct: Math.min(DEFAULT_PAPER_EARLY_EXIT.earlyExitMinProfitPct, Math.max(0.025, profile.minExpectedProfitOnStakePct / 2)),
+  };
+  const confirmedExits: Array<{ id: string; reason: string; advantageUsd: number; proceedsUsd: number }> = [];
   for (const position of state.account.positions) {
     const market = markets.get(position.marketId);
-    if (!market || market.fairUp === null) {
+    const fairUp = market ? anchoredFairUp(market) : null;
+    if (!market || fairUp === null || !marketHasFreshInputs(market, now)) {
       delete state.exitObservations[position.id];
       continue;
     }
-    const currentPrice = position.side === "UP" ? market.upBid : market.downBid;
-    const fairProbability = position.side === "UP" ? market.fairUp : 1 - market.fairUp;
-    if (currentPrice === null) {
+    const exitFill = estimatePaperExitFill(market, position.side, position.shares, costs);
+    const fairProbability = position.side === "UP" ? fairUp : 1 - fairUp;
+    if (!exitFill || exitFill.shares + 0.00000001 < position.shares) {
       delete state.exitObservations[position.id];
       continue;
     }
-    const evaluation = evaluateModelAwareExit({
-      policy: DEFAULT_PAPER_EARLY_EXIT,
-      entryPrice: position.avgEntry,
-      currentPrice,
-      fairProbability,
-      shares: position.shares,
-      feeRate: costs.feeRate,
+    const modelRead = analyzeMarketSignal(market, costs, Math.max(paperMinBetUsd, position.totalCost), 0.04);
+    const opposite = position.side === "UP" ? "DOWN" : "UP";
+    const directionalReversal = modelRead.bias === opposite && (modelRead.biasConfidence ?? 0) >= 0.6 && fairProbability < 0.45;
+    const evaluation = evaluatePaperHoldExit({
+      policy,
+      entryCostUsd: position.totalCost,
+      originalShares: position.shares,
+      filledShares: exitFill.shares,
+      netExitProceedsUsd: exitFill.totalCost,
+      sideFairProbability: fairProbability,
       remainingSeconds: market.remaining,
+      directionalReversal,
+      reversalMarginPct: profile.tier === "MICRO" ? 0.005 : 0.01,
     });
     if (!evaluation.shouldExit) {
       delete state.exitObservations[position.id];
@@ -825,14 +1131,26 @@ function applyEarlyExits(markets: Map<string, LiveMarket>, now: number): void {
     const previous = state.exitObservations[position.id];
     const count = previous && now - previous.lastSeen <= EXIT_CONFIRMATION_WINDOW_MS ? previous.count + 1 : 1;
     state.exitObservations[position.id] = { count, lastSeen: now };
-    if (count >= DEFAULT_PAPER_EARLY_EXIT.earlyExitConfirmations) exitIds.add(position.id);
+    if (count >= policy.earlyExitConfirmations) confirmedExits.push({
+      id: position.id,
+      reason: evaluation.reason,
+      advantageUsd: evaluation.exitAdvantageUsd,
+      proceedsUsd: evaluation.netExitProceedsUsd,
+    });
   }
-  if (!exitIds.size) return;
-  const closed = closePaperPositions(state.account, markets, costs, "model-aware paper cashout", now, exitIds);
-  if (closed.closed) {
-    state.account = closed.account;
-    for (const id of exitIds) delete state.exitObservations[id];
-    log("INFO", "Model-aware paper cashout", { closed: closed.closed, realized: closed.realized });
+  for (const exit of confirmedExits) {
+    const closed = closePaperPositions(state.account, markets, costs, `bankroll-aware paper cashout; ${exit.reason}`, now, new Set([exit.id]));
+    if (closed.closed) {
+      state.account = closed.account;
+      delete state.exitObservations[exit.id];
+      log("INFO", "Bankroll-aware paper cashout", {
+        reason: exit.reason,
+        realized: closed.realized,
+        exitAdvantageUsd: exit.advantageUsd,
+        netExitProceedsUsd: exit.proceedsUsd,
+        tier: profile.tier,
+      });
+    }
   }
 }
 
@@ -852,43 +1170,46 @@ async function latchStaleDataIfNeeded(now: number): Promise<void> {
   }
 }
 
-async function recoverStaleDataHaltAfterFreshCycles(usableMarkets: number, portfolioMarkable: boolean): Promise<void> {
-  if (!await readFlag(staleHaltFile)) {
-    staleRecoveryHealthyCycles = 0;
-    return;
-  }
-  if (usableMarkets < staleRecoveryMinimumMarkets || !portfolioMarkable || state.lastError !== null) {
-    staleRecoveryHealthyCycles = 0;
-    return;
-  }
-  staleRecoveryHealthyCycles += 1;
-  if (staleRecoveryHealthyCycles < staleRecoveryCyclesRequired) return;
+async function recoverStaleDataHaltAfterFreshCycles(freshMarkets: number, portfolioMarkable: boolean, observationSignature: string): Promise<void> {
+  const haltLatched = await readFlag(staleHaltFile);
+  const healthyObservations = staleRecoveryTracker.observe({
+    haltLatched,
+    freshMarketCount: freshMarkets,
+    minimumFreshMarkets: staleRecoveryMinimumMarkets,
+    portfolioMarkable,
+    hasError: state.lastError !== null,
+    signature: observationSignature,
+  });
+  if (!haltLatched || healthyObservations < staleRecoveryCyclesRequired) return;
 
   await rm(staleHaltFile, { force: true });
   log("WARN", "Stale-data halt recovered after consecutive fresh market snapshots; other safety latches remain active.", {
-    healthyCycles: staleRecoveryHealthyCycles,
-    usableMarkets,
-    minimumUsableMarkets: staleRecoveryMinimumMarkets,
+    healthyCycles: healthyObservations,
+    freshMarkets,
+    minimumFreshMarkets: staleRecoveryMinimumMarkets,
   });
-  staleRecoveryHealthyCycles = 0;
+  staleRecoveryTracker.reset();
 }
 
 async function runCycle(): Promise<void> {
-  const now = Date.now();
+  const cycleStartedAt = Date.now();
   try {
     // Check before attempting recovery so a successful fetch cannot erase evidence
     // that the last complete snapshot was already stale.
-    await latchStaleDataIfNeeded(now);
-    const allMarkets = await collectMarkets();
+    await latchStaleDataIfNeeded(cycleStartedAt);
+    const allMarkets = [...latestMarkets.values()];
     if (stopping || shutdownController.signal.aborted) return;
-    await latchStaleDataIfNeeded(Date.now());
+    const now = Date.now();
+    await latchStaleDataIfNeeded(now);
     const markets = allMarkets.filter((market) => market.endTime > now);
     pruneTrackingMaps(markets);
+    const freshDataMarkets = markets.filter((market) => marketHasFreshStreamingData(market, now));
     const usableMarkets = markets.filter((market) => marketHasFreshInputs(market, now));
     const eligibleMarkets = markets.filter((market) => market.startTime !== null && market.startTime <= now && market.remaining >= 30);
     const blockerCounts: Record<string, number> = {};
     for (const market of eligibleMarkets) {
-      const issue = marketDataFreshnessIssue(market, now, { allowCoinbaseReferenceEstimate: true });
+      const issue = marketDataFreshnessIssue(market, now) ??
+        (marketHasFreshInputs(market, now) ? null : "Verified Polymarket TWAP Price to Beat, current price, or executable book is unavailable.");
       if (issue) blockerCounts[issue] = (blockerCounts[issue] ?? 0) + 1;
     }
     latestEligibleMarketCount = eligibleMarkets.length;
@@ -901,39 +1222,16 @@ async function runCycle(): Promise<void> {
       });
     }
     const marketMap = new Map(markets.map((market) => [market.id, market]));
-    latestMarkets = marketMap;
     ensureMarketStreams(markets);
-    const sizingEquity = accountEquity(state.account, marketMap);
-    latestSignals = usableMarkets
-      .map((market) => {
-        const preliminary = analyzeMarketSignal(market, costs, paperMinBetUsd, paperMinNetEdge, { allowCoinbaseReferenceEstimate: true });
-        const stake = paperBetSize(sizingEquity, state.account.cash);
-        const signal = stake.usd >= paperMinBetUsd
-          ? analyzeMarketSignal(market, costs, stake.usd, paperMinNetEdge, { allowCoinbaseReferenceEstimate: true })
-          : preliminary;
-        return {
-          marketId: market.id,
-          marketLabel: `${market.asset} ${market.duration}`,
-          asset: market.asset,
-          duration: market.duration,
-          action: signal.action,
-          edge: signal.edge,
-          confidence: signal.confidence,
-          entryPrice: signal.entryPrice,
-          targetBetUsd: stake.usd,
-          targetBetPct: sizingEquity > 0 ? stake.usd / sizingEquity : 0,
-          reason: signal.reason,
-          remainingSeconds: market.remaining,
-        };
-      })
-      .sort((left, right) => (right.edge ?? -1) - (left.edge ?? -1))
-      .slice(0, 20);
+    latestSignals = [];
     latestSignalsAt = now;
     state.marketsTracked = markets.length;
     state.usableMarkets = usableMarkets.length;
-    state.lastError = null;
-
-    if (usableMarkets.length) state.lastHealthyDataAt = now;
+    if (freshDataMarkets.length) {
+      const observedAt = Math.max(...freshDataMarkets.flatMap((market) => [market.spotUpdatedAt, market.upBook?.timestamp ?? null,
+        market.downBook?.timestamp ?? null, market.chartUpdatedAt].filter((value): value is number => value !== null && value <= now + 1000)));
+      if (Number.isFinite(observedAt)) state.lastHealthyDataAt = Math.max(state.lastHealthyDataAt ?? 0, Math.min(now, observedAt));
+    }
     for (const position of state.account.positions) {
       const activeMarket = marketMap.get(position.marketId);
       if (activeMarket) {
@@ -943,24 +1241,26 @@ async function runCycle(): Promise<void> {
         };
       }
     }
-    await resolveExpiredPositions(now);
+    scheduleExpiredPositionResolution(now);
     if (stopping || shutdownController.signal.aborted) return;
 
     const recoveryPortfolioMarkable = state.account.positions.every((position) => {
       const positionMarket = marketMap.get(position.marketId);
-      return Boolean(positionMarket && marketHasFreshInputs(positionMarket, now));
+      return Boolean(positionMarket && marketHasFreshStreamingData(positionMarket, now));
     });
-    await recoverStaleDataHaltAfterFreshCycles(usableMarkets.length, recoveryPortfolioMarkable);
+    const recoveryObservationSignature = freshDataMarkets.slice(0, Math.max(1, staleRecoveryMinimumMarkets))
+      .map((market) => [market.id, market.spotUpdatedAt, market.upBook?.timestamp, market.downBook?.timestamp, market.chartUpdatedAt].join(":"))
+      .join("|");
+    await recoverStaleDataHaltAfterFreshCycles(freshDataMarkets.length, recoveryPortfolioMarkable, recoveryObservationSignature);
 
-    if (usableMarkets.length) {
+    if (usableMarkets.length || (state.account.positions.length > 0 && recoveryPortfolioMarkable)) {
       state.account = markAccount(state.account, marketMap, now);
       applyEarlyExits(marketMap, now);
       state.account = markAccount(state.account, marketMap, now);
 
-      const currentEquity = accountEquity(state.account, marketMap);
       const portfolioMarkable = state.account.positions.every((position) => {
         const positionMarket = marketMap.get(position.marketId);
-        return Boolean(positionMarket && marketHasFreshInputs(positionMarket, now));
+        return Boolean(positionMarket && marketHasFreshStreamingData(positionMarket, now));
       });
       const currentLiquidationEquity = portfolioMarkable ? accountLiquidationEquity(state.account, marketMap, costs) : null;
       const utcDay = new Date(now).toISOString().slice(0, 10);
@@ -976,41 +1276,92 @@ async function runCycle(): Promise<void> {
         await rm(path.join(stateDir, "RESET_RISK_DAY"), { force: true });
         log("WARN", "Operator reset the daily paper-loss baseline", { liquidationEquity: currentLiquidationEquity });
       }
-      if (!await readFlag(riskHaltFile) && state.dayStartEquity !== null &&
-          currentLiquidationEquity !== null && currentLiquidationEquity <= state.dayStartEquity * (1 - paperMaxDailyLossPct)) {
-        await latchFile(riskHaltFile, `Paper daily loss limit reached (${paperMaxDailyLossPct * 100}%).`);
+      if (currentLiquidationEquity !== null) {
+        state.peakLiquidationEquity = Math.max(state.peakLiquidationEquity ?? state.account.startingCash, currentLiquidationEquity);
+        const profile = bankrollProfile(currentLiquidationEquity);
+        const dailyLossLimitPct = Math.min(profile.maxDailyLossPct, paperMaxDailyLossPct);
+        if (!await readFlag(riskHaltFile) && state.dayStartEquity !== null &&
+            currentLiquidationEquity <= state.dayStartEquity * (1 - dailyLossLimitPct)) {
+          await latchFile(riskHaltFile, `Paper daily liquidation loss limit reached (${(dailyLossLimitPct * 100).toFixed(1)}% ${profile.tier} cap).`);
+        }
+        if (!await readFlag(riskHaltFile) && state.peakLiquidationEquity > 0 &&
+            currentLiquidationEquity <= state.peakLiquidationEquity * (1 - profile.maxPeakDrawdownPct)) {
+          await latchFile(riskHaltFile, `Paper peak-to-current liquidation drawdown limit reached (${(profile.maxPeakDrawdownPct * 100).toFixed(1)}% ${profile.tier} cap).`);
+        }
       }
 
       const [killed, paused, stale, riskHalted] = await Promise.all([
         readFlag(killFile), readFlag(pauseFile), readFlag(staleHaltFile), readFlag(riskHaltFile),
       ]);
       if (stopping || shutdownController.signal.aborted) return;
-      const maximumExposureUsd = Math.max(paperMinBetUsd, currentEquity * paperMaxExposurePct);
-      const canEnter = !stopping && !shutdownController.signal.aborted && !killed && !paused && !stale && !riskHalted && portfolioMarkable;
+      const opportunities: Array<{ market: LiveMarket; opportunity: PaperOpportunity }> = currentLiquidationEquity === null ? [] : usableMarkets
+        .map((market) => ({
+          market,
+          opportunity: evaluatePaperMarket({
+            market,
+            markets: marketMap,
+            account: state.account,
+            costs,
+            liquidationEquityUsd: currentLiquidationEquity,
+            dayStartLiquidationEquityUsd: state.dayStartEquity ?? undefined,
+            peakLiquidationEquityUsd: state.peakLiquidationEquity ?? undefined,
+            minOrderUsd: paperMinBetUsd,
+            maxTradeUsd: currentLiquidationEquity * paperMaxBetPct,
+            maxExposurePct: paperMaxExposurePct,
+            maxOpenPositions: paperMaxOpenPositions,
+            minNetEdge: paperMinNetEdge,
+          }),
+        }))
+        .sort((left, right) => Number(right.opportunity.approved) - Number(left.opportunity.approved)
+          || (right.opportunity.score?.score ?? 0) - (left.opportunity.score?.score ?? 0)
+          || (right.opportunity.signal.edge ?? -1) - (left.opportunity.signal.edge ?? -1));
+      const controlBlocker = killed ? "kill switch active" : paused ? "paper trading paused" :
+        stale ? "stale-data halt active" : riskHalted ? "risk halt active" : state.lastError ? "market-data refresh or decision error" : null;
+      latestSignals = opportunities.slice(0, 20).map(({ market, opportunity }) => {
+        const { signal, sizing, score, book } = opportunity;
+        const profile = sizing?.profile ?? bankrollProfile(currentLiquidationEquity!);
+        const entryAllowed = opportunity.approved && controlBlocker === null;
+        return {
+          marketId: market.id,
+          marketLabel: `${market.asset} ${market.duration}`,
+          asset: market.asset,
+          duration: market.duration,
+          action: entryAllowed ? signal.action : "PASS" as const,
+          edge: signal.edge,
+          confidence: signal.confidence,
+          entryPrice: signal.entryPrice,
+          targetBetUsd: opportunity.stakeUsd,
+          targetBetPct: currentLiquidationEquity! > 0 ? opportunity.stakeUsd / currentLiquidationEquity! : 0,
+          maximumAllowedStakeUsd: sizing?.maxAllowedStakeUsd ?? 0,
+          minimumExecutableOrderUsd: book && book.minimumExecutableOrderUsd < Number.MAX_SAFE_INTEGER ? book.minimumExecutableOrderUsd : null,
+          expectedNetProfitUsd: sizing?.expectedNetProfitUsd ?? signal.expectedNetProfitUsd,
+          opportunityScore: score?.score ?? 0,
+          scoreComponents: score?.components ?? null,
+          bankrollTier: profile.tier,
+          strategy: profile.strategy,
+          marketProbability: signal.marketProbabilityUp,
+          fairProbability: signal.fairUp,
+          rawModelProbability: signal.rawModelUp,
+          spread: book?.spreadPct ?? null,
+          availableDepthUsd: book?.availableDepthUsd ?? null,
+          smallAccountProtectionActive: profile.tier === "MICRO" || profile.tier === "SMALL",
+          entryAllowed,
+          reason: opportunity.approved && controlBlocker ? `PASS: ${controlBlocker}. ${opportunity.reason}` : opportunity.reason,
+          remainingSeconds: market.remaining,
+        };
+      });
+      const canEnter = !stopping && !shutdownController.signal.aborted && !killed && !paused && !stale && !riskHalted
+        && state.lastError === null && portfolioMarkable;
       if (canEnter && state.account.cash >= paperMinBetUsd && state.account.positions.length < paperMaxOpenPositions) {
-        const candidates = usableMarkets
-          .filter((market) => !state.account.positions.some((position) => position.marketId === market.id))
-          .map((market) => {
-            const preliminary = analyzeMarketSignal(market, costs, paperMinBetUsd, paperMinNetEdge, { allowCoinbaseReferenceEstimate: true });
-            const stake = paperBetSize(currentEquity, state.account.cash);
-            const signal = stake.usd >= paperMinBetUsd
-              ? analyzeMarketSignal(market, costs, stake.usd, paperMinNetEdge, { allowCoinbaseReferenceEstimate: true })
-              : preliminary;
-            return { market, signal, stakeUsd: stake.usd, stakePct: currentEquity > 0 ? stake.usd / currentEquity : 0 };
-          })
-          .filter((item) => item.signal.action !== "PASS" && item.signal.edge !== null && item.signal.edge >= paperMinNetEdge &&
-            item.stakeUsd >= paperMinBetUsd && item.signal.estimatedFill !== null && item.market.liquidity >= item.stakeUsd &&
-            accountDeployed(state.account) + item.stakeUsd <= maximumExposureUsd)
-          .sort((left, right) => (right.signal.edge ?? -1) - (left.signal.edge ?? -1));
-        const candidate = candidates[0];
+        const candidate = opportunities.find(({ opportunity }) => opportunity.approved && opportunity.signal.action !== "PASS");
         if (candidate) {
           const lastEntryAt = state.lastEntryByMarket[candidate.market.id] ?? 0;
-          if (!stopping && !shutdownController.signal.aborted && now - lastEntryAt >= 15_000) {
-            const referenceLabel = candidate.market.referenceSource === "COINBASE ESTIMATE"
-              ? "Coinbase opening-reference estimate (paper only)"
-              : "Polymarket opening reference";
-            const result = buyPaper(state.account, candidate.market, candidate.signal.action as PaperSide, candidate.stakeUsd, costs,
-              `headless paper auto engine; ${referenceLabel}`, now);
+          if (!stopping && !shutdownController.signal.aborted && now - lastEntryAt >= 15_000 &&
+              marketHasFreshInputs(candidate.market, Date.now())) {
+            const referenceLabel = "verified Polymarket 60-second TWAP opening reference";
+            const result = buyPaper(state.account, candidate.market, candidate.opportunity.signal.action as PaperSide,
+              candidate.opportunity.stakeUsd, costs,
+              `headless bankroll-aware paper engine; ${candidate.opportunity.sizing?.tier ?? "UNKNOWN"}; ${referenceLabel}; score ${candidate.opportunity.score?.score ?? 0}`, now);
             if (result.fill) {
               state.account = markAccount(result.account, marketMap, now);
               state.lastEntryByMarket[candidate.market.id] = now;
@@ -1021,11 +1372,21 @@ async function runCycle(): Promise<void> {
               log("INFO", "Paper fill recorded", {
                 asset: candidate.market.asset,
                 duration: candidate.market.duration,
-                side: candidate.signal.action,
+                side: candidate.opportunity.signal.action,
                 notional: result.fill.totalCost,
-                targetBetPct: candidate.stakePct,
-                edge: candidate.signal.edge,
+                targetBetPct: currentLiquidationEquity! > 0 ? result.fill.totalCost / currentLiquidationEquity! : 0,
+                edge: candidate.opportunity.signal.edge,
+                expectedNetProfitUsd: candidate.opportunity.sizing?.expectedNetProfitUsd,
+                opportunityScore: candidate.opportunity.score?.score,
+                tier: candidate.opportunity.sizing?.tier,
+                minimumExecutableOrderUsd: candidate.opportunity.sizing?.minimumExecutableOrderUsd,
                 marketId: candidate.market.id,
+              });
+            } else {
+              log("WARN", "Ranked paper opportunity could not be filled at the approved stake", {
+                marketId: candidate.market.id,
+                stakeUsd: candidate.opportunity.stakeUsd,
+                reason: result.error,
               });
             }
           }
@@ -1037,9 +1398,15 @@ async function runCycle(): Promise<void> {
     assertPaperAccount(state.account);
   } catch (error) {
     state.lastError = errorMessage(error);
+    // Recovery requires uninterrupted complete cycles; a late failure must
+    // invalidate any healthy snapshots accumulated earlier in the streak.
+    staleRecoveryTracker.reset();
     log("WARN", "Paper trading cycle failed; no new entries were considered", { error: state.lastError });
   } finally {
     state.lastCycleAt = Date.now();
+    lastDecisionIntervalMs = lastCycleInMemory === null ? null : state.lastCycleAt - lastCycleInMemory;
+    lastDecisionDurationMs = state.lastCycleAt - cycleStartedAt;
+    if (lastDecisionDurationMs > decisionIntervalMs) decisionCycleOverruns += 1;
     lastCycleInMemory = state.lastCycleAt;
     try {
       await latchStaleDataIfNeeded(state.lastCycleAt);
@@ -1056,13 +1423,17 @@ async function runCycle(): Promise<void> {
 process.once("SIGTERM", () => { stopping = true; shutdownController.abort(); });
 process.once("SIGINT", () => { stopping = true; shutdownController.abort(); });
 
+void refreshMarketSnapshot();
+const marketRefreshTimer = setInterval(() => { void refreshMarketSnapshot(); }, pollIntervalMs);
+
 while (!stopping) {
   const cycleStartedAt = Date.now();
   await runCycle();
   const elapsed = Date.now() - cycleStartedAt;
-  if (!stopping && elapsed < pollIntervalMs) await new Promise((resolve) => setTimeout(resolve, pollIntervalMs - elapsed));
+  if (!stopping && elapsed < decisionIntervalMs) await new Promise((resolve) => setTimeout(resolve, decisionIntervalMs - elapsed));
 }
 
+clearInterval(marketRefreshTimer);
 clearInterval(markTimer);
 if (coinbaseReconnectTimer) clearTimeout(coinbaseReconnectTimer);
 if (clobReconnectTimer) clearTimeout(clobReconnectTimer);

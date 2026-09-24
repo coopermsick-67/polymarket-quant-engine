@@ -80,6 +80,7 @@ let currentPage = 0;
 function render(data, connectionError) {
   const width = Math.max(40, (process.stdout.columns || 100) - 1);
   const paper = data?.paper ?? {};
+  const bankroll = data?.bankroll ?? {};
   const positions = Array.isArray(paper.positions) ? paper.positions : [];
   const fills = Array.isArray(paper.recentFills) ? paper.recentFills : [];
   const closedTrades = Array.isArray(paper.recentClosedTrades) ? paper.recentClosedTrades : [];
@@ -87,14 +88,15 @@ function render(data, connectionError) {
   const controls = data?.controls ?? {};
   const streams = data?.streams ?? {};
   const booksState = !streams.clobRequired ? "idle" : streams.clobConnected ? "LIVE" : "down";
-  const tradingState = data?.tradingState || "CONNECTING";
+  const tradingState = data?.tradingState || data?.readiness || "CONNECTING";
+  const usableMarkets = data?.dataQuality?.usableMarkets ?? data?.usableMarkets ?? 0;
   const stateColor = tradingState === "PAPER_RUNNING" ? "32" : ["WAITING_FOR_DATA", "PAUSED"].includes(tradingState) ? "33" : "31";
   const lines = [
     color("1;36", "POLYMARKET QUANT ENGINE  ·  PAPER"),
     `Page ${currentPage + 1}/2  |  n/p page  r refresh  q quit  |  ${new Date().toLocaleTimeString()}`,
     `SERVICE ${data?.process || "unavailable"}  ${data?.mode || "unknown"}  ${color(stateColor, tradingState)}`,
-    `DATA ${data?.usableMarkets ?? 0}/${data?.marketsTracked ?? 0} usable  fresh ${age(data?.lastHealthyDataAgeMs)}  cycle ${clock(data?.lastCycleAt)}`,
-    `STREAM spot ${streams.coinbaseConnected ? "LIVE" : "down"}  books ${booksState}  quote ${age(streams.clobUpdateAgeMs)}`,
+    `DATA ${usableMarkets}/${data?.marketsTracked ?? 0} usable  readiness ${data?.readiness || "?"}  fresh ${age(data?.lastHealthyDataAgeMs)}  cycle ${clock(data?.lastCycleAt)}`,
+    `STREAM oracle ${streams.polymarketPriceConnected ? "LIVE" : "down"} ${age(streams.officialPriceAgeMs)}  research ${streams.coinbaseConnected ? "LIVE" : "down"}  books ${booksState} ${age(streams.clobUpdateAgeMs)}`,
     `HALTS pause ${controls.paused ? "ON" : "off"}  kill ${controls.killed ? "ON" : "off"}  stale ${controls.staleDataHalt ? "ON" : "off"}  risk ${controls.riskHalt ? "ON" : "off"}  recon ${data?.reconciliation || "?"}`,
   ];
 
@@ -106,6 +108,10 @@ function render(data, connectionError) {
     lines.push(`Cash ${money(paper.cash)}  |  Equity ${money(paper.equity)}`);
     lines.push(`P&L realized ${signedMoney(paper.realizedPnl)}  |  open ${signedMoney(paper.unrealizedPnl)}  |  total ${signedMoney(paper.totalPnl)}`);
     lines.push(`Start ${money(paper.startingCash)}  |  deployed ${money(paper.deployed)}  |  fees ${money(paper.fees)}  |  win ${pct(paper.winRate)}`);
+    lines.push(`PROFILE ${bankroll.tier || "—"}  ${bankroll.riskState || "—"}  ${bankroll.smallAccountProtectionActive ? "small-account protection ON" : ""}`);
+    lines.push(`Liquidation ${money(bankroll.liquidationEquity)}  reserve ${money(bankroll.reserveUsd)}  max trade ${money(bankroll.maximumStakeUsd)}`);
+    lines.push(`Exposure ${money(bankroll.deployedUsd)} / ${money(bankroll.maximumExposureUsd)}  correlated ${money(bankroll.correlatedExposureUsd)} / ${money(bankroll.maximumCorrelatedExposureUsd)}`);
+    lines.push(`Loss room ${money(bankroll.dailyLossRemainingUsd)}  streak ${bankroll.consecutiveLossesToday ?? "—"}  ${bankroll.riskReason || ""}`);
     lines.push(`Equity ${equitySparkline(paper.equityHistory)}`);
     lines.push("", color("1", `OPEN POSITIONS (${positions.length})`));
     if (positions.length === 0) lines.push(color("90", "  none"));
@@ -124,12 +130,14 @@ function render(data, connectionError) {
   } else {
     lines.push("", color("1", `CURRENT SIGNALS (${signals.length})`));
     const sizing = data?.betSizing;
-    if (sizing) lines.push(`Bet size ${(sizing.minimumBetPct * 100).toFixed(1)}-${(sizing.maximumBetPct * 100).toFixed(1)}%  min ${money(sizing.minimumBetUsd)}  exposure cap ${(sizing.maximumExposurePct * 100).toFixed(0)}%`);
+    if (sizing) lines.push(`PROFILE ${bankroll.tier || "—"}  max trade ${pct(sizing.maximumBetPct)}  min ${money(sizing.minimumBetUsd)}  exposure cap ${pct(sizing.maximumExposurePct)}`);
     if (signals.length === 0) lines.push(color("90", "  waiting for complete fresh data"));
     for (const signal of signals.slice(0, 8)) {
       const edge = Number.isFinite(signal.edge) ? `${(signal.edge * 100).toFixed(1)}%` : "—";
       const confidence = Number.isFinite(signal.confidence) ? pct(signal.confidence) : "—";
-      lines.push(`  ${stateLabel(signal.action)}  ${signal.marketLabel}  edge ${edge}  conf ${confidence}  bet ${money(signal.targetBetUsd)} (${pct(signal.targetBetPct)})  ${liveSignalCountdown(signal.remainingSeconds, data?.signalsUpdatedAt)}`);
+      lines.push(`  ${stateLabel(signal.action)}  ${signal.marketLabel}  edge ${edge}  score ${Number(signal.opportunityScore || 0).toFixed(1)}  bet ${money(signal.targetBetUsd)}  EV ${money(signal.expectedNetProfitUsd)}  ${liveSignalCountdown(signal.remainingSeconds, data?.signalsUpdatedAt)}`);
+      lines.push(`    ${signal.entryAllowed ? "ENTRY" : "PASS"}  P(up) ${pct(signal.fairProbability)} (raw model ${pct(signal.rawModelProbability)})  market ${pct(signal.marketProbability)}  spread ${pct(signal.spread)}  depth ${money(signal.availableDepthUsd)}  ${confidence} direction`);
+      if (signal.reason) lines.push(`    ${signal.reason}`);
     }
     lines.push("", color("1", `RECENT FILLS (${paper.totalFills ?? fills.length})`));
     if (fills.length === 0) lines.push(color("90", "  none"));

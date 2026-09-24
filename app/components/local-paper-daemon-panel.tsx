@@ -8,6 +8,13 @@ type PaperDaemonStatus = {
   readiness?: string;
   tradingState?: string;
   lastCycleAt?: number | null;
+  decisionIntervalMs?: number | null;
+  marketRefreshIntervalMs?: number | null;
+  lastMarketRefreshAt?: number | null;
+  marketRefreshInFlight?: boolean;
+  lastDecisionDurationMs?: number | null;
+  lastDecisionIntervalMs?: number | null;
+  decisionCycleOverruns?: number;
   lastHealthyDataAgeMs?: number | null;
   lastError?: string | null;
   marketsTracked?: number;
@@ -25,7 +32,7 @@ function money(value: number | undefined): string {
 }
 
 export default function LocalPaperDaemonPanel() {
-  const [connected, setConnected] = useState(false);
+  const [connected, setConnected] = useState(true);
   const [connecting, setConnecting] = useState(false);
   const [status, setStatus] = useState<PaperDaemonStatus | null>(null);
   const [error, setError] = useState("");
@@ -80,11 +87,15 @@ export default function LocalPaperDaemonPanel() {
 
   useEffect(() => {
     if (!connected) return;
+    const initialRefresh = window.setTimeout(() => { void refresh(); }, 0);
     const timer = window.setInterval(() => {
       setClock(Date.now());
       void refresh();
     }, 1000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(initialRefresh);
+      window.clearInterval(timer);
+    };
   }, [connected, refresh]);
 
   const ageMs = lastSuccess === null ? null : Math.max(0, clock - lastSuccess);
@@ -100,7 +111,7 @@ export default function LocalPaperDaemonPanel() {
         <div>
           <div className="eyebrow">LOCAL TERMINAL BRIDGE · READ ONLY</div>
           <h3>Persistent paper trader</h3>
-          <p className="heading-muted">Reads the terminal daemon on this computer and refreshes once per second.</p>
+          <p className="heading-muted">Reads the terminal daemon on this computer. Decision scans target one second; live feed updates arrive between book refreshes.</p>
         </div>
         <span className={`result-badge ${stateClass}`} aria-live="polite">{state}</span>
       </div>
@@ -124,7 +135,8 @@ export default function LocalPaperDaemonPanel() {
           : <button className="button-primary" disabled={connecting} onClick={() => void connect()} type="button">{connecting ? "CONNECTING…" : "CONNECT TO TERMINAL PAPER TRADER"}</button>}
         {lastSuccess !== null ? <span className="heading-muted">Last status: {ageMs === null ? "—" : `${Math.floor(ageMs / 1000)}s ago`}</span> : null}
       </div>
-      <p className="risk-note">The daemon must be running on this same computer. Your browser may ask you to allow local network access. Trading decisions run on the daemon’s configured cycle; this panel refreshes its status every second.</p>
+      <p className="risk-note">The daemon must be running on this same computer. Your browser may ask you to allow local network access. Decision scans run every {Math.max(1, Math.round((status?.decisionIntervalMs ?? 1000) / 1000))}s; market discovery and REST book refresh run every {Math.max(1, Math.round((status?.marketRefreshIntervalMs ?? 15000) / 1000))}s, with live stream updates between refreshes.</p>
+      {status ? <p className="risk-note">Decision cadence: {status.lastDecisionIntervalMs ?? "—"} ms apart · last cycle took {status.lastDecisionDurationMs ?? "—"} ms · cycles over target: {status.decisionCycleOverruns ?? 0} · last complete REST refresh: {status.lastMarketRefreshAt ? new Date(status.lastMarketRefreshAt).toLocaleTimeString() : "waiting"}{status.marketRefreshInFlight ? " · refresh in progress" : ""}</p> : null}
     </section>
   );
 }
