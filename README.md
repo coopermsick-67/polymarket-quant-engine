@@ -110,3 +110,53 @@ Generate each session secret with `node -e "console.log(require('crypto').random
 The official Polymarket APIs separate Gamma market metadata, CLOB books/orders, the Data API for positions/activity, Relayer wallet transactions, and public/authenticated WebSocket channels. Before enabling live trading, independently verify market selection, wallet/account type, L1/L2 signing, balance reconciliation, order/fill reconciliation after restart, stale-data halts, fees, slippage, and exposure limits.
 
 See `SETUP.md`, `ARCHITECTURE.md`, `STRATEGY.md`, `RISK.md`, and `API.md` for project details.
+
+## 24/7 live 5-minute signal scanner
+
+The repository includes a headless scanner for live Polymarket 5-minute crypto Up/Down markets. It uses public live data and produces ranked `UP` / `DOWN` `LOCK` signals, but it does **not** submit real-money orders.
+
+Run it locally:
+
+```bash
+SIGNAL_BANKROLL_USD=10 pnpm run daemon:signals
+```
+
+The scanner listens only on localhost by default:
+
+```bash
+curl http://127.0.0.1:8790/signals
+curl http://127.0.0.1:8790/healthz
+```
+
+Default profile:
+
+- 5-minute markets only
+- BTC, ETH, SOL, XRP
+- exact Polymarket reference required
+- 5m and 15m trend agreement inherited from `analyzeMarketSignal`
+- `LOCK` tier only
+- minimum configured net edge 6%; the engine's `LOCK` rule is stricter than the entry floor
+- maximum spread 6 cents
+- 20 bps slippage assumption
+- signal window from 270 seconds to 45 seconds remaining
+- adaptive suggested stake for small balances, capped at 30% and $3 by default
+- no wallet private key is required for the scanner
+
+Useful environment variables:
+
+```bash
+SIGNAL_BANKROLL_USD=10
+SIGNAL_ALLOWED_ASSETS=BTC,ETH,SOL,XRP
+SIGNAL_POLL_MS=5000
+SIGNAL_PORT=8790
+SIGNAL_MAX_TRADE_USD=3
+SIGNAL_MAX_POSITION_PCT=0.30
+SIGNAL_MIN_NET_EDGE=0.06
+SIGNAL_SLIPPAGE_BPS=20
+SIGNAL_MAX_SPREAD=0.06
+SIGNAL_MIN_REMAINING_SECONDS=45
+SIGNAL_MAX_REMAINING_SECONDS=270
+```
+
+For real orders, keep the existing authenticated live-execution flow with explicit user confirmation. A balance target such as $10 to $100 is not guaranteed by any signal model; treat it only as a goal or stopping condition.
+
