@@ -356,27 +356,35 @@ const liveSellQuote = (market: LiveMarket, side: "UP" | "DOWN", shares: number, 
 
 const buildPaperAccount = (balance: number, rows: PositionRow[], markets: Map<string, LiveMarket>, timestamp: number, dayStart: number,
   closedTrades: ClosedPaperTrade[] = []): PaperAccount => {
-  const positions: PaperPosition[] = rows.map((row) => {
+  const positions: PaperPosition[] = rows.map((row, index) => {
     const market = [...markets.values()].find((candidate) => candidate.upTokenId === row.tokenID || candidate.downTokenId === row.tokenID
       || Boolean(candidate.conditionId && row.conditionId && candidate.conditionId.toLowerCase() === row.conditionId.toLowerCase())
       || candidate.slug.toLowerCase() === row.slug?.toLowerCase());
     const tokenSide = market && row.tokenID === market.downTokenId ? "DOWN" : market && row.tokenID === market.upTokenId ? "UP" : null;
     const side = tokenSide ?? row.outcome;
-    if (!side) throw new Error("A wallet position could not be assigned to an exact UP or DOWN token; live entries are blocked.");
-    const marketId = market?.id ?? row.conditionId ?? row.slug ?? row.tokenID ?? `unmapped:${row.size}`;
+    // Wallets can hold unrelated markets, including YES/NO outcomes, while this
+    // engine only trades crypto UP/DOWN. Keep those costs in aggregate exposure
+    // and open-position limits, but give each an isolated identity so it can
+    // never be mistaken for a position in a discovered market or auto-exited.
+    const isUnmapped = side === null;
+    const riskMarket = isUnmapped ? null : market;
+    const riskSide = side ?? "UP";
+    const marketId = riskMarket?.id ?? (isUnmapped
+      ? `unmapped:${row.tokenID ?? row.conditionId ?? row.slug ?? index}`
+      : row.conditionId ?? row.slug ?? row.tokenID ?? `position:${index}`);
     const avgEntry = row.averagePrice && row.averagePrice > 0 && row.averagePrice <= 1 ? row.averagePrice : row.exposureUsd / row.size;
     return {
       id: row.tokenID ?? marketId,
       marketId,
-      marketLabel: market ? `${market.asset} ${market.duration}` : row.slug ?? "Existing Polymarket position",
-      asset: market?.asset ?? "CRYPTO",
-      duration: market?.duration ?? "5m",
-      side,
+      marketLabel: riskMarket ? `${riskMarket.asset} ${riskMarket.duration}` : row.slug ?? "Existing Polymarket position",
+      asset: riskMarket?.asset ?? "CRYPTO",
+      duration: riskMarket?.duration ?? "5m",
+      side: riskSide,
       shares: row.size,
       avgEntry,
       totalCost: row.exposureUsd,
       mark: null,
-      endTime: market?.endTime ?? timestamp,
+      endTime: riskMarket?.endTime ?? timestamp,
       openedAt: timestamp,
       lastUpdated: timestamp,
     };

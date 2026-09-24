@@ -881,7 +881,8 @@ export const marketDataFreshnessIssue = (
   now = Date.now(),
 ): string | null => {
   if (market.priceFeed === "UNSUPPORTED") return "This market uses an unsupported price-resolution feed; waiting for a supported Polymarket oracle market.";
-  if (!market.startTimeVerified || market.startTime === null || market.startTime > now + 1_000) return "Market start time is missing or cannot be verified against the market interval.";
+  if (!market.startTimeVerified || market.startTime === null) return "Market start time is missing or cannot be verified against the market interval.";
+  if (market.startTime > now + 1_000) return "Market interval has not started yet.";
   const liveIssue = marketStreamingDataFreshnessIssue(market, now);
   if (liveIssue) return liveIssue;
   if (market.reference === null || market.reference <= 0 || !market.referenceVerified
