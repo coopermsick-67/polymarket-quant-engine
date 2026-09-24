@@ -118,6 +118,7 @@ if (action === "status") {
         process.exitCode = 2;
         return;
       }
+      await mkdir(stateDir, { recursive: true, mode: 0o750 });
       let previous = null;
       try { previous = JSON.parse(await readFile(path.join(stateDir, "paper-state.json"), "utf8")); }
       catch (error) { if (error.code !== "ENOENT") throw error; }
