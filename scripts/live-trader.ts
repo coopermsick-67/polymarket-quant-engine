@@ -581,7 +581,7 @@ async function main() {
         console.error(`Trader halted with unresolved ${state.pending.action} order ${state.pending.requestId}; reconcile the wallet before continuing.`);
         return;
       }
-      const now = Date.now();
+      let now = Date.now();
       for (const [marketKey, retryAt] of Object.entries(state.retryAfter)) if (retryAt <= now) delete state.retryAfter[marketKey];
       if (state.closedTradesAt === null || now - state.closedTradesAt >= CLOSED_HISTORY_REFRESH_MS) {
         try {
@@ -624,6 +624,10 @@ async function main() {
       try {
         const [books] = await Promise.all([fetchOrderBooks(tokenIds, controller.signal)]);
         if (cycle % 30 === 0) histories = await fetchCandleHistories([...new Set(definitions.map((market) => market.asset))], controller.signal);
+        // Discovery, books, and candle requests can take several seconds. Use
+        // the post-I/O clock for oracle filtering so valid RTDS ticks received
+        // during those requests are not discarded as future-dated.
+        now = Date.now();
         const ticks = [...priceTicks.values()];
         const currentMarkets = new Map<string, LiveMarket>();
         for (const definition of definitions) {
@@ -809,9 +813,13 @@ async function main() {
         if (!best) {
           if (cycle % 15 === 0) {
             const leadingBlock = [...blockedReasons.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? "no supported active market";
-            const activeCount = [...currentMarkets.values()].filter((market) => market.startTimeVerified && market.startTime !== null
-              && market.startTime <= synchronizedPolymarketTime(now) + 1_000 && market.endTime > synchronizedPolymarketTime(now)).length;
-            console.log(`[${new Date().toLocaleTimeString()}] No actionable LOCK opportunity · ${definitions.length} markets discovered · ${activeCount} active · ${leadingBlock}.`);
+            const marketNow = synchronizedPolymarketTime(now);
+            const activeMarkets = [...currentMarkets.values()].filter((market) => market.startTimeVerified && market.startTime !== null
+              && market.startTime <= marketNow + 1_000 && market.endTime > marketNow);
+            const freshOracleCount = activeMarkets.filter((market) => market.spotSource === "POLYMARKET"
+              && market.spotUpdatedAt !== null && marketNow - market.spotUpdatedAt <= 10_000
+              && market.spotUpdatedAt <= marketNow + 1_000).length;
+            console.log(`[${new Date().toLocaleTimeString()}] No actionable LOCK opportunity · ${definitions.length} markets discovered · ${activeMarkets.length} active · ${freshOracleCount}/${activeMarkets.length} active markets have a fresh oracle tick · ${leadingBlock}.`);
           }
           await sleep(SCAN_MS);
           continue;
