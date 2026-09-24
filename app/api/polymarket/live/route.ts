@@ -344,7 +344,8 @@ const sessionFromConnection = async (input: LiveRequest, userId: string) => {
     funderAddress: walletAddress,
     useServerTime: true,
     retryOnError: false,
-    throwOnError: true,
+    // createOrDeriveApiKey needs API error responses to fall back to deriving an existing key.
+    throwOnError: false,
   });
   const rawCreds = await retryTransient(() => bootstrap.createOrDeriveApiKey());
   const apiKey = text((rawCreds as unknown as JsonRecord).key ?? (rawCreds as unknown as JsonRecord).apiKey);

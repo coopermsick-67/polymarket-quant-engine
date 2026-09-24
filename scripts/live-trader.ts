@@ -188,7 +188,8 @@ async function main() {
     const account = privateKeyToAccount((privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as `0x${string}`);
     if (signatureType === SignatureTypeV2.EOA && account.address.toLowerCase() !== walletAddress.toLowerCase()) throw new Error("Signature type 0 requires the wallet address to match the private-key signer.");
     const signer = createWalletClient({ account, chain: polygon, transport: http() });
-    const bootstrap = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer, signatureType: signatureType as SignatureTypeV2, funderAddress: walletAddress, useServerTime: true, retryOnError: false, throwOnError: true });
+    // createOrDeriveApiKey needs API error responses to fall back to deriving an existing key.
+    const bootstrap = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer, signatureType: signatureType as SignatureTypeV2, funderAddress: walletAddress, useServerTime: true, retryOnError: false, throwOnError: false });
     console.log("\nConnecting to Polymarket and reading your balance…");
     const rawCredentials = await bootstrap.createOrDeriveApiKey();
     const credentials = rawCredentials as ApiKeyCreds;
