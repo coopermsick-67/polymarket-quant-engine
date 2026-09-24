@@ -188,8 +188,15 @@ button { color: inherit; }
 .action-pill.negative { background: rgba(255, 125, 138, 0.09); border-color: rgba(255, 125, 138, 0.26); color: var(--red); }
 .action-pill.warning { background: rgba(255, 200, 107, 0.09); border-color: rgba(255, 200, 107, 0.25); color: var(--amber); }
 .action-pill.neutral { background: rgba(149, 168, 192, 0.06); color: #8998aa; }
-.market-price-row { align-items: flex-end; border-bottom: 1px solid rgba(146, 166, 191, 0.1); margin-top: 16px; padding-bottom: 12px; }
+.market-price-row { align-items: flex-end; border-bottom: 1px solid rgba(146, 166, 191, 0.1); display: grid; gap: 10px; grid-template-columns: minmax(58px, 0.55fr) minmax(0, 1.45fr); margin-top: 16px; padding-bottom: 12px; }
 .market-price-row small, .market-spot small { color: #67778b; display: block; font-size: 8px; letter-spacing: 0.07em; }
+.market-price-data { align-items: end; display: grid; gap: 4px 8px; grid-template-columns: 1fr 1fr; min-width: 0; text-align: right; }
+.market-price-data .market-current, .market-price-data .market-reference-price { min-width: 0; }
+.market-price-data .market-reference-price { border-left: 1px solid rgba(146, 166, 191, 0.12); padding-left: 8px; }
+.market-current strong, .market-reference-price strong { color: #e5edf7; display: block; font-family: "IBM Plex Mono", monospace; font-size: 14px; letter-spacing: -0.03em; margin: 3px 0 2px; white-space: nowrap; }
+.market-reference-price strong { color: #f2c56f; font-size: 15px; }
+.market-price-data .market-current small:last-child, .market-price-data .market-reference-price small:last-child { font-size: 7px; letter-spacing: 0; }
+.market-distance { font-family: "IBM Plex Mono", monospace; font-size: 8px; grid-column: 1 / -1; }
 .countdown { color: #dbe6f1; display: block; font-family: "IBM Plex Mono", monospace; font-size: 17px; letter-spacing: -0.04em; margin-top: 3px; }
 .market-spot { text-align: right; }
 .market-spot strong { display: inline-block; font-family: "IBM Plex Mono", monospace; font-size: 13px; margin-top: 4px; }
@@ -211,6 +218,8 @@ button { color: inherit; }
 .entry-price-checks > div, .signal-price-checks > div { background: rgba(4, 9, 15, 0.28); border: 1px solid rgba(146, 166, 191, 0.09); border-radius: 5px; min-width: 0; padding: 6px; }
 .entry-price-checks small, .signal-price-checks small { font-size: 9px; letter-spacing: 0; line-height: 1.25; white-space: normal; }
 .entry-price-checks strong, .signal-price-checks strong { font-size: 11px; }
+.entry-price-checks .edge-detail { color: #7f8ea2; font-family: "IBM Plex Mono", monospace; font-size: 8px; margin-top: 4px; }
+.edge-method-note { color: #68798d; font-family: "IBM Plex Mono", monospace; font-size: 8px; grid-column: 1 / -1; line-height: 1.4; }
 .entry-trends { align-items: center; display: flex; flex-wrap: wrap; font-family: "IBM Plex Mono", monospace; font-size: 12px; gap: 10px; grid-column: 1 / -1; justify-content: space-between; }
 .entry-trends span { color: #a5b2c1; white-space: nowrap; }
 .market-sparkline { height: 22px; width: 100%; }
@@ -539,6 +548,54 @@ button { color: inherit; }
 .live-status-row span { flex: 1; line-height: 1.45; }
 .live-status-row b { color: var(--cyan); font-size: 10px; }
 .live-active { color: var(--mint) !important; }
+.manual-trading-panel { min-width: 0; padding: 18px; }
+.manual-trading-intro { color: #8091a5; font-size: 11px; line-height: 1.55; margin: -4px 0 15px; max-width: 850px; }
+.manual-trading-grid { display: grid; gap: 14px; grid-template-columns: minmax(0, 1.25fr) minmax(270px, 0.75fr); }
+.manual-entry-column, .manual-position-column { background: rgba(5, 9, 15, 0.38); border: 1px solid rgba(146, 166, 191, 0.12); border-radius: 8px; min-width: 0; padding: 13px; }
+.manual-entry-controls { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) minmax(130px, 0.32fr); }
+.manual-select, .manual-stake-input, .manual-exit-input { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.manual-select > span, .manual-stake-input > span, .manual-exit-input > span { color: #72849a; font-family: "IBM Plex Mono", monospace; font-size: 8px; letter-spacing: 0.06em; }
+.manual-select select, .manual-stake-input input, .manual-exit-input input { background: #0a111b; border: 1px solid var(--border-bright); border-radius: 5px; color: #d1dce7; font-family: "IBM Plex Mono", monospace; font-size: 10px; min-height: 34px; min-width: 0; padding: 0 8px; width: 100%; }
+.manual-select select:focus, .manual-stake-input input:focus, .manual-exit-input input:focus { border-color: var(--cyan); outline: none; }
+.manual-stake-input > div { align-items: center; background: #0a111b; border: 1px solid var(--border-bright); border-radius: 5px; display: flex; min-height: 34px; padding: 0 8px; }
+.manual-stake-input > div:focus-within { border-color: var(--cyan); }
+.manual-stake-input b { color: var(--mint); font-family: "IBM Plex Mono", monospace; font-size: 10px; }
+.manual-stake-input input { background: transparent; border: 0; min-height: 30px; outline: 0; padding-right: 0; }
+.manual-reference-row { border-bottom: 1px solid rgba(146, 166, 191, 0.1); border-top: 1px solid rgba(146, 166, 191, 0.1); display: flex; flex-wrap: wrap; gap: 9px 20px; margin: 12px 0; padding: 9px 0; }
+.manual-reference-row span, .manual-position-values span { color: #6f8195; display: flex; flex-direction: column; font-family: "IBM Plex Mono", monospace; font-size: 7px; gap: 4px; letter-spacing: 0.04em; }
+.manual-reference-row b, .manual-position-values b { color: #d0deea; font-size: 10px; font-weight: 500; letter-spacing: 0; }
+.manual-probability-grid { display: grid; gap: 7px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.manual-probability-grid > div { background: rgba(14, 22, 33, 0.75); border: 1px solid rgba(146, 166, 191, 0.1); border-radius: 5px; display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 8px; }
+.manual-probability-grid span { color: #6f8195; font-family: "IBM Plex Mono", monospace; font-size: 7px; letter-spacing: 0.04em; }
+.manual-probability-grid strong { color: #dce8f4; font-family: "IBM Plex Mono", monospace; font-size: 15px; }
+.manual-side-tabs { display: grid; gap: 7px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 11px 0 8px; }
+.manual-side-tabs button { align-items: center; background: rgba(9, 15, 23, 0.75); border: 1px solid var(--border); border-radius: 5px; color: #8c9bad; cursor: pointer; display: flex; font-family: "IBM Plex Mono", monospace; font-size: 10px; gap: 6px; justify-content: center; padding: 9px; }
+.manual-side-tabs button b { font-size: 9px; margin-left: auto; }
+.manual-side-tabs .manual-up.active { background: rgba(108, 242, 196, 0.08); border-color: rgba(108, 242, 196, 0.4); color: var(--mint); }
+.manual-side-tabs .manual-down.active { background: rgba(255, 125, 138, 0.08); border-color: rgba(255, 125, 138, 0.42); color: var(--red); }
+.manual-quote-grid { display: grid; gap: 7px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.manual-quote-card { background: rgba(12, 18, 28, 0.65); border: 1px solid rgba(146, 166, 191, 0.1); border-radius: 6px; display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 9px; }
+.manual-quote-card.selected { border-color: rgba(111, 216, 255, 0.3); }
+.manual-quote-card > span, .manual-quote-card > small, .manual-quote-card > strong { font-family: "IBM Plex Mono", monospace; font-size: 8px; }
+.manual-quote-card > span { color: #8091a5; }
+.manual-quote-card > strong { color: #c8d7e5; font-size: 8px; }
+.manual-quote-card > small { color: #718196; line-height: 1.45; }
+.manual-quote-card .manual-consensus-edge { color: var(--cyan); margin-top: 2px; }
+.manual-entry-footer { align-items: center; display: flex; gap: 10px; justify-content: space-between; margin-top: 10px; }
+.manual-entry-footer > span { color: #78899d; font-size: 9px; line-height: 1.45; }
+.manual-entry-footer button { flex: 0 0 auto; justify-content: center; min-width: 155px; }
+.manual-sizing-note { color: #65778c; font-family: "IBM Plex Mono", monospace; font-size: 8px; line-height: 1.5; margin-top: 9px; }
+.manual-position-column > .eyebrow { margin: 1px 0 10px; }
+.manual-position-card { background: rgba(12, 18, 28, 0.7); border: 1px solid rgba(146, 166, 191, 0.12); border-radius: 6px; margin-bottom: 8px; padding: 10px; }
+.manual-position-heading { align-items: center; display: flex; gap: 8px; justify-content: space-between; }
+.manual-position-heading strong { color: #d4e1ed; font-family: "IBM Plex Mono", monospace; font-size: 9px; }
+.manual-position-heading > span { color: #718196; font-family: "IBM Plex Mono", monospace; font-size: 8px; }
+.manual-position-market { color: #798ba0; font-size: 9px; line-height: 1.45; margin-top: 5px; }
+.manual-position-values { display: flex; gap: 20px; margin: 10px 0; }
+.manual-exit-input { margin: 8px 0; }
+.manual-sell-button { justify-content: center; width: 100%; }
+.manual-empty-position { border: 1px dashed rgba(146, 166, 191, 0.18); border-radius: 5px; color: #73849a; font-size: 10px; line-height: 1.45; padding: 13px; }
+.manual-stop-note { align-items: center; background: rgba(255, 194, 93, 0.06); border: 1px solid rgba(255, 194, 93, 0.16); border-radius: 5px; color: var(--amber); display: flex; font-size: 9px; gap: 7px; margin: 0 0 12px; padding: 9px; }
 
 .paper-lab { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .paper-test-grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 1.08fr) minmax(330px, 0.92fr); }
@@ -601,6 +658,7 @@ button { color: inherit; }
 @media (max-width: 920px) {
   .live-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .live-grid { grid-template-columns: 1fr; }
+  .manual-trading-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 620px) {
@@ -609,4 +667,9 @@ button { color: inherit; }
   .live-stat-card strong { font-size: 18px; }
   .live-status-row { align-items: flex-start; flex-wrap: wrap; }
   .live-status-row span { flex-basis: 100%; }
+  .manual-entry-controls { grid-template-columns: 1fr; }
+  .manual-probability-grid { grid-template-columns: 1fr; }
+  .manual-quote-grid { grid-template-columns: 1fr; }
+  .manual-entry-footer { align-items: stretch; flex-direction: column; }
+  .manual-entry-footer button { min-height: 36px; width: 100%; }
 }

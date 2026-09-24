@@ -65,6 +65,7 @@ import {
   accountUnrealized,
   accountWinRate,
   analyzeMarketSignal,
+  estimateSidePrice,
   backtestCsvTemplate,
   buyPaper,
   closePaperPositions,
@@ -83,14 +84,14 @@ import {
   type PaperAccount,
   type PaperSide,
 } from "./lib/engines";
-import LiveExecutionPanel, { type LiveExecutionStatus, type LiveSessionState } from "./components/live-execution-panel";
+import LiveExecutionPanel, { type LiveExecutionStatus, type LiveSessionState, type ManualLivePosition } from "./components/live-execution-panel";
 import PaperLabPanel, { type PaperTestViewState, type TelegramViewState } from "./components/paper-lab-panel";
 import LocalPaperDaemonPanel from "./components/local-paper-daemon-panel";
 import { ACTIVE_MODEL_VERSION, computeLedgerMetrics, decisionLedgerCsv, ledgerResultFor, type MarketDecisionRow } from "./lib/decision-ledger";
 import { DEFAULT_PAPER_EARLY_EXIT, evaluateModelAwareExit, evaluatePaperHoldExit, normalizeEarlyExitPolicy, type EarlyExitPolicy } from "./lib/early-exit";
 import { evaluatePaperMarket } from "./lib/paper-bankroll";
 import { assessBankrollRisk, bankrollProfile } from "./lib/bankroll-policy";
-import { enforceLiveExecutionRisk, normalizeLiveRiskConfig, type LiveRiskConfig } from "./lib/live-risk";
+import { computeKellySizing, enforceLiveExecutionRisk, liveUnitUsd, normalizeLiveRiskConfig, type LiveRiskConfig } from "./lib/live-risk";
 
 type View = "overview" | "paper" | "account" | "live" | "backtest";
 type Tone = "positive" | "warning" | "negative" | "neutral";
@@ -191,6 +192,10 @@ const hasVerifiedOpeningReference = (market: LiveMarket) => market.startTimeVeri
   && market.referenceVerified && market.referenceSource === "POLYMARKET" && market.reference !== null
   && market.referenceUpdatedAt === market.startTime;
 
+const probabilityPoints = (value: number | null) => value === null || !Number.isFinite(value)
+  ? "—"
+  : `${value > 0 ? "+" : ""}${(value * 100).toFixed(1)} pp`;
+
 const topBidDepthUsd = (levels: Array<{ price: number; size: number }> | undefined) => {
   const bestBid = levels?.reduce((best, level) => Number.isFinite(level.price) && level.price > 0 && level.price < 1
     && Number.isFinite(level.size) && level.size > 0 ? Math.max(best, level.price) : best, 0) ?? 0;
@@ -244,6 +249,9 @@ const validationBookFields = (market: LiveMarket, costs: CostConfig, side: Paper
 
 function MarketCard({ market, selected, config, clock, onSelect }: { market: LiveMarket; selected: boolean; config: Config; clock: number; onSelect: () => void }) {
   const signal = analyzeMarketSignal(market, { feeRate: config.feeRate, slippageBps: config.slippageBps }, config.maxTrade, config.minEdge, clock);
+  const priceModelFresh = marketDataFreshnessIssue(market, clock) === null;
+  const upEstimate = estimateSidePrice(market, "UP", { feeRate: config.feeRate, slippageBps: config.slippageBps }, config.maxTrade, signal.fairUp);
+  const downEstimate = estimateSidePrice(market, "DOWN", { feeRate: config.feeRate, slippageBps: config.slippageBps }, config.maxTrade, signal.fairUp);
   const action: { label: string; tone: Tone } = signal.action === "PASS"
     ? { label: "PASS", tone: "warning" }
     : { label: `${signal.tier} ${signal.action}`, tone: signal.action === "UP" ? "positive" : "negative" };
@@ -255,14 +263,31 @@ function MarketCard({ market, selected, config, clock, onSelect }: { market: Liv
   const referenceTitle = market.priceFeed === "TWAP_60"
     ? "Price to Beat is the Polymarket Chainlink 60-second TWAP observation at this market's exact start time."
     : "Price to Beat is the verified Polymarket oracle observation at this market's exact start time.";
+  const feeLabel = market.feeSchedule?.source === "CLOB" ? "CLOB fee schedule" : "conservative fee fallback";
+  const sidePriceSummary = (side: PaperSide, estimate: ReturnType<typeof estimateSidePrice>) => {
+    const probability = signal.fairUp === null ? null : side === "UP" ? signal.fairUp : 1 - signal.fairUp;
+    const estimateFee = estimate.fill?.fee ?? null;
+    const grossAtAsk = priceModelFresh && signal.fairUp !== null ? estimate.grossEdgeAtBestAsk : null;
+    const netAtSize = priceModelFresh ? estimate.netEdge : null;
+    const rawProbability = signal.rawModelUp === null ? null : side === "UP" ? signal.rawModelUp : 1 - signal.rawModelUp;
+    const rawAtAsk = rawProbability !== null && estimate.bestAsk !== null ? rawProbability - estimate.bestAsk : null;
+    const rawNetAtSize = priceModelFresh ? estimate.rawModelNetEdge : null;
+    const priceImpact = estimate.averagePrice !== null && estimate.bestAsk !== null ? Math.max(0, estimate.averagePrice - estimate.bestAsk) : null;
+    return <div title={`Book-anchored P(${side}) ${probability === null ? "unavailable" : percentage(probability)} minus all-in cost/share ${estimate.costPerShare === null ? "unavailable" : cents(estimate.costPerShare)} = the displayed engine net edge. This quote walks up to ${dollars(config.maxTrade)} through visible asks, includes ${feeLabel.toLowerCase()} and ${config.slippageBps} bps slippage. Raw candle-model P(${side}) is ${rawProbability === null ? "unavailable" : percentage(rawProbability)}; its separate raw model net edge is ${rawNetAtSize === null ? "unavailable" : probabilityPoints(rawNetAtSize)}. The heuristic model is not calibrated.`}>
+      <small>{side} · BLENDED P {priceModelFresh ? percentage(probability) : "—"} / ASK {cents(estimate.bestAsk)}</small>
+      <strong className={netAtSize === null ? "text-muted" : netAtSize >= 0 ? "text-positive" : "text-negative"}>NET @{dollars(config.maxTrade, 0)} {probabilityPoints(netAtSize)}</strong>
+      <small className="edge-detail">{priceModelFresh ? `raw model net ${probabilityPoints(rawNetAtSize)} · raw @ ask ${probabilityPoints(rawAtAsk)} · blended gross ${probabilityPoints(grossAtAsk)}` : "Waiting for fresh oracle, chart, reference, and both books"}</small>
+      <small className="edge-detail">{priceModelFresh ? `avg fill ${cents(estimate.averagePrice)} · all-in ${cents(estimate.costPerShare)} · walk/slip +${priceImpact === null ? "—" : cents(priceImpact)} · fee ${estimateFee === null ? "—" : dollars(estimateFee, 2)}` : "Live execution edge is held while data is stale"}</small>
+    </div>;
+  };
   const chartValues = market.chart5m.slice(-18).map((candle) => candle.close);
   return <button className={`market-card ${selected ? "market-card-selected" : ""}`} onClick={onSelect} type="button">
     <div className="market-card-header"><div className="market-identity"><span className={`asset-token ${assetTone(market.asset)}`}>{market.asset.slice(0, 1)}</span><span><strong>{market.asset}</strong><small>{market.duration} · live book</small></span></div><span className={`action-pill ${action.tone}`}>{action.label}</span></div>
     <div className="market-question">{market.question}</div>
-    <div className="market-price-row"><div><small>TIME LEFT</small><strong className="countdown">{timeLeft(market.remaining)}</strong></div><div className="market-spot"><small>{oracleLabel}</small><strong>{oracleCurrent ? formatSpot(market.asset, market.spot) : market.spot !== null ? "STALE · HOLD" : "WAITING FOR ORACLE"}</strong><small className="market-reference" title={referenceTitle}>{verifiedReference ? `PRICE TO BEAT ${formatSpot(market.asset, market.reference)}` : "PRICE TO BEAT · exact opening tick pending"}</small><span className={oracleCurrent && verifiedReference && distance !== null && distance >= 0 ? "text-positive" : oracleCurrent && verifiedReference && distance !== null ? "text-negative" : "text-muted"}>{!oracleCurrent || !verifiedReference || distance === null ? "—" : `${distance >= 0 ? "+" : ""}${percentage(distance, 2)}`}</span></div></div>
-    <div className="book-grid"><div><span>UP</span><strong>{cents(market.upAsk)}</strong><small>bid {cents(market.upBid)}</small></div><div><span>DOWN</span><strong>{cents(market.downAsk)}</strong><small>bid {cents(market.downBid)}</small></div><div title="Candle model pulled toward the order book in log-odds. Edges are priced against this number."><span>P(UP)</span><strong>{percentage(signal.fairUp)}</strong><small>model {percentage(signal.rawModelUp, 0)} · mkt {percentage(signal.marketProbabilityUp, 0)}</small></div></div>
-    <div className="entry-signal"><div><small title="Directional trend score, not a win probability.">TREND READ</small><strong className={signal.bias === "UP" ? "text-positive" : signal.bias === "DOWN" ? "text-negative" : "text-warning"}>{signal.bias}{signal.biasConfidence === null ? "" : ` · ${percentage(signal.biasConfidence, 0)}`}</strong></div><div><small>ENTRY</small><strong className={signal.action === "UP" ? "text-positive" : signal.action === "DOWN" ? "text-negative" : "text-warning"}>{signal.action === "PASS" ? "PASS" : `${signal.action} · ${cents(signal.entryPrice)}`}</strong></div><div className="entry-price-checks"><div><small>UP · P {percentage(signal.fairUp)} / ASK {cents(market.upAsk)}</small><strong className={signal.upEdge === null ? "text-muted" : signal.upEdge >= 0 ? "text-positive" : "text-negative"}>EDGE {signal.upEdge === null ? "—" : percentage(signal.upEdge)}</strong></div><div><small>DOWN · P {percentage(signal.fairUp === null ? null : 1 - signal.fairUp)} / ASK {cents(market.downAsk)}</small><strong className={signal.downEdge === null ? "text-muted" : signal.downEdge >= 0 ? "text-positive" : "text-negative"}>EDGE {signal.downEdge === null ? "—" : percentage(signal.downEdge)}</strong></div></div><div className="entry-trends"><span>5M {signal.trend5m}</span><span>15M {signal.trend15m}</span></div><PriceSparkline values={chartValues} color={signal.bias === "DOWN" ? "#ff7d8a" : "#6cf2c4"} /><small className="entry-reason">{signal.reason}</small></div>
-    <div className="market-footer"><span className="market-edge"><span className="metric-label">NET EDGE</span><strong className={signal.action !== "PASS" ? "text-positive" : "text-muted"}>{signal.edge === null ? "—" : `${signal.edge >= 0 ? "+" : ""}${percentage(signal.edge)}`}</strong></span><span className="market-liquidity"><span className="metric-label">ASK DEPTH</span><strong>{market.liquidity ? dollars(market.liquidity, 0) : "—"}</strong></span></div>
+    <div className="market-price-row"><div><small>TIME LEFT</small><strong className="countdown">{timeLeft(market.remaining)}</strong></div><div className="market-price-data"><div className="market-current"><small>{oracleLabel} · NOW</small><strong>{oracleCurrent ? formatSpot(market.asset, market.spot) : market.spot !== null ? "STALE · HOLD" : "WAITING"}</strong><small>{oracleCurrent ? "current oracle" : "entries held"}</small></div><div className="market-reference-price" title={referenceTitle}><small>PRICE TO BEAT</small><strong>{verifiedReference ? formatSpot(market.asset, market.reference) : "WAITING"}</strong><small>{verifiedReference ? "Polymarket opening value" : "exact opening tick pending"}</small></div><span className={oracleCurrent && verifiedReference && distance !== null && distance >= 0 ? "market-distance text-positive" : oracleCurrent && verifiedReference && distance !== null ? "market-distance text-negative" : "market-distance text-muted"}>{!oracleCurrent || !verifiedReference || distance === null ? "gap —" : `${distance >= 0 ? "+" : ""}${percentage(distance, 2)} from open`}</span></div></div>
+    <div className="book-grid"><div><span>UP ASK</span><strong>{cents(market.upAsk)}</strong><small>bid {cents(market.upBid)}</small></div><div><span>DOWN ASK</span><strong>{cents(market.downAsk)}</strong><small>bid {cents(market.downBid)}</small></div><div title="Blended P(UP) combines the candle model with the order-book midpoint in log-odds. Raw model and book midpoint are shown below. Probabilities are estimates, not calibrated forecasts."><span>BLENDED P(UP)</span><strong>{priceModelFresh ? percentage(signal.fairUp) : "—"}</strong><small>{priceModelFresh ? `model ${percentage(signal.rawModelUp, 0)} · book ${percentage(signal.marketProbabilityUp, 0)}` : "model inputs stale"}</small></div></div>
+    <div className="entry-signal"><div><small title="Directional trend score, not a win probability.">TREND READ</small><strong className={signal.bias === "UP" ? "text-positive" : signal.bias === "DOWN" ? "text-negative" : "text-warning"}>{signal.bias}{signal.biasConfidence === null ? "" : ` · ${percentage(signal.biasConfidence, 0)}`}</strong></div><div><small>MODEL ENTRY</small><strong className={signal.action === "UP" ? "text-positive" : signal.action === "DOWN" ? "text-negative" : "text-warning"}>{signal.action === "PASS" ? "PASS" : `${signal.action} · ${cents(signal.entryPrice)}`}</strong></div><div className="entry-price-checks">{sidePriceSummary("UP", upEstimate)}{sidePriceSummary("DOWN", downEstimate)}</div><div className="edge-method-note">Net edge = blended fair probability − estimated all-in cost per share. Uses a {dollars(config.maxTrade)} ask-ladder walk, {feeLabel.toLowerCase()}, and {config.slippageBps} bps slippage.</div><div className="entry-trends"><span>5M {signal.trend5m}</span><span>15M {signal.trend15m}</span></div><PriceSparkline values={chartValues} color={signal.bias === "DOWN" ? "#ff7d8a" : "#6cf2c4"} /><small className="entry-reason">{signal.reason}</small></div>
+    <div className="market-footer"><span className="market-edge"><span className="metric-label">BEST NET EDGE · {dollars(config.maxTrade, 0)}</span><strong className={priceModelFresh && signal.action !== "PASS" ? "text-positive" : "text-muted"}>{!priceModelFresh || signal.edge === null ? "—" : probabilityPoints(signal.edge)}</strong></span><span className="market-liquidity"><span className="metric-label">ASK DEPTH</span><strong>{market.liquidity ? dollars(market.liquidity, 0) : "—"}</strong></span></div>
   </button>;
 }
 
@@ -301,7 +326,7 @@ export default function Home() {
   const [engineRunning, setEngineRunning] = useState(false); const [paused, setPaused] = useState(false); const [killSwitch, setKillSwitch] = useState(false); const [runnerDialogOpen, setRunnerDialogOpen] = useState(false); const [selectedRange, setSelectedRange] = useState("ALL"); const [startingCashInput, setStartingCashInput] = useState("100");
   const [recordedTicks, setRecordedTicks] = useState<BacktestRow[]>([]); const [backtestRows, setBacktestRows] = useState<BacktestRow[]>([]); const [backtestRejected, setBacktestRejected] = useState(0); const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null); const [backtestStartingCash, setBacktestStartingCash] = useState(100);
   const [accountConnection, setAccountConnection] = useState<AccountConnection>(() => ({ ...EMPTY_ACCOUNT_CONNECTION, walletAddress: readStoredJson<{ walletAddress?: string }>(ACCOUNT_WALLET_STORAGE_KEY)?.walletAddress ?? "" })); const [connectedAccount, setConnectedAccount] = useState<ConnectedAccount | null>(null); const [accountLoading, setAccountLoading] = useState(false); const [accountError, setAccountError] = useState(""); const [accountDialogOpen, setAccountDialogOpen] = useState(false);
-  const [liveRisk, setLiveRisk] = useState<LiveRiskConfig>(() => enforceLiveExecutionRisk(readStoredJson<Partial<LiveRiskConfig>>(LIVE_RISK_STORAGE_KEY))); const [liveSession, setLiveSession] = useState<LiveSessionState | null>(null); const [liveRunning, setLiveRunning] = useState(false); const [livePaused, setLivePaused] = useState(false); const [liveConsent, setLiveConsent] = useState(false); const [liveStatus, setLiveStatus] = useState<LiveExecutionStatus>({ lastAction: "", lastDetail: "", lastError: "", lastLatencyMs: null });
+  const [liveRisk, setLiveRisk] = useState<LiveRiskConfig>(() => enforceLiveExecutionRisk(readStoredJson<Partial<LiveRiskConfig>>(LIVE_RISK_STORAGE_KEY))); const [liveSession, setLiveSession] = useState<LiveSessionState | null>(null); const [liveRunning, setLiveRunning] = useState(false); const [livePaused, setLivePaused] = useState(false); const [liveConsent, setLiveConsent] = useState(false); const [liveStatus, setLiveStatus] = useState<LiveExecutionStatus>({ lastAction: "", lastDetail: "", lastError: "", lastLatencyMs: null }); const [livePositions, setLivePositions] = useState<LivePositionSnapshot[]>([]); const [manualOrderBusy, setManualOrderBusy] = useState(false);
   const [ledgerRows, setLedgerRows] = useState<MarketDecisionRow[]>(() => readStoredJson<MarketDecisionRow[]>(LEDGER_STORAGE_KEY) ?? []);
   const [paperTestStartingBalanceInput, setPaperTestStartingBalanceInput] = useState("100"); const [paperTestDurationDaysInput, setPaperTestDurationDaysInput] = useState("1");
   const [paperTest, setPaperTest] = useState<PaperTestViewState>({ status: "IDLE", startingBalance: 100, days: 1, startedAt: null, endsAt: null, balance: 100, trades: 0, openPositions: 0, realizedPnl: 0, winRate: null });
@@ -417,6 +442,11 @@ export default function Home() {
     }
     return next;
   }, [liveMarkets]);
+  const manualPositions = useMemo<ManualLivePosition[]>(() => livePositions.flatMap((position) => {
+    const mapped = position.tokenID ? liveTokenMap.get(position.tokenID) : null;
+    if (!mapped || !position.size || position.size <= 0) return [];
+    return [{ ...position, market: mapped.market, side: mapped.side, bid: mapped.side === "UP" ? mapped.market.upBid : mapped.market.downBid }];
+  }), [livePositions, liveTokenMap]);
   const ledgerMetrics = useMemo(() => computeLedgerMetrics(ledgerRows), [ledgerRows]);
   useEffect(() => {
     if (!liveMarkets.length) return;
@@ -1031,6 +1061,7 @@ export default function Home() {
       const payload = await response.json() as { ok?: boolean; error?: string; positions?: LivePositionSnapshot[] };
       if (!response.ok || !payload.ok || !Array.isArray(payload.positions)) throw new Error(payload.error || "Live positions could not be refreshed.");
       livePositionsRef.current = payload.positions.filter((position) => (position.size ?? 0) > 0);
+      setLivePositions(livePositionsRef.current);
       livePositionRefreshedAt.current = Date.now();
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Live positions could not be refreshed.";
@@ -1040,6 +1071,19 @@ export default function Home() {
       livePositionRefreshBusy.current = false;
     }
   }, [appendLog, liveRequest, liveSession?.connected]);
+  useEffect(() => {
+    if (!liveSession?.connected) {
+      if (livePositionsRef.current.length) {
+        livePositionsRef.current = [];
+        setLivePositions([]);
+      }
+      return;
+    }
+    void refreshLivePositions();
+    if (view !== "live") return;
+    const timer = window.setInterval(() => void refreshLivePositions(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [liveSession?.connected, refreshLivePositions, view]);
   const refreshLiveBalance = useCallback(async () => {
     if (!liveSession?.connected) return;
     try {
@@ -1052,6 +1096,80 @@ export default function Home() {
       setLiveStatus((current) => ({ ...current, lastError: detail })); appendLog("Live balance unavailable", detail, "negative");
     }
   }, [appendLog, liveRequest, liveSession?.connected]);
+  const submitManualEntry = useCallback(async (marketId: string, side: PaperSide, stakeUsd: number) => {
+    const market = liveMarketMap.get(marketId);
+    if (!liveSession?.connected || !market || liveRunning || livePaused || manualOrderBusy || killSwitch) return;
+    const risk = enforceLiveExecutionRisk(liveRisk);
+    const freshnessIssue = marketDataFreshnessIssue(market, clock);
+    const signal = analyzeMarketSignal(market, { feeRate: risk.feeRate, slippageBps: risk.slippageBps }, stakeUsd, risk.minEdge, clock);
+    const estimate = estimateSidePrice(market, side, { feeRate: risk.feeRate, slippageBps: risk.slippageBps }, stakeUsd, signal.fairUp);
+    const probability = signal.fairUp === null ? null : side === "UP" ? signal.fairUp : 1 - signal.fairUp;
+    if (freshnessIssue || probability === null || estimate.netEdge === null || estimate.costPerShare === null || estimate.averagePrice === null || !estimate.fill) {
+      setLiveStatus((current) => ({ ...current, lastAction: "MANUAL ENTRY HELD", lastDetail: freshnessIssue || "A complete fresh quote is not available for this side and size.", lastError: "" }));
+      return;
+    }
+    if (stakeUsd > liveUnitUsd(liveSession.balance ?? 0, risk) + 1e-8) {
+      setLiveStatus((current) => ({ ...current, lastAction: "MANUAL ENTRY HELD", lastDetail: `This balance currently allows a maximum stake of ${dollars(liveUnitUsd(liveSession.balance ?? 0, risk))}.`, lastError: "" }));
+      return;
+    }
+    const sizing = computeKellySizing(probability, estimate.costPerShare, liveSession.balance ?? 0, risk);
+    if (estimate.netEdge < risk.minEdge || !sizing.approved || stakeUsd > sizing.stakeUsd + 1e-8) {
+      const detail = estimate.netEdge < risk.minEdge
+        ? `Selected ${side} net edge is ${probabilityPoints(estimate.netEdge)}, below the ${percentage(risk.minEdge)} live minimum.`
+        : `Kelly and the bankroll cap allow ${dollars(sizing.stakeUsd)} at most.`;
+      setLiveStatus((current) => ({ ...current, lastAction: "MANUAL ENTRY HELD", lastDetail: detail, lastError: "" }));
+      return;
+    }
+    const confirmation = [
+      `Place a real-money ${side} FAK order?`,
+      `${market.asset} ${market.duration} · ${market.question}`,
+      `Stake: ${dollars(stakeUsd)} · blended P(${side}): ${percentage(probability)}`,
+      `Best ask: ${cents(estimate.bestAsk)} · estimated all-in: ${cents(estimate.costPerShare)} per share`,
+      `Net edge at this size: ${probabilityPoints(estimate.netEdge)} · estimated fee: ${dollars(estimate.fill.fee, 2)}`,
+      `The live server rechecks the exact opening tick and current order book. FAK orders can partially fill or not fill.`,
+    ].join("\n");
+    if (!window.confirm(confirmation)) return;
+    setManualOrderBusy(true);
+    const startedAt = Date.now();
+    try {
+      const response = await liveRequest({ action: "manual-entry", marketId, side, stakeUsd, requestId: `manual:${crypto.randomUUID()}`, confirmLive: true, config: risk }, true);
+      const payload = await response.json() as { ok?: boolean; status?: string; reason?: string; error?: string; uncertain?: boolean; balanceAfter?: number | null; sizing?: { stakeUsd?: number }; signal?: { edge?: number | null }; quote?: { netEdge?: number | null } };
+      const detail = payload.reason || payload.error || (payload.status === "EXECUTED" ? "Order accepted by Polymarket." : "No order submitted.");
+      setLiveStatus({ lastAction: payload.status === "EXECUTED" ? "MANUAL ENTRY EXECUTED" : payload.status || "MANUAL ENTRY HELD", lastDetail: detail, lastError: payload.uncertain ? (payload.error || "Order outcome is uncertain; reconcile the Account tab before trying again.") : response.ok ? "" : (payload.error || "Manual entry failed."), lastLatencyMs: Date.now() - startedAt });
+      if (typeof payload.balanceAfter === "number") setLiveSession((current) => current ? { ...current, balance: payload.balanceAfter! } : current);
+      if (payload.status === "EXECUTED") {
+        appendLog(`${market.asset} ${market.duration} manual live ${side}`, `${dollars(payload.sizing?.stakeUsd ?? stakeUsd)} · book-anchored net edge ${probabilityPoints(payload.quote?.netEdge ?? estimate.netEdge)} · FAK`, "warning");
+        livePositionRefreshedAt.current = 0;
+        await refreshLivePositions();
+      }
+      if (payload.uncertain || response.status === 401 || response.status === 403) { setLiveRunning(false); setLivePaused(true); }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Manual live entry failed.";
+      setLiveStatus({ lastAction: "MANUAL ENTRY ERROR", lastDetail: detail, lastError: detail, lastLatencyMs: Date.now() - startedAt });
+    } finally { setManualOrderBusy(false); }
+  }, [appendLog, clock, killSwitch, liveMarketMap, livePaused, liveRequest, liveRisk, liveRunning, liveSession, manualOrderBusy, refreshLivePositions]);
+  const submitManualExit = useCallback(async (position: LivePositionSnapshot, marketId: string, side: PaperSide, amount: number, bestBid: number | null) => {
+    if (!liveSession?.connected || liveRunning || livePaused || manualOrderBusy || killSwitch || !position.tokenID || !bestBid || amount <= 0) return;
+    const market = liveMarketMap.get(marketId);
+    if (!market) return;
+    const risk = enforceLiveExecutionRisk(liveRisk);
+    const minimumPrice = Math.max(0.001, bestBid * (1 - risk.slippageBps / 10_000));
+    if (!window.confirm(`Sell ${amount.toFixed(4)} ${side} shares in ${market.asset} ${market.duration}?\nCurrent best bid: ${cents(bestBid)} · minimum fill price: about ${cents(minimumPrice)} · FAK order.\nThe exchange may fill fewer shares or none.`)) return;
+    setManualOrderBusy(true);
+    const startedAt = Date.now();
+    try {
+      const response = await liveRequest({ action: "manual-exit", marketId, tokenID: position.tokenID, amount, minimumPrice, requestId: `manual-exit:${crypto.randomUUID()}`, confirmLive: true, config: risk }, true);
+      const payload = await response.json() as { ok?: boolean; status?: string; error?: string; uncertain?: boolean; balanceAfter?: number | null; sizing?: { shares?: number }; order?: { takingAmount?: string } };
+      const detail = payload.error || (payload.status === "EXECUTED" ? `Sell submitted · ${payload.order?.takingAmount ?? payload.sizing?.shares ?? amount} shares requested.` : "No sell submitted.");
+      setLiveStatus({ lastAction: payload.status === "EXECUTED" ? "MANUAL EXIT EXECUTED" : payload.status || "MANUAL EXIT HELD", lastDetail: detail, lastError: payload.uncertain ? (payload.error || "Sell outcome is uncertain; reconcile Account before retrying.") : response.ok ? "" : (payload.error || "Manual exit failed."), lastLatencyMs: Date.now() - startedAt });
+      if (typeof payload.balanceAfter === "number") setLiveSession((current) => current ? { ...current, balance: payload.balanceAfter! } : current);
+      if (payload.status === "EXECUTED") { appendLog(`${market.asset} ${market.duration} manual live exit`, `${side} · requested ${amount.toFixed(4)} shares · FAK`, "warning"); livePositionRefreshedAt.current = 0; await refreshLivePositions(); }
+      if (payload.uncertain || response.status === 401 || response.status === 403) { setLiveRunning(false); setLivePaused(true); }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Manual live exit failed.";
+      setLiveStatus({ lastAction: "MANUAL EXIT ERROR", lastDetail: detail, lastError: detail, lastLatencyMs: Date.now() - startedAt });
+    } finally { setManualOrderBusy(false); }
+  }, [appendLog, killSwitch, liveMarketMap, livePaused, liveRequest, liveRisk, liveRunning, liveSession?.connected, manualOrderBusy, refreshLivePositions]);
   const startLiveExecutor = () => {
     if (!liveSession?.connected) { setView("account"); setAccountDialogOpen(true); return; }
     if (!liveConsent || killSwitch) { setLiveStatus((current) => ({ ...current, lastError: killSwitch ? "Reset the paper risk halt before starting live execution." : "Confirm the live-order risk notice before starting." })); return; }
@@ -1190,7 +1308,7 @@ export default function Home() {
       {killSwitch ? <div className="critical-banner"><AlertTriangle size={17} /><span><strong>RISK HALT</strong> — paper auto-execution is disabled; reset only after reviewing the ledger.</span><button onClick={resetPaperSession} type="button">Reset empty ledger</button></div> : <div className="info-banner"><Activity size={16} /><span><strong>Paper is the default.</strong> Live execution is opt-in, owner-authenticated, balance-aware, and fail-closed.</span><span className="banner-spacer" /><button onClick={() => setRunnerDialogOpen(true)} type="button">24/7 runner setup <Terminal size={14} /></button><button onClick={() => setView("live")} type="button">Open live executor <ArrowUpRight size={14} /></button></div>}
       <div className="terminal-content"><div className="workspace-tabs" role="tablist" aria-label="Workspace"><button className={view === "overview" ? "active" : ""} onClick={() => setView("overview")} role="tab" aria-selected={view === "overview"} type="button"><LayoutDashboard size={14} />Overview</button><button className={view === "paper" ? "active" : ""} onClick={() => setView("paper")} role="tab" aria-selected={view === "paper"} type="button"><Wallet size={14} />Paper trader</button><button className={view === "backtest" ? "active" : ""} onClick={() => setView("backtest")} role="tab" aria-selected={view === "backtest"} type="button"><LineChart size={14} />Paper lab</button><button className={view === "account" ? "active" : ""} onClick={() => setView("account")} role="tab" aria-selected={view === "account"} type="button"><CircleDollarSign size={14} />Account</button><button className={view === "live" ? "active" : ""} onClick={() => setView("live")} role="tab" aria-selected={view === "live"} type="button"><Zap size={14} />Live executor</button><span className="workspace-tab-spacer" /><span className="data-receipt"><span className={`status-dot ${oracleFresh ? "status-ready" : "status-warning"}`} />{oracleFresh ? `SELECTED ORACLE LIVE · ${formatAge(selectedOracleTickAt, clock)} ago` : `SELECTED ORACLE ${polymarketStreamStatus.toLowerCase()} · entries held`}<span className={`status-dot ${streamStatus === "LIVE" ? "status-ready" : "status-warning"}`} />{streamStatus === "LIVE" ? "books/research live" : `aux ${streamStatus.toLowerCase()}`}</span></div>
         {view === "paper" ? <LocalPaperDaemonPanel /> : null}<section className="control-row" aria-label="Trading controls"><div className="engine-state"><span className={`engine-pulse ${engineRunning && !paused && !killSwitch ? "running" : ""}`} /><span><strong>{killSwitch ? "HALTED" : engineRunning ? (paused ? "PAPER ENGINE PAUSED" : "PAPER ENGINE RUNNING") : "PAPER ENGINE STANDBY"}</strong><small>{engineRunning ? "Candidate scan uses only executable public asks" : "Start the paper engine to scan signals"}</small></span></div><div className="control-buttons"><button className="button-primary" disabled={killSwitch || engineRunning} onClick={startEngine} type="button"><Play size={15} fill="currentColor" />{engineRunning ? "RUNNING" : "START PAPER ENGINE"}</button><button className={`button-secondary ${paused ? "button-warning" : ""}`} disabled={!engineRunning} onClick={togglePause} type="button"><Pause size={15} />{paused ? "RESUME" : "PAUSE NEW TRADES"}</button><button className="button-secondary" onClick={cancelOrders} type="button"><Ban size={15} />CLEAR QUEUE <span className="button-count">{account.openOrders}</span></button><button className="button-secondary" disabled={!account.positions.length} onClick={closePositions} type="button"><Wallet size={15} />CLOSE POSITIONS</button><button className="button-danger" onClick={triggerKillSwitch} type="button"><Zap size={15} />KILL SWITCH</button></div></section>
-        {view === "account" ? <AccountView account={connectedAccount} error={accountError} loading={accountLoading} onConnect={() => setAccountDialogOpen(true)} onDisconnect={disconnectAccount} onRefresh={() => void fetchConnectedAccount(accountConnection)} /> : view === "live" ? <LiveExecutionPanel candidateCount={liveCandidates.length} consent={liveConsent} killSwitch={killSwitch} marketCount={liveMarkets.length} onConsentChange={setLiveConsent} onKill={() => void killLiveExecutor()} onLink={() => setAccountDialogOpen(true)} onPause={toggleLivePause} onRefresh={() => void refreshLiveBalance()} onRiskChange={(patch) => setLiveRisk((current) => normalizeLiveRiskConfig({ ...current, ...patch }))} onStart={startLiveExecutor} paused={livePaused} risk={liveRisk} running={liveRunning} session={liveSession} status={liveStatus} /> : view !== "backtest" ? <><section className="metric-grid" aria-label="Paper account summary"><MetricCard label="TOTAL EQUITY" value={dollars(equity)} delta={signedDollars(todayPnl)} deltaTone={todayPnl >= 0 ? "positive" : "negative"} detail="vs. starting cash" icon={<CircleDollarSign size={17} />} spark={selectedTicks} /><MetricCard label="CASH" value={dollars(account.cash)} delta={`${account.positions.length} open`} deltaTone="neutral" detail="available balance" icon={<Wallet size={17} />} /><MetricCard label="SESSION P&L" value={signedDollars(todayPnl)} delta={`${account.fills.length} fills`} deltaTone={todayPnl >= 0 ? "positive" : "negative"} detail="paper ledger" icon={todayPnl >= 0 ? <TrendingUp size={17} /> : <TrendingDown size={17} />} spark={selectedTicks} /><MetricCard label="UNREALIZED" value={signedDollars(unrealized)} delta={`${account.positions.length} positions`} deltaTone={unrealized >= 0 ? "positive" : "negative"} detail="marked to bid" icon={<Activity size={17} />} /><MetricCard label="REALIZED P&L" value={signedDollars(account.realizedPnl)} delta={`${account.closedTrades.length} closed`} deltaTone={account.realizedPnl >= 0 ? "positive" : "negative"} detail="after recorded fees" icon={<Target size={17} />} /><MetricCard label="FEES" value={dollars(account.fees)} delta={`${(config.feeRate * 100).toFixed(2)}% model`} deltaTone="neutral" detail="configured cost" icon={<CircleDot size={17} />} /><MetricCard label="DRAWDOWN" value={percentage(maxDrawdown)} delta={maxDrawdown <= config.maxLoss ? "within limit" : "halt threshold"} deltaTone={maxDrawdown <= config.maxLoss ? "positive" : "negative"} detail={`max ${percentage(config.maxLoss)} configured`} icon={<Gauge size={17} />} /><MetricCard label="WIN RATE" value={percentage(winRate)} delta={account.closedTrades.length ? `${account.closedTrades.length} settled` : "no settled trades"} deltaTone="neutral" detail="paper ledger only" icon={<ShieldCheck size={17} />} /></section>
+        {view === "account" ? <AccountView account={connectedAccount} error={accountError} loading={accountLoading} onConnect={() => setAccountDialogOpen(true)} onDisconnect={disconnectAccount} onRefresh={() => void fetchConnectedAccount(accountConnection)} /> : view === "live" ? <LiveExecutionPanel candidateCount={liveCandidates.length} clock={clock} consent={liveConsent} killSwitch={killSwitch} manualBusy={manualOrderBusy} manualPositions={manualPositions} marketCount={liveMarkets.length} markets={liveMarkets} onConsentChange={setLiveConsent} onKill={() => void killLiveExecutor()} onLink={() => setAccountDialogOpen(true)} onManualEntry={(marketId, side, stakeUsd) => void submitManualEntry(marketId, side, stakeUsd)} onManualExit={(position, marketId, side, amount, bid) => void submitManualExit(position, marketId, side, amount, bid)} onPause={toggleLivePause} onRefresh={() => void refreshLiveBalance()} onRiskChange={(patch) => setLiveRisk((current) => normalizeLiveRiskConfig({ ...current, ...patch }))} onStart={startLiveExecutor} paused={livePaused} risk={liveRisk} running={liveRunning} session={liveSession} status={liveStatus} /> : view !== "backtest" ? <><section className="metric-grid" aria-label="Paper account summary"><MetricCard label="TOTAL EQUITY" value={dollars(equity)} delta={signedDollars(todayPnl)} deltaTone={todayPnl >= 0 ? "positive" : "negative"} detail="vs. starting cash" icon={<CircleDollarSign size={17} />} spark={selectedTicks} /><MetricCard label="CASH" value={dollars(account.cash)} delta={`${account.positions.length} open`} deltaTone="neutral" detail="available balance" icon={<Wallet size={17} />} /><MetricCard label="SESSION P&L" value={signedDollars(todayPnl)} delta={`${account.fills.length} fills`} deltaTone={todayPnl >= 0 ? "positive" : "negative"} detail="paper ledger" icon={todayPnl >= 0 ? <TrendingUp size={17} /> : <TrendingDown size={17} />} spark={selectedTicks} /><MetricCard label="UNREALIZED" value={signedDollars(unrealized)} delta={`${account.positions.length} positions`} deltaTone={unrealized >= 0 ? "positive" : "negative"} detail="marked to bid" icon={<Activity size={17} />} /><MetricCard label="REALIZED P&L" value={signedDollars(account.realizedPnl)} delta={`${account.closedTrades.length} closed`} deltaTone={account.realizedPnl >= 0 ? "positive" : "negative"} detail="after recorded fees" icon={<Target size={17} />} /><MetricCard label="FEES" value={dollars(account.fees)} delta={`${(config.feeRate * 100).toFixed(2)}% model`} deltaTone="neutral" detail="configured cost" icon={<CircleDot size={17} />} /><MetricCard label="DRAWDOWN" value={percentage(maxDrawdown)} delta={maxDrawdown <= config.maxLoss ? "within limit" : "halt threshold"} deltaTone={maxDrawdown <= config.maxLoss ? "positive" : "negative"} detail={`max ${percentage(config.maxLoss)} configured`} icon={<Gauge size={17} />} /><MetricCard label="WIN RATE" value={percentage(winRate)} delta={account.closedTrades.length ? `${account.closedTrades.length} settled` : "no settled trades"} deltaTone="neutral" detail="paper ledger only" icon={<ShieldCheck size={17} />} /></section>
           <section className="section-heading"><div><div className="eyebrow">PUBLIC MARKET DISCOVERY</div><h2>Active short-duration markets</h2></div><div className="section-heading-right"><span className="last-tick">{filteredMarkets.length ? `${filteredMarkets.length} markets` : "no markets"}</span><span className="last-tick"><span className={`status-dot ${dataStatus === "ready" ? "status-ready" : "status-warning"}`} />{lastUpdated ? formatAge(lastUpdated, clock) : "no tick"}</span><div className="filter-tabs" role="tablist" aria-label="Market duration">{(["ALL", "5m", "15m"] as const).map((filter) => <button aria-selected={durationFilter === filter} className={durationFilter === filter ? "filter-tab active" : "filter-tab"} key={filter} onClick={() => setDurationFilter(filter)} role="tab" type="button">{filter}</button>)}</div><button className="icon-button" disabled={refreshing} onClick={() => void refreshMarkets()} title="Refresh public market discovery" type="button">{refreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}</button></div></section>
           {dataStatus === "error" ? <div className="data-alert"><AlertTriangle size={16} /><div><strong>Public data unavailable</strong><span>{dataError}</span></div><button onClick={() => void refreshMarkets()} type="button">Retry</button></div> : null}{dataStatus === "ready" && !filteredMarkets.length ? <EmptyState title="No eligible markets right now" detail={dataError || "Gamma returned no active crypto markets matching the 5m/15m filters. The engine will keep checking; it will not fabricate quotes."} action={<button className="button-secondary" onClick={() => void refreshMarkets()} type="button"><RefreshCw size={14} />Refresh public feed</button>} /> : null}
           <section className="market-layout">{filteredMarkets.length ? <div className="market-grid" aria-label="Public markets">{filteredMarkets.map((market) => <MarketCard key={market.id} clock={clock} config={config} market={market} onSelect={() => setSelectedMarketId(market.id)} selected={selectedMarket?.id === market.id} />)}</div> : <div />}{selectedMarket && selectedSignal ? <aside className="panel signal-panel" aria-label="Selected market signal">

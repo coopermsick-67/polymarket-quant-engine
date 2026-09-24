@@ -93,6 +93,19 @@ export type FillResult = {
   levels: number;
 };
 
+export type SidePriceEstimate = {
+  bestAsk: number | null;
+  averagePrice: number | null;
+  costPerShare: number | null;
+  grossEdgeAtBestAsk: number | null;
+  /** Raw candle-model edge after the same depth walk, fee, and slippage. */
+  rawModelNetEdge: number | null;
+  /** Portion of all-in cost attributable to fees per share. */
+  feePerShare: number | null;
+  netEdge: number | null;
+  fill: FillResult | null;
+};
+
 export type MarketSignal = {
   action: PaperSide | "PASS";
   tier: "LOCK" | "ENTRY" | "PASS";
@@ -100,7 +113,7 @@ export type MarketSignal = {
   biasConfidence: number | null;
   /** Compatibility field; this is a directional heuristic score, not a calibrated win probability. */
   confidence: number | null;
-  /** Market-anchored P(UP); every edge in this signal is priced against it. */
+  /** Candle probability blended with the book midpoint; every displayed net edge uses this. */
   fairUp: number | null;
   /** Unanchored candle-model P(UP), shown for transparency only. */
   rawModelUp: number | null;
@@ -111,7 +124,9 @@ export type MarketSignal = {
   microScore: number | null;
   executableCostProbability: number | null;
   expectedNetProfitUsd: number | null;
+  /** Net probability edge at the requested budget after book walk, fee estimate and slippage. */
   upEdge: number | null;
+  /** Net probability edge at the requested budget after book walk, fee estimate and slippage. */
   downEdge: number | null;
   entryPrice: number | null;
   edge: number | null;
@@ -342,6 +357,36 @@ const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: Co
 
 const isBookFreshForExecution = (book: OrderBook | null, now = Date.now()): book is OrderBook =>
   Boolean(book && book.timestamp !== null && book.timestamp <= now + 30_000 && now - book.timestamp <= MAX_ORDER_BOOK_AGE_MS);
+
+/**
+ * Quote one side at the requested cash size. `netEdge` compares blended fair
+ * probability with the estimated all-in cost per share; it is unavailable if
+ * the visible ask ladder cannot fill that size. The caller must also enforce
+ * market data freshness before presenting it as actionable.
+ */
+export const estimateSidePrice = (
+  market: LiveMarket,
+  side: PaperSide,
+  costs: CostConfig,
+  budget: number,
+  fairUp = anchoredFairUp(market),
+): SidePriceEstimate => {
+  const bestAsk = bestAskFor(market, side);
+  const fairProbability = fairUp === null ? null : side === "UP" ? fairUp : 1 - fairUp;
+  const rawModelProbability = market.fairUp === null ? null : side === "UP" ? market.fairUp : 1 - market.fairUp;
+  const fill = walkAsks(market, side, budget, costs);
+  const costPerShare = fill && fill.shares > 0 ? fill.totalCost / fill.shares : null;
+  return {
+    bestAsk,
+    averagePrice: fill?.price ?? null,
+    costPerShare,
+    grossEdgeAtBestAsk: fairProbability !== null && bestAsk !== null ? fairProbability - bestAsk : null,
+    rawModelNetEdge: rawModelProbability !== null && costPerShare !== null ? rawModelProbability - costPerShare : null,
+    feePerShare: fill && fill.shares > 0 ? fill.fee / fill.shares : null,
+    netEdge: fairProbability !== null && costPerShare !== null ? fairProbability - costPerShare : null,
+    fill,
+  };
+};
 
 const walkBids = (market: LiveMarket, side: PaperSide, requestedShares: number, costs: CostConfig, now = Date.now()): FillResult | null => {
   const book = orderBookFor(market, side);
@@ -968,8 +1013,8 @@ const passSignal = (reason: string, stats5m: ChartTrendStats | null = null, stat
   biasConfidence: read.confidence,
   confidence: null,
   fairUp,
-  rawModelUp: market?.fairUp ?? null,
-  marketProbabilityUp: market ? marketImpliedProbabilityUp(market) : null,
+  rawModelUp: fairUp === null ? null : market?.fairUp ?? null,
+  marketProbabilityUp: fairUp === null || !market ? null : marketImpliedProbabilityUp(market),
   modelUncertainty: market ? modelUncertainty(market, stats5m, stats15m, read) : 1,
   microScore: read.microScore,
   executableCostProbability: null,
@@ -1000,11 +1045,11 @@ export const analyzeMarketSignal = (
   const read = directionalRead(market, stats5m, stats15m, now);
   const comparePrices = (fairUp: number | null) => {
     if (fairUp === null) return { upEdge: null, downEdge: null };
-    const upFill = walkAsks(market, "UP", budget, costs);
-    const downFill = walkAsks(market, "DOWN", budget, costs);
+    const up = estimateSidePrice(market, "UP", costs, budget, fairUp);
+    const down = estimateSidePrice(market, "DOWN", costs, budget, fairUp);
     return {
-      upEdge: upFill ? fairUp - upFill.totalCost / upFill.shares : null,
-      downEdge: downFill ? 1 - fairUp - downFill.totalCost / downFill.shares : null,
+      upEdge: up.netEdge,
+      downEdge: down.netEdge,
     };
   };
   const anchoredUp = anchoredFairUp(market);
@@ -1013,7 +1058,7 @@ export const analyzeMarketSignal = (
     return passSignal(reason, stats5m, stats15m, fairUp, read, comparison.upEdge, comparison.downEdge, market);
   };
   const freshnessIssue = marketDataFreshnessIssue(market, now);
-  if (freshnessIssue) return pass(freshnessIssue);
+  if (freshnessIssue) return pass(freshnessIssue, null);
 
   if (!stats5m || !stats15m) {
     const reason = !market.chart5m.length && !market.chart15m.length

@@ -1,8 +1,10 @@
 "use client";
 
-import { AlertTriangle, Check, LockKeyhole, Pause, Play, RefreshCw, ShieldCheck, SlidersHorizontal, Wallet, X, Zap } from "lucide-react";
-import type { Horizon } from "../lib/polymarket-data";
-import type { LiveRiskConfig } from "../lib/live-risk";
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, Check, LockKeyhole, Pause, Play, RefreshCw, ShieldCheck, SlidersHorizontal, Wallet, X, Zap } from "lucide-react";
+import { useState } from "react";
+import type { Horizon, LiveMarket } from "../lib/polymarket-data";
+import { analyzeMarketSignal, estimateSidePrice, marketDataFreshnessIssue, type PaperSide } from "../lib/engines";
+import { computeKellySizing, enforceLiveExecutionRisk, liveUnitUsd, type LiveRiskConfig } from "../lib/live-risk";
 
 export type LiveSessionState = {
   connected: boolean;
@@ -21,6 +23,14 @@ export type LiveExecutionStatus = {
   lastLatencyMs: number | null;
 };
 
+export type LivePositionBrief = { id: string; tokenID: string | null; conditionId: string | null; title: string; outcome: string; size: number | null; averagePrice: number | null };
+
+export type ManualLivePosition = LivePositionBrief & {
+  market: LiveMarket;
+  side: PaperSide;
+  bid: number | null;
+};
+
 type Props = {
   session: LiveSessionState | null;
   running: boolean;
@@ -31,6 +41,12 @@ type Props = {
   marketCount: number;
   candidateCount: number;
   status: LiveExecutionStatus;
+  clock: number;
+  markets: LiveMarket[];
+  manualPositions: ManualLivePosition[];
+  manualBusy: boolean;
+  onManualEntry: (marketId: string, side: PaperSide, stakeUsd: number) => void;
+  onManualExit: (position: LivePositionBrief, marketId: string, side: PaperSide, amount: number, bid: number | null) => void;
   onLink: () => void;
   onStart: () => void;
   onPause: () => void;
@@ -45,6 +61,7 @@ const money = (value: number | null | undefined) => value === null || value === 
   : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
 
 const percent = (value: number) => (value * 100).toFixed(value < 0.01 ? 2 : 1) + "%";
+const cents = (value: number) => `${(value * 100).toFixed(1)}¢`;
 
 const sessionTime = (expiresAt: number | null) => {
   if (!expiresAt) return "—";
@@ -52,11 +69,51 @@ const sessionTime = (expiresAt: number | null) => {
   return Math.floor(seconds / 60) + "m " + String(seconds % 60).padStart(2, "0") + "s";
 };
 
-export default function LiveExecutionPanel({ session, running, paused, consent, killSwitch, risk, marketCount, candidateCount, status, onLink, onStart, onPause, onKill, onRefresh, onConsentChange, onRiskChange }: Props) {
+export default function LiveExecutionPanel({ session, running, paused, consent, killSwitch, risk, marketCount, candidateCount, status, clock, markets, manualPositions, manualBusy, onManualEntry, onManualExit, onLink, onStart, onPause, onKill, onRefresh, onConsentChange, onRiskChange }: Props) {
+  const [selectedMarketId, setSelectedMarketId] = useState("");
+  const [selectedSide, setSelectedSide] = useState<PaperSide>("UP");
+  const [stakeInput, setStakeInput] = useState("1.00");
+  const [exitAmounts, setExitAmounts] = useState<Record<string, string>>({});
   const baseUnit = session?.balance === null || session?.balance === undefined ? null : session.balance * risk.unitBalancePct;
   const exposureCap = session?.balance === null || session?.balance === undefined ? null : session.balance * risk.maxExposurePct;
   const maxStake = Math.min(risk.maxTradeUsd, exposureCap ?? risk.maxTradeUsd);
   const canStart = Boolean(session?.connected && consent && !running && !killSwitch);
+  const liveRisk = enforceLiveExecutionRisk(risk);
+  const selectedMarket = markets.find((market) => market.id === selectedMarketId) ?? markets[0] ?? null;
+  const stakeUsd = Number(stakeInput);
+  const manualSignal = selectedMarket && Number.isFinite(stakeUsd) && stakeUsd > 0
+    ? analyzeMarketSignal(selectedMarket, { feeRate: liveRisk.feeRate, slippageBps: liveRisk.slippageBps }, stakeUsd, liveRisk.minEdge, clock)
+    : null;
+  const marketFreshnessIssue = selectedMarket ? marketDataFreshnessIssue(selectedMarket, clock) : "No active market is available.";
+  const upQuote = selectedMarket && manualSignal
+    ? estimateSidePrice(selectedMarket, "UP", { feeRate: liveRisk.feeRate, slippageBps: liveRisk.slippageBps }, stakeUsd, manualSignal.fairUp)
+    : null;
+  const downQuote = selectedMarket && manualSignal
+    ? estimateSidePrice(selectedMarket, "DOWN", { feeRate: liveRisk.feeRate, slippageBps: liveRisk.slippageBps }, stakeUsd, manualSignal.fairUp)
+    : null;
+  const selectedQuote = selectedSide === "UP" ? upQuote : downQuote;
+  const selectedProbability = manualSignal?.fairUp === null || !manualSignal
+    ? null
+    : selectedSide === "UP" ? manualSignal.fairUp : 1 - manualSignal.fairUp;
+  const sizing = selectedProbability !== null && selectedQuote !== null && selectedQuote.costPerShare !== null && session?.balance !== null && session?.balance !== undefined
+    ? computeKellySizing(selectedProbability, selectedQuote.costPerShare, session.balance, liveRisk)
+    : null;
+  const maxManualStake = session?.balance === null || session?.balance === undefined ? 0 : liveUnitUsd(session.balance, liveRisk);
+  const selectedPosition = selectedMarket ? manualPositions.find((position) => position.market.id === selectedMarket.id) : undefined;
+  const canManualEnter = Boolean(session?.connected && selectedMarket && !running && !paused && !manualBusy && !killSwitch
+    && session.openOrders === 0 && !selectedPosition && !marketFreshnessIssue && manualSignal?.fairUp !== null
+    && selectedQuote?.fill && selectedQuote.netEdge !== null && selectedQuote.netEdge >= liveRisk.minEdge
+    && selectedProbability !== null && sizing?.approved && stakeUsd >= 1 && stakeUsd <= maxManualStake + 1e-8
+    && sizing && stakeUsd <= sizing.stakeUsd + 1e-8);
+  const manualHoldReason = !session?.connected ? "Link the wallet and read its current collateral balance to enable manual orders."
+    : running || paused ? "Stop the live runner before placing manual orders."
+      : killSwitch ? "The kill switch is active; reset the paper risk halt first."
+        : session.openOrders > 0 ? "Cancel or reconcile the open CLOB order before manual entry."
+          : selectedPosition ? "A position already exists in this market; use the position panel to manage it."
+            : marketFreshnessIssue ?? (manualSignal?.fairUp === null || !manualSignal ? "The model probability is unavailable for this market." : null)
+              ?? (!selectedQuote?.fill ? "The visible ask ladder cannot fill this stake." : null)
+              ?? (selectedQuote?.netEdge === null || selectedQuote?.netEdge === undefined ? "The all-in quote is incomplete." : selectedQuote.netEdge < liveRisk.minEdge ? `Net edge is below the ${percent(liveRisk.minEdge)} live minimum.` : null)
+              ?? (!sizing?.approved ? sizing?.reason ?? "The bankroll cap blocks this stake." : stakeUsd < 1 ? "Live orders require at least $1." : stakeUsd > maxManualStake + 1e-8 ? `The current account unit is capped at ${money(maxManualStake)}.` : stakeUsd > (sizing?.stakeUsd ?? 0) + 1e-8 ? `Model sizing allows ${money(sizing?.stakeUsd ?? 0)} at most.` : null);
   const toggleDuration = (duration: Horizon) => {
     const enabled = risk.allowedDurations.includes(duration);
     const next = enabled ? risk.allowedDurations.filter((item) => item !== duration) : [...risk.allowedDurations, duration];
@@ -133,6 +190,68 @@ export default function LiveExecutionPanel({ session, running, paused, consent, 
               <div className="risk-note"><ShieldCheck size={15} /><span>Full Kelly is reduced by the selected fraction, then capped by unit size, max trade, exposure, balance, and a $1 minimum.</span></div>
             </article>
           </div>
+
+          <article className="panel manual-trading-panel">
+            <div className="panel-heading"><div><div className="eyebrow">MANUAL TRADING</div><h3>Model edge · your entries and exits</h3></div><span className="panel-footnote"><LockKeyhole size={13} /> Server rechecks each order</span></div>
+            <p className="manual-trading-intro">Choose UP or DOWN and size the order yourself. The card separates raw candle-model edge from the book-anchored edge used by the runner. Manual FAK orders may partially fill or not fill.</p>
+            {running ? <div className="manual-stop-note"><AlertTriangle size={15} />Stop the live runner before placing manual orders.</div> : null}
+            <div className="manual-trading-grid">
+              <div className="manual-entry-column">
+                <div className="manual-entry-controls">
+                  <label className="manual-select"><span>MARKET</span><select value={selectedMarket?.id ?? ""} onChange={(event) => setSelectedMarketId(event.target.value)}>{markets.map((market) => <option key={market.id} value={market.id}>{market.asset} {market.duration} · {market.question}</option>)}</select></label>
+                  <label className="manual-stake-input"><span>STAKE · MAX {money(maxManualStake)}</span><div><b>$</b><input inputMode="decimal" max={maxManualStake} min="1" onChange={(event) => setStakeInput(event.target.value)} step="0.25" type="number" value={stakeInput} /></div></label>
+                </div>
+                <div className="manual-reference-row"><span>TIME LEFT <b>{selectedMarket ? `${Math.floor(selectedMarket.remaining / 60).toString().padStart(2, "0")}:${String(selectedMarket.remaining % 60).padStart(2, "0")}` : "—"}</b></span><span>PRICE TO BEAT <b>{selectedMarket?.referenceVerified && selectedMarket.referenceSource === "POLYMARKET" ? money(selectedMarket.reference) : "pending exact tick"}</b></span><span>ORACLE NOW <b>{selectedMarket?.spotSource === "POLYMARKET" && selectedMarket.spotUpdatedAt !== null && clock - selectedMarket.spotUpdatedAt <= 10_000 ? money(selectedMarket.spot) : "stale"}</b></span></div>
+                <div className="manual-probability-grid">
+                  <div><span>RAW MODEL P(UP)</span><strong>{marketFreshnessIssue ? "—" : percent(selectedMarket?.fairUp ?? NaN)}</strong></div>
+                  <div><span>BOOK MID P(UP)</span><strong>{marketFreshnessIssue ? "—" : percent(manualSignal?.marketProbabilityUp ?? NaN)}</strong></div>
+                  <div><span>BOOK-ANCHORED P(UP)</span><strong>{marketFreshnessIssue ? "—" : percent(manualSignal?.fairUp ?? NaN)}</strong></div>
+                </div>
+                <div className="manual-side-tabs" role="tablist" aria-label="Manual position side">
+                  {(["UP", "DOWN"] as PaperSide[]).map((side) => {
+                    const quote = side === "UP" ? upQuote : downQuote;
+                    const active = selectedSide === side;
+                    return <button aria-selected={active} className={`${active ? "active " : ""}${side === "UP" ? "manual-up" : "manual-down"}`} key={side} onClick={() => setSelectedSide(side)} role="tab" type="button">{side === "UP" ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}{side}<b>{quote?.netEdge == null || marketFreshnessIssue ? "—" : `${(quote.netEdge * 100).toFixed(1)}pp`}</b></button>;
+                  })}
+                </div>
+                <div className="manual-quote-grid">
+                  {(["UP", "DOWN"] as PaperSide[]).map((side) => {
+                    const quote = side === "UP" ? upQuote : downQuote;
+                    const rawModelSide = selectedMarket?.fairUp === null || !selectedMarket ? null : side === "UP" ? selectedMarket.fairUp : 1 - selectedMarket.fairUp;
+                    const rawNet = quote?.rawModelNetEdge ?? null;
+                    return <div className={side === selectedSide ? "manual-quote-card selected" : "manual-quote-card"} key={side}>
+                      <span>{side} · BEST ASK {quote?.bestAsk == null || marketFreshnessIssue ? "—" : cents(quote.bestAsk)}</span>
+                      <strong className={rawNet === null || marketFreshnessIssue ? "text-muted" : rawNet >= 0 ? "text-positive" : "text-negative"}>RAW MODEL NET EDGE {rawNet === null || marketFreshnessIssue ? "—" : `${(rawNet * 100).toFixed(1)}pp`}</strong>
+                      <small>raw P {rawModelSide === null || marketFreshnessIssue ? "—" : percent(rawModelSide)} − all-in cost/share, at {money(stakeUsd)}</small>
+                      <small>average fill {quote?.averagePrice == null || marketFreshnessIssue ? "—" : cents(quote.averagePrice)} · all-in {quote?.costPerShare == null || marketFreshnessIssue ? "—" : cents(quote.costPerShare)} / share</small>
+                      <small>ask walk + slippage {quote?.averagePrice == null || quote.bestAsk == null || marketFreshnessIssue ? "—" : cents(Math.max(0, quote.averagePrice - quote.bestAsk))} · fee {quote?.feePerShare == null || marketFreshnessIssue ? "—" : cents(quote.feePerShare)} / share</small>
+                      <small className="manual-consensus-edge">BOOK-ANCHORED NET EDGE AT {money(stakeUsd)}: {quote?.netEdge == null || marketFreshnessIssue ? "—" : `${(quote.netEdge * 100).toFixed(1)}pp`}</small>
+                    </div>;
+                  })}
+                </div>
+                <div className="manual-entry-footer">
+                  <span>{manualHoldReason}</span>
+                  <button className="button-primary" disabled={!canManualEnter} onClick={() => selectedMarket && onManualEntry(selectedMarket.id, selectedSide, stakeUsd)} type="button">{manualBusy ? "SUBMITTING…" : `BUY ${selectedSide} · ${money(stakeUsd)}`}</button>
+                </div>
+                {selectedProbability !== null && sizing ? <div className="manual-sizing-note">Model stake cap {money(sizing.stakeUsd)} · account unit {money(maxManualStake)} · minimum edge {percent(liveRisk.minEdge)}. Server sizing can further reduce the order.</div> : null}
+              </div>
+              <div className="manual-position-column">
+                <div className="eyebrow">OPEN WALLET POSITIONS</div>
+                {!manualPositions.length ? <div className="manual-empty-position">No active UP/DOWN positions match current markets.</div> : manualPositions.map((position) => {
+                  const amount = Number(exitAmounts[position.tokenID ?? position.id] ?? String(position.size ?? 0));
+                  const validAmount = Number.isFinite(amount) && amount > 0 && amount <= (position.size ?? 0) + 1e-8;
+                  return <div className="manual-position-card" key={position.id}>
+                    <div className="manual-position-heading"><strong>{position.market.asset} {position.market.duration} · {position.side}</strong><span>{money(position.averagePrice)} entry</span></div>
+                    <div className="manual-position-market">{position.market.question}</div>
+                    <div className="manual-position-values"><span>SHARES <b>{(position.size ?? 0).toFixed(4)}</b></span><span>BEST BID <b>{position.bid === null ? "—" : cents(position.bid)}</b></span></div>
+                    <label className="manual-exit-input"><span>SHARES TO SELL</span><input inputMode="decimal" max={position.size ?? undefined} min="0.0001" onChange={(event) => setExitAmounts((current) => ({ ...current, [position.tokenID ?? position.id]: event.target.value }))} step="0.0001" type="number" value={exitAmounts[position.tokenID ?? position.id] ?? String(position.size ?? "")} /></label>
+                    <button className="button-secondary manual-sell-button" disabled={!session?.connected || running || paused || manualBusy || killSwitch || !validAmount || position.bid === null} onClick={() => onManualExit(position, position.market.id, position.side, amount, position.bid)} type="button">{manualBusy ? "WORKING…" : `SELL ${validAmount ? amount.toFixed(4) : "—"} SHARES`}</button>
+                  </div>;
+                })}
+                <div className="manual-sizing-note">Manual sells use the current live bid and a slippage floor. Settlement or already-expired positions are handled in Account.</div>
+              </div>
+            </div>
+          </article>
 
           <article className="panel live-risk-card early-exit-card">
             <div className="panel-heading"><div><div className="eyebrow">MODEL-AWARE CASHOUT</div><h3>Protect profitable positions</h3></div><ShieldCheck size={17} className="heading-icon" /></div>

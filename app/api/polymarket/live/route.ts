@@ -4,6 +4,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 import { getChatGPTUser } from "../../../chatgpt-auth";
 import {
+  applyPolymarketPriceTicks,
   anchoredFairUp,
   buildLiveMarket,
   discoverCryptoMarkets,
@@ -11,7 +12,7 @@ import {
   fetchOrderBooks,
   fetchSpotPrices,
 } from "../../../lib/polymarket-data";
-import { analyzeMarketSignal, marketDataFreshnessIssue } from "../../../lib/engines";
+import { analyzeMarketSignal, estimateSidePrice, marketDataFreshnessIssue } from "../../../lib/engines";
 import { evaluateModelAwareExit } from "../../../lib/early-exit";
 import { assessLiveExposure, computeKellySizing, enforceLiveExecutionRisk, type LiveRiskConfig } from "../../../lib/live-risk";
 import {
@@ -26,6 +27,7 @@ import {
   type LiveSession,
 } from "../../../lib/polymarket-session";
 import { env } from "cloudflare:workers";
+import { readPolymarketPriceTicks } from "../../../lib/polymarket-price-stream";
 
 const CLOB_HOST = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
@@ -40,7 +42,7 @@ const activeLiveEntryKeys = new Map<string, symbol>();
 const VALID_TICK_SIZES = new Set(["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"]);
 const POSITION_PAGE_LIMIT = 100;
 
-type LiveAction = "connect" | "balance" | "positions" | "execute" | "exit" | "cancel-all" | "disconnect";
+type LiveAction = "connect" | "balance" | "positions" | "execute" | "manual-entry" | "exit" | "manual-exit" | "cancel-all" | "disconnect";
 type LiveRequest = {
   action?: unknown;
   walletAddress?: unknown;
@@ -49,6 +51,9 @@ type LiveRequest = {
   marketId?: unknown;
   tokenID?: unknown;
   amount?: unknown;
+  side?: unknown;
+  stakeUsd?: unknown;
+  minimumPrice?: unknown;
   confirmLive?: unknown;
   requestId?: unknown;
   config?: Partial<LiveRiskConfig>;
@@ -69,6 +74,7 @@ const json = (body: unknown, status = 200, extraHeaders: Record<string, string> 
 });
 
 const text = (value: unknown) => typeof value === "string" ? value.trim() : "";
+const dollars = (value: number) => `$${value.toFixed(2)}`;
 const record = (value: unknown): JsonRecord => value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 const finiteNumber = (value: unknown): number | null => {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -377,9 +383,9 @@ export async function POST(request: Request) {
   try { input = await request.json() as LiveRequest; } catch { return json({ ok: false, error: "Invalid JSON request." }, 400); }
 
   const action = text(input.action) as LiveAction;
-  if (!["connect", "balance", "positions", "execute", "exit", "cancel-all", "disconnect"].includes(action)) return json({ ok: false, error: "Unsupported live action." }, 400);
+  if (!["connect", "balance", "positions", "execute", "manual-entry", "exit", "manual-exit", "cancel-all", "disconnect"].includes(action)) return json({ ok: false, error: "Unsupported live action." }, 400);
   if (action === "disconnect") return json({ ok: true, status: "DISCONNECTED" }, 200, { "Set-Cookie": clearLiveSessionCookie(secureCookie) });
-  if ((action === "execute" || action === "exit") && !liveExecutionEnabled()) return json({ ok: false, status: "DISABLED", error: "Live order submissions are disabled. Set POLYMARKET_LIVE_EXECUTION_ENABLED=true only after the live prerequisites are explicitly enabled." }, 503);
+  if ((action === "execute" || action === "manual-entry" || action === "exit" || action === "manual-exit") && !liveExecutionEnabled()) return json({ ok: false, status: "DISABLED", error: "Live order submissions are disabled. Set POLYMARKET_LIVE_EXECUTION_ENABLED=true only after the live prerequisites are explicitly enabled." }, 503);
 
   if (action === "connect") {
     try {
@@ -426,13 +432,14 @@ export async function POST(request: Request) {
     }
   }
 
-  if (action === "exit") {
+  if (action === "exit" || action === "manual-exit") {
+    const manualExit = action === "manual-exit";
     const marketId = text(input.marketId);
     const tokenID = text(input.tokenID);
     const requestedShares = finiteNumber(input.amount);
     const risk = enforceLiveExecutionRisk(input.config);
     if (!marketId || !tokenID || requestedShares === null || requestedShares <= 0) return json({ ok: false, error: "A market id, token id, and positive share amount are required for an early exit." }, 400);
-    if (!risk.earlyExitEnabled) return json(pass("Model-aware early exits are disabled."));
+    if (!manualExit && !risk.earlyExitEnabled) return json(pass("Model-aware early exits are disabled."));
     const requestId = text(input.requestId) || `exit:${tokenID}:${Math.floor(Date.now() / 5_000)}`;
     const reservation = reserveLiveExit(gate.user.userId, requestId, tokenID);
     if (reservation.response) return json(reservation.response);
@@ -451,16 +458,21 @@ export async function POST(request: Request) {
         fetchSpotPrices([definition.asset]),
         fetchCandleHistories([definition.asset]),
       ]);
-      const market = buildLiveMarket(definition, books, spots, null, Date.now(), histories.get(definition.asset) ?? null);
-      const freshnessIssue = marketDataFreshnessIssue(market);
-      if (freshnessIssue) return json(pass(`Early exit blocked: ${freshnessIssue}`));
+      const now = Date.now();
+      let market = buildLiveMarket(definition, books, spots, null, now, histories.get(definition.asset) ?? null);
+      if (!manualExit) {
+        const ticks = definition.priceFeed === "UNSUPPORTED" || definition.startTime === null ? [] : await readPolymarketPriceTicks([{ asset: definition.asset, priceFeed: definition.priceFeed, startTime: definition.startTime }]);
+        market = applyPolymarketPriceTicks(market, ticks, Date.now());
+        const freshnessIssue = marketDataFreshnessIssue(market);
+        if (freshnessIssue) return json(pass(`Early exit blocked: ${freshnessIssue}`));
+      }
       const currentPrice = side === "UP" ? market.upBid : market.downBid;
-      const fairUp = anchoredFairUp(market);
+      const fairUp = manualExit ? null : anchoredFairUp(market);
       const fairProbability = fairUp === null ? null : side === "UP" ? fairUp : 1 - fairUp;
-      if (currentPrice === null || fairProbability === null) return json(pass("Current executable bid or model fair probability is unavailable."));
+      if (currentPrice === null || (!manualExit && fairProbability === null)) return json(pass("Current executable bid or model fair probability is unavailable."));
       const shares = Math.min(requestedShares, position.size);
-      const evaluation = evaluateModelAwareExit({ policy: risk, entryPrice: position.averagePrice, currentPrice, fairProbability, shares, feeRate: risk.feeRate, remainingSeconds: market.remaining });
-      if (!evaluation.shouldExit) return json(pass(evaluation.reason, { evaluation, market: { id: market.id, asset: market.asset, duration: market.duration, remaining: market.remaining } }));
+      const evaluation = manualExit ? null : evaluateModelAwareExit({ policy: risk, entryPrice: position.averagePrice, currentPrice, fairProbability: fairProbability!, shares, feeRate: risk.feeRate, remainingSeconds: market.remaining });
+      if (evaluation && !evaluation.shouldExit) return json(pass(evaluation.reason, { evaluation, market: { id: market.id, asset: market.asset, duration: market.duration, remaining: market.remaining } }));
       const openOrders = await client.getOpenOrders({ asset_id: tokenID }, true);
       if (openOrders.length) return json(pass("An open order already exists for this position; the early exit was not submitted.", { openOrders: openOrders.length }));
       const orderBook = await retryTransient(() => client.getOrderBook(tokenID));
@@ -472,7 +484,10 @@ export async function POST(request: Request) {
         .filter((price): price is number => price !== null && price > 0 && price < 1)
         .sort((left, right) => right - left)[0] ?? null;
       if (bestBid === null) return json(pass("The CLOB has no readable executable bid; the early exit was not submitted."));
-      const minimumExecutionPrice = ceilPriceToTick(bestBid * (1 - risk.slippageBps / 10_000), clobTickSize);
+      const slippageFloor = ceilPriceToTick(bestBid * (1 - risk.slippageBps / 10_000), clobTickSize);
+      const userMinimumPrice = finiteNumber(input.minimumPrice);
+      const requestedFloor = manualExit && userMinimumPrice !== null ? Math.max(slippageFloor ?? 0, ceilPriceToTick(userMinimumPrice, clobTickSize) ?? 0) : slippageFloor;
+      const minimumExecutionPrice = requestedFloor;
       if (minimumExecutionPrice === null || minimumExecutionPrice > bestBid || minimumExecutionPrice <= 0) {
         return json(pass("The current bid cannot satisfy the configured exit slippage bound; the early exit was not submitted.", { bestBid, minimumExecutionPrice }));
       }
@@ -491,8 +506,9 @@ export async function POST(request: Request) {
         market: { id: market.id, asset: market.asset, duration: market.duration, question: market.question, remaining: market.remaining, tokenID, side },
         evaluation,
         executionGuard: { bestBid, minimumExecutionPrice, slippageBps: risk.slippageBps },
-        sizing: { shares, netProfit: evaluation.netProfit, modelGap: evaluation.modelGap },
+        sizing: evaluation ? { shares, netProfit: evaluation.netProfit, modelGap: evaluation.modelGap } : { shares },
         order: { success: response.success, orderID: response.orderID, status: response.status, errorMsg: response.errorMsg, makingAmount: response.makingAmount, takingAmount: response.takingAmount, transactionsHashes: response.transactionsHashes ?? [], tradeIDs: response.tradeIDs ?? [] },
+        manual: manualExit,
       });
     } catch (error) {
       if (submissionAttempted) return json({ ok: false, uncertain: true, error: `Early-exit state is uncertain; reconcile the account before retrying. ${errorMessage(error)}` }, 502);
@@ -502,8 +518,14 @@ export async function POST(request: Request) {
     }
   }
 
+  const manualEntry = action === "manual-entry";
   const marketId = text(input.marketId);
   if (!marketId) return json({ ok: false, error: "A market id is required for execution." }, 400);
+  const requestedManualSide = text(input.side).toUpperCase();
+  const manualSide = manualEntry && (requestedManualSide === "UP" || requestedManualSide === "DOWN") ? requestedManualSide as "UP" | "DOWN" : null;
+  if (manualEntry && !manualSide) return json({ ok: false, error: "Choose UP or DOWN for the manual entry." }, 400);
+  const requestedManualStake = manualEntry ? finiteNumber(input.stakeUsd) : null;
+  if (manualEntry && (requestedManualStake === null || requestedManualStake < 1)) return json({ ok: false, error: "Manual live entries must be at least $1." }, 400);
   const risk = enforceLiveExecutionRisk(input.config);
   const requestId = text(input.requestId) || `${marketId}:${Math.floor(Date.now() / 5_000)}`;
   const reservation = reserveLiveEntry(gate.user.userId, requestId, marketId);
@@ -537,16 +559,36 @@ export async function POST(request: Request) {
       fetchCandleHistories([definition.asset]),
     ]);
     const now = Date.now();
-    const market = buildLiveMarket(definition, books, spots, null, now, histories.get(definition.asset) ?? null);
+    const baseMarket = buildLiveMarket(definition, books, spots, null, now, histories.get(definition.asset) ?? null);
+    const oracleTicks = definition.priceFeed === "UNSUPPORTED" || definition.startTime === null ? [] : await readPolymarketPriceTicks([{ asset: definition.asset, priceFeed: definition.priceFeed, startTime: definition.startTime }]);
+    const market = applyPolymarketPriceTicks(baseMarket, oracleTicks, Date.now());
     if (market.remaining < MIN_LIVE_REMAINING_SECONDS) return json(pass("Too little time remains for a fresh live entry.", { remaining: market.remaining }));
-    const signal = analyzeMarketSignal(market, { feeRate: risk.feeRate, slippageBps: risk.slippageBps }, Math.min(risk.maxTradeUsd, balance), risk.minEdge);
-    const probability = signal.action === "UP" ? signal.fairUp : signal.action === "DOWN" && signal.fairUp !== null ? 1 - signal.fairUp : null;
-    if (signal.action === "PASS" || probability === null || signal.entryPrice === null || signal.edge === null) return json(pass(signal.reason, { signal, balance, market: { id: market.id, asset: market.asset, duration: market.duration, remaining: market.remaining } }));
-    if (risk.requireLock && signal.tier !== "LOCK") return json(pass("Live execution requires a LOCK signal under the current risk policy.", { signal, balance }));
+    const manualBudget = requestedManualStake ?? Math.min(risk.maxTradeUsd, balance);
+    const signal = analyzeMarketSignal(market, { feeRate: risk.feeRate, slippageBps: risk.slippageBps }, manualEntry ? manualBudget : Math.min(risk.maxTradeUsd, balance), risk.minEdge, Date.now());
+    const selectedSide = manualEntry ? manualSide : signal.action === "PASS" ? null : signal.action;
+    const manualQuote = manualEntry && selectedSide ? estimateSidePrice(market, selectedSide, { feeRate: risk.feeRate, slippageBps: risk.slippageBps }, manualBudget, signal.fairUp) : null;
+    const selectedProbability = selectedSide === null || signal.fairUp === null ? null : selectedSide === "UP" ? signal.fairUp : 1 - signal.fairUp;
+    const selectedCostPerShare = manualEntry ? manualQuote?.costPerShare ?? null : signal.executableCostProbability;
+    const selectedEdge = manualEntry ? manualQuote?.netEdge ?? null : signal.edge;
+    const selectedEntryPrice = manualEntry ? manualQuote?.averagePrice ?? null : signal.entryPrice;
+    if (manualEntry) {
+      const freshnessIssue = marketDataFreshnessIssue(market, Date.now());
+      if (freshnessIssue) return json(pass(`Manual order blocked: ${freshnessIssue}`, { signal, balance }));
+      if (selectedProbability === null || selectedCostPerShare === null || selectedEdge === null || selectedEntryPrice === null || !manualQuote?.fill) {
+        return json(pass("The selected side does not have a complete executable quote at that size.", { signal, balance, side: selectedSide, quote: manualQuote }));
+      }
+      if (selectedEdge < risk.minEdge) return json(pass(`The selected ${selectedSide} net edge is ${Math.round(selectedEdge * 1000) / 10}%, below the server minimum of ${Math.round(risk.minEdge * 1000) / 10}%.`, { signal, balance, side: selectedSide, quote: manualQuote }));
+    } else {
+      if (signal.action === "PASS" || selectedProbability === null || selectedEntryPrice === null || signal.edge === null || selectedCostPerShare === null) return json(pass(signal.reason, { signal, balance, market: { id: market.id, asset: market.asset, duration: market.duration, remaining: market.remaining } }));
+      if (risk.requireLock && signal.tier !== "LOCK") return json(pass("Live execution requires a LOCK signal under the current risk policy.", { signal, balance }));
+    }
 
-    const sizing = computeKellySizing(probability, signal.entryPrice, balance, risk);
+    const sizing = computeKellySizing(selectedProbability!, selectedCostPerShare!, balance, risk);
+    if (manualEntry && requestedManualStake! > sizing.stakeUsd + 1e-8) {
+      return json(pass(`The selected stake exceeds the current model or bankroll cap of ${dollars(sizing.stakeUsd)}. Lower the manual size to continue.`, { signal, sizing, balance, side: selectedSide, quote: manualQuote }));
+    }
     if (!sizing.approved) return json(pass(sizing.reason, { signal, sizing, balance }));
-    const tokenID = signal.action === "UP" ? definition.upTokenId : definition.downTokenId;
+    const tokenID = selectedSide === "UP" ? definition.upTokenId : definition.downTokenId;
     const existingExposureUsd = positions.reduce((total, position) => total + position.exposureUsd, 0);
     const exposure = assessLiveExposure(balance, existingExposureUsd, sizing.stakeUsd, risk);
     if (!exposure.approved) return json(pass(exposure.reason, { signal, sizing, exposure, balance }));
@@ -563,7 +605,7 @@ export async function POST(request: Request) {
       .sort((left, right) => left - right)[0] ?? null;
     if (bestAsk === null) return json(pass("The CLOB has no readable executable ask; the live order was not submitted.", { signal, sizing, exposure }));
     const slippageCeiling = bestAsk * (1 + risk.slippageBps / 10_000);
-    const maximumExecutionPrice = floorPriceToTick(Math.min(signal.entryPrice, slippageCeiling), clobTickSize);
+    const maximumExecutionPrice = floorPriceToTick(Math.min(selectedEntryPrice!, slippageCeiling), clobTickSize);
     if (maximumExecutionPrice === null || maximumExecutionPrice < bestAsk || maximumExecutionPrice >= 1) {
       return json(pass("The current ask exceeds the model price or configured slippage bound; the live order was not submitted.", { signal, sizing, exposure, bestAsk, maximumExecutionPrice }));
     }
@@ -579,10 +621,12 @@ export async function POST(request: Request) {
       latencyMs: Date.now() - startedAt,
       balanceBefore: balance,
       balanceAfter: afterBalance,
-      market: { id: market.id, asset: market.asset, duration: market.duration, question: market.question, remaining: market.remaining, tokenID, side: signal.action },
+      market: { id: market.id, asset: market.asset, duration: market.duration, question: market.question, remaining: market.remaining, tokenID, side: selectedSide },
       signal,
       sizing,
       exposure,
+      manual: manualEntry,
+      quote: manualQuote,
       executionGuard: { bestAsk, maximumExecutionPrice, slippageBps: risk.slippageBps },
       order: { success: response.success, orderID: response.orderID, status: response.status, errorMsg: response.errorMsg, makingAmount: response.makingAmount, takingAmount: response.takingAmount, transactionsHashes: response.transactionsHashes ?? [], tradeIDs: response.tradeIDs ?? [] },
     });

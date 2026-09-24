@@ -146,20 +146,29 @@ export const enforceLiveExecutionRisk = (input: Partial<LiveRiskConfig> | null |
   };
 };
 
+/** A $1 micro-account unit supports the venue minimum while keeping entries small. */
+export const liveUnitUsd = (balance: number, config: LiveRiskConfig): number => {
+  const safeBalance = Math.max(0, finite(balance, 0));
+  const percentUnit = safeBalance <= 100 ? Math.min(1, safeBalance * 0.05) : safeBalance * config.unitBalancePct;
+  return Math.min(percentUnit, config.maxTradeUsd, safeBalance * config.maxExposurePct, safeBalance);
+};
+
 export const computeKellySizing = (
   probability: number,
-  entryPrice: number,
+  allInCostPerShare: number,
   balance: number,
   config: LiveRiskConfig,
 ): KellySizing => {
   const safeBalance = Math.max(0, finite(balance, 0));
   const safeProbability = clamp(finite(probability, 0), 0, 1);
-  const safeEntry = clamp(finite(entryPrice, 1), 0.001, 0.999);
-  const executionMultiplier = (1 + config.slippageBps / 10_000) * (1 + config.feeRate);
-  const effectivePrice = clamp(safeEntry * executionMultiplier, 0.001, 0.999);
+  // Callers supply the already walked, fee-inclusive, slippage-adjusted cost.
+  // Applying config costs again here double-counted execution costs and made
+  // the Kelly stake disagree with the net edge shown by the signal engine.
+  const safeEntry = clamp(finite(allInCostPerShare, 1), 0.001, 0.999);
+  const effectivePrice = safeEntry;
   const fullKelly = Math.max(0, (safeProbability - effectivePrice) / (1 - effectivePrice));
   const kellyStakeUsd = safeBalance * fullKelly * config.kellyFraction;
-  const baseUnitUsd = safeBalance * config.unitBalancePct;
+  const baseUnitUsd = liveUnitUsd(safeBalance, config);
   const requestedStakeUsd = Math.min(baseUnitUsd * config.unitsPerTrade, config.maxTradeUsd);
   const exposureCapUsd = safeBalance * config.maxExposurePct;
   const stakeUsd = Math.max(0, Math.min(kellyStakeUsd, requestedStakeUsd, exposureCapUsd, safeBalance));

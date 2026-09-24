@@ -159,3 +159,42 @@ export const subscribePolymarketPrices = (
   connect();
   return stop;
 };
+
+/** Collect a bounded snapshot for a single server-side order preflight. */
+export const readPolymarketPriceTicks = (
+  markets: readonly { asset: Asset; priceFeed: PolymarketPriceTick["priceFeed"]; startTime: number }[],
+  timeoutMs = 3_000,
+  signal?: AbortSignal,
+): Promise<PolymarketPriceTick[]> => {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Oracle read aborted."));
+  if (!markets.length) return Promise.resolve([]);
+  return new Promise((resolve, reject) => {
+    const ticks = new Map<string, PolymarketPriceTick>();
+    let stop: () => void = () => undefined;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let complete = false;
+    const finish = (error?: unknown) => {
+      if (complete) return;
+      complete = true;
+      if (timer !== null) clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      stop();
+      if (error) reject(error);
+      else resolve([...ticks.values()]);
+    };
+    const abort = () => finish(signal?.reason ?? new Error("Oracle read aborted."));
+    timer = setTimeout(() => finish(), Math.max(500, timeoutMs));
+    signal?.addEventListener("abort", abort, { once: true });
+    stop = subscribePolymarketPrices([...new Set(markets.map((market) => market.asset))], (batch) => {
+      for (const tick of batch) ticks.set(`${tick.asset}:${tick.priceFeed}:${tick.timestamp}`, tick);
+      const now = Date.now();
+      const ready = markets.every((market) => {
+        const rows = [...ticks.values()].filter((tick) => tick.asset === market.asset && tick.priceFeed === market.priceFeed);
+        const opening = rows.some((tick) => tick.timestamp === market.startTime);
+        const current = rows.some((tick) => tick.timestamp >= now - 10_000 && tick.timestamp <= now + 1_000);
+        return opening && current;
+      });
+      if (ready) finish();
+    }, undefined, signal);
+  });
+};

@@ -115,6 +115,17 @@ The CSV needs timestamps, market IDs, duration, an explicit matching `model_vers
 
 The replay reports bankroll-specific trades, returns when settled, fees, slippage assumptions, exposure, minimum-order rejections, and probability buckets. When ask-level snapshots are present, it walks those levels separately for each bankroll and resizes against the resulting VWAP. Rows without a ladder use a fixed recorded entry price or the top ask plus configured slippage, so their price impact cannot be inferred. Liquidation equity uses each recorded top bid and bid depth with the flat exit-fee approximation; missing executable bid depth is valued at zero. Sparse rows cannot reproduce a full order-book exit or continuous intramarket drawdown. Its walk-forward probability adjustment waits for at least 200 previously resolved markets overall and 30 in the matching confidence bucket. Do not treat this replay as proof of live readiness.
 
+## Interactive terminal live trader
+
+The standalone `pnpm run live` command connects to the real Polymarket CLOB. It prompts for the wallet address and signature type, masks the private-key input, reads collateral/open orders/positions, then requires the exact word `YES` before scanning or placing anything. The key is kept in process memory and is not written to the trader state file. Use a trusted local terminal; never paste the key into chat, source control, command-line arguments, or an environment variable.
+
+```powershell
+pnpm install
+pnpm run live
+```
+
+The trader uses LOCK signals, a 4% minimum displayed net edge, FAK limit orders, a $1 micro-account unit up to $100 balance, a $5 maximum order, and a 10% total-exposure cap. It stops if an order result cannot be reconciled and writes a pending marker so restart cannot silently submit a duplicate. Press `Q` then Enter to stop. Live orders use real funds, can partially fill, and the uncalibrated model does not establish profitability; run paper history and independently reconcile every wallet/order assumption before opting in.
+
 ## Local environment
 
 Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by production live execution.
