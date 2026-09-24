@@ -294,7 +294,7 @@ if (requestedPaperStartingCash !== null) {
   await saveState(state);
   await rm(resetStartingCashFile, { force: true });
 }
-let lastCycleInMemory: number | null = state.lastCycleAt;
+let lastCycleInMemory: number | null = null;
 let lastMarketRefreshAt = 0;
 let marketRefreshInFlight = false;
 let resolutionCheckInFlight = false;
@@ -1363,10 +1363,6 @@ async function runCycle(): Promise<void> {
     log("WARN", "Paper trading cycle failed; no new entries were considered", { error: state.lastError });
   } finally {
     state.lastCycleAt = Date.now();
-    lastDecisionIntervalMs = lastCycleInMemory === null ? null : state.lastCycleAt - lastCycleInMemory;
-    lastDecisionDurationMs = state.lastCycleAt - cycleStartedAt;
-    if (lastDecisionDurationMs > decisionIntervalMs) decisionCycleOverruns += 1;
-    lastCycleInMemory = state.lastCycleAt;
     try {
       await latchStaleDataIfNeeded(state.lastCycleAt);
       assertPaperAccount(state.account);
@@ -1376,6 +1372,12 @@ async function runCycle(): Promise<void> {
       process.exitCode = 1;
       stopping = true;
     }
+    const cycleCompletedAt = Date.now();
+    state.lastCycleAt = cycleCompletedAt;
+    lastDecisionIntervalMs = lastCycleInMemory === null ? null : cycleCompletedAt - lastCycleInMemory;
+    lastDecisionDurationMs = cycleCompletedAt - cycleStartedAt;
+    if (lastDecisionDurationMs > decisionIntervalMs) decisionCycleOverruns += 1;
+    lastCycleInMemory = cycleCompletedAt;
   }
 }
 
