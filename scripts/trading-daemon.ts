@@ -71,6 +71,8 @@ const dashboardOrigins = new Set((process.env.PQE_DASHBOARD_ORIGINS ?? "")
   .filter(Boolean));
 const pollIntervalMs = integerSetting("POLL_INTERVAL_MS", 15_000, 5_000, 60_000);
 const staleAfterMs = integerSetting("DATA_STALE_HALT_MS", 90_000, 30_000, 600_000);
+const staleRecoveryCyclesRequired = integerSetting("DATA_STALE_RECOVERY_CYCLES", 3, 2, 10);
+const staleRecoveryMinimumMarkets = integerSetting("DATA_STALE_RECOVERY_MIN_MARKETS", 4, 1, 100);
 const paperStartingCash = numberSetting("PAPER_STARTING_CASH", 1_000, 1, 1_000_000_000);
 const paperMinBetUsd = numberSetting("PAPER_MIN_BET_USD", 1, 1, 100_000);
 const paperMinBetPct = numberSetting("PAPER_MIN_BET_PCT", 0.005, 0.005, 0.03);
@@ -253,6 +255,10 @@ let latestSignals: Array<{
 }> = [];
 let latestSignalsAt: number | null = null;
 let latestMarkets = new Map<string, LiveMarket>();
+let latestEligibleMarketCount = 0;
+let latestMarketDataIssues: Record<string, number> = {};
+let lastDataGapWarningAt = 0;
+let staleRecoveryHealthyCycles = 0;
 let coinbaseSocket: WebSocket | null = null;
 let clobSocket: WebSocket | null = null;
 let coinbaseConnected = false;
@@ -374,6 +380,16 @@ async function statusPayload() {
       lastUpdateAt: lastStreamUpdateAt,
       lastUpdateAgeMs: lastStreamUpdateAt === null ? null : Math.max(0, now - lastStreamUpdateAt),
       clobUpdateAgeMs: lastClobUpdateAt === null ? null : Math.max(0, now - lastClobUpdateAt),
+    },
+    dataQuality: {
+      eligibleMarkets: latestEligibleMarketCount,
+      usableMarkets: state.usableMarkets,
+      blockers: latestMarketDataIssues,
+    },
+    staleRecovery: {
+      healthyCycles: staleRecoveryHealthyCycles,
+      requiredCycles: staleRecoveryCyclesRequired,
+      minimumUsableMarkets: staleRecoveryMinimumMarkets,
     },
     reconciliation: "PASS",
   };
@@ -836,6 +852,27 @@ async function latchStaleDataIfNeeded(now: number): Promise<void> {
   }
 }
 
+async function recoverStaleDataHaltAfterFreshCycles(usableMarkets: number, portfolioMarkable: boolean): Promise<void> {
+  if (!await readFlag(staleHaltFile)) {
+    staleRecoveryHealthyCycles = 0;
+    return;
+  }
+  if (usableMarkets < staleRecoveryMinimumMarkets || !portfolioMarkable || state.lastError !== null) {
+    staleRecoveryHealthyCycles = 0;
+    return;
+  }
+  staleRecoveryHealthyCycles += 1;
+  if (staleRecoveryHealthyCycles < staleRecoveryCyclesRequired) return;
+
+  await rm(staleHaltFile, { force: true });
+  log("WARN", "Stale-data halt recovered after consecutive fresh market snapshots; other safety latches remain active.", {
+    healthyCycles: staleRecoveryHealthyCycles,
+    usableMarkets,
+    minimumUsableMarkets: staleRecoveryMinimumMarkets,
+  });
+  staleRecoveryHealthyCycles = 0;
+}
+
 async function runCycle(): Promise<void> {
   const now = Date.now();
   try {
@@ -848,6 +885,21 @@ async function runCycle(): Promise<void> {
     const markets = allMarkets.filter((market) => market.endTime > now);
     pruneTrackingMaps(markets);
     const usableMarkets = markets.filter((market) => marketHasFreshInputs(market, now));
+    const eligibleMarkets = markets.filter((market) => market.startTime !== null && market.startTime <= now && market.remaining >= 30);
+    const blockerCounts: Record<string, number> = {};
+    for (const market of eligibleMarkets) {
+      const issue = marketDataFreshnessIssue(market, now, { allowCoinbaseReferenceEstimate: true });
+      if (issue) blockerCounts[issue] = (blockerCounts[issue] ?? 0) + 1;
+    }
+    latestEligibleMarketCount = eligibleMarkets.length;
+    latestMarketDataIssues = blockerCounts;
+    if (eligibleMarkets.length > 0 && usableMarkets.length === 0 && now - lastDataGapWarningAt >= 60_000) {
+      lastDataGapWarningAt = now;
+      log("WARN", "No eligible paper market has a complete fresh snapshot.", {
+        eligibleMarkets: eligibleMarkets.length,
+        blockers: blockerCounts,
+      });
+    }
     const marketMap = new Map(markets.map((market) => [market.id, market]));
     latestMarkets = marketMap;
     ensureMarketStreams(markets);
@@ -893,6 +945,12 @@ async function runCycle(): Promise<void> {
     }
     await resolveExpiredPositions(now);
     if (stopping || shutdownController.signal.aborted) return;
+
+    const recoveryPortfolioMarkable = state.account.positions.every((position) => {
+      const positionMarket = marketMap.get(position.marketId);
+      return Boolean(positionMarket && marketHasFreshInputs(positionMarket, now));
+    });
+    await recoverStaleDataHaltAfterFreshCycles(usableMarkets.length, recoveryPortfolioMarkable);
 
     if (usableMarkets.length) {
       state.account = markAccount(state.account, marketMap, now);

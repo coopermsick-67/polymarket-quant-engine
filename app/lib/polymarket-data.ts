@@ -99,14 +99,20 @@ const CRYPTO_TAG_ID = "21";
 const GAMMA_PAGE_SIZE = 100;
 const GAMMA_MAX_PAGES = 12;
 const GAMMA_LOOKAHEAD_MS = 2 * 60 * 60 * 1000;
-const DISCOVERY_CACHE_MS = 15_000;
+const DISCOVERY_CACHE_MS = 60_000;
+const DISCOVERY_STALE_FALLBACK_MS = 120_000;
 const POLYMARKET_TIME_CACHE_MS = 15_000;
 const PUBLIC_REQUEST_TIMEOUT_MS = 15_000;
+const PUBLIC_REQUEST_RETRIES = 2;
+const PUBLIC_RETRY_AFTER_MAX_MS = 20_000;
 const CLOB_BATCH_SIZE = 500;
+const CLOB_FEE_LOOKUP_CONCURRENCY = 8;
+const CLOB_SINGLE_BOOK_FALLBACK_LIMIT = 32;
+const CLOB_SINGLE_BOOK_FALLBACK_CONCURRENCY = 4;
 const CANDLE_CACHE_MS = 60_000;
 const CANDLE_LOOKBACK_BARS = 100;
 const CLOB_FEE_CACHE_MS = 5 * 60_000;
-const CLOB_FEE_FALLBACK_CACHE_MS = 30_000;
+const CLOB_FEE_FALLBACK_CACHE_MS = CLOB_FEE_CACHE_MS;
 
 let polymarketClockOffsetMs = 0;
 let polymarketClockSyncedAt = 0;
@@ -393,24 +399,89 @@ const normalizeMarket = (raw: Record<string, unknown>, now = Date.now()): Market
   };
 };
 
-const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
-  const timeoutController = new AbortController();
-  const timeoutId = globalThis.setTimeout(() => timeoutController.abort(), PUBLIC_REQUEST_TIMEOUT_MS);
-  const upstreamSignal = init?.signal;
-  const abortRequest = () => timeoutController.abort();
-  if (upstreamSignal?.aborted) timeoutController.abort();
-  else upstreamSignal?.addEventListener("abort", abortRequest, { once: true });
+class PublicApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "PublicApiError";
+  }
+}
 
+const publicEndpoint = (url: string): string => {
   try {
-    const response = await fetch(url, { ...init, cache: "no-store", signal: timeoutController.signal });
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-    return await response.json() as T;
-  } catch (error) {
-    if (timeoutController.signal.aborted && !upstreamSignal?.aborted) throw new Error(`Public request timed out after ${PUBLIC_REQUEST_TIMEOUT_MS / 1000}s`);
-    throw error;
-  } finally {
-    globalThis.clearTimeout(timeoutId);
-    upstreamSignal?.removeEventListener("abort", abortRequest);
+    const parsed = new URL(url);
+    return `${parsed.host}${parsed.pathname}`;
+  } catch {
+    return url.split("?", 1)[0];
+  }
+};
+
+const retryAfterMs = (value: string | null): number | null => {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+};
+
+const waitForRetry = (milliseconds: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
+  if (signal?.aborted) {
+    reject(signal.reason ?? new Error("Public request aborted"));
+    return;
+  }
+  const timer = globalThis.setTimeout(() => {
+    signal?.removeEventListener("abort", abort);
+    resolve();
+  }, milliseconds);
+  const abort = () => {
+    globalThis.clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    reject(signal?.reason ?? new Error("Public request aborted"));
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+});
+
+const mapInBatches = async <T, R>(items: readonly T[], concurrency: number, mapper: (item: T) => Promise<R>): Promise<R[]> => {
+  const results: R[] = [];
+  for (let index = 0; index < items.length; index += concurrency) {
+    results.push(...await Promise.all(items.slice(index, index + concurrency).map(mapper)));
+  }
+  return results;
+};
+
+const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
+  const upstreamSignal = init?.signal ?? undefined;
+  const endpoint = publicEndpoint(url);
+  for (let attempt = 0; ; attempt += 1) {
+    const timeoutController = new AbortController();
+    const timeoutId = globalThis.setTimeout(() => timeoutController.abort(), PUBLIC_REQUEST_TIMEOUT_MS);
+    const abortRequest = () => timeoutController.abort();
+    if (upstreamSignal?.aborted) timeoutController.abort();
+    else upstreamSignal?.addEventListener("abort", abortRequest, { once: true });
+
+    try {
+      const response = await fetch(url, { ...init, cache: "no-store", signal: timeoutController.signal });
+      if (response.ok) return await response.json() as T;
+
+      const retryable = [408, 429, 500, 502, 503, 504].includes(response.status);
+      const serverDelay = retryAfterMs(response.headers.get("Retry-After"));
+      if (retryable && attempt < PUBLIC_REQUEST_RETRIES && (serverDelay === null || serverDelay <= PUBLIC_RETRY_AFTER_MAX_MS)) {
+        const delay = serverDelay ?? Math.round(350 * 2 ** attempt * (0.75 + Math.random() * 0.5));
+        await response.body?.cancel().catch(() => undefined);
+        globalThis.clearTimeout(timeoutId);
+        upstreamSignal?.removeEventListener("abort", abortRequest);
+        await waitForRetry(delay, upstreamSignal);
+        continue;
+      }
+      throw new PublicApiError(`${response.status} ${response.statusText} from ${endpoint}`, response.status);
+    } catch (error) {
+      if (timeoutController.signal.aborted && !upstreamSignal?.aborted) {
+        throw new Error(`Public request timed out after ${PUBLIC_REQUEST_TIMEOUT_MS / 1000}s (${endpoint})`);
+      }
+      throw error;
+    } finally {
+      globalThis.clearTimeout(timeoutId);
+      upstreamSignal?.removeEventListener("abort", abortRequest);
+    }
   }
 };
 
@@ -539,19 +610,33 @@ const discoverCryptoMarketsFresh = async (signal?: AbortSignal): Promise<MarketD
       if (leftPhase !== rightPhase) return leftPhase - rightPhase;
       return leftStart - rightStart || left.endTime - right.endTime || left.asset.localeCompare(right.asset) || left.id.localeCompare(right.id);
     });
-  return Promise.all(definitions.map(async (definition) => ({
+  return mapInBatches(definitions, CLOB_FEE_LOOKUP_CONCURRENCY, async (definition) => ({
     ...definition,
     feeSchedule: await fetchClobFeeSchedule(definition.conditionId, signal),
-  })));
+  }));
 };
 
 export async function discoverCryptoMarkets(signal?: AbortSignal): Promise<MarketDefinition[]> {
   if (discoveryCache && Date.now() - discoveryCache.timestamp < DISCOVERY_CACHE_MS) return discoveryCache.value;
   if (!discoveryInFlight) {
+    const cachedFallback = discoveryCache && Date.now() - discoveryCache.timestamp <= DISCOVERY_STALE_FALLBACK_MS
+      ? discoveryCache
+      : null;
     discoveryInFlight = discoverCryptoMarketsFresh(signal)
       .then((value) => {
         discoveryCache = { value, timestamp: Date.now() };
         return value;
+      })
+      .catch((error) => {
+        if (signal?.aborted || !cachedFallback) throw error;
+        console.warn(JSON.stringify({
+          at: new Date().toISOString(),
+          level: "WARN",
+          message: "Gamma market discovery failed; using recent cached definitions while refreshing live inputs.",
+          error: error instanceof Error ? error.message.slice(0, 300) : "Unknown error",
+          cacheAgeMs: Date.now() - cachedFallback.timestamp,
+        }));
+        return cachedFallback.value;
       })
       .finally(() => {
         discoveryInFlight = null;
@@ -632,14 +717,25 @@ export async function fetchOrderBooks(tokenIds: string[], signal?: AbortSignal):
       }
     } catch (error) {
       if (signal?.aborted) throw error;
-      const entries = await Promise.all(chunk.map(async (tokenId) => {
+      if (!(error instanceof PublicApiError) || ![400, 404, 405, 415, 422].includes(error.status)) {
+        console.warn(JSON.stringify({
+          at: new Date().toISOString(),
+          level: "WARN",
+          message: "CLOB batch book request failed; skipped single-book fallback to avoid a request burst.",
+          error: error instanceof Error ? error.message.slice(0, 300) : "Unknown error",
+          tokenCount: chunk.length,
+        }));
+        return;
+      }
+      const fallbackTokenIds = chunk.slice(0, CLOB_SINGLE_BOOK_FALLBACK_LIMIT);
+      const entries = await mapInBatches(fallbackTokenIds, CLOB_SINGLE_BOOK_FALLBACK_CONCURRENCY, async (tokenId) => {
         try {
           const payload = await fetchJson<Record<string, unknown>>(`${CLOB_API}/book?token_id=${encodeURIComponent(tokenId)}`, { signal });
           return [tokenId, parseBook(payload, tokenId)] as const;
         } catch {
           return null;
         }
-      }));
+      });
       for (const entry of entries) if (entry) books.set(entry[0], entry[1]);
     }
   }));
