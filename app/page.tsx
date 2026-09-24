@@ -1098,7 +1098,7 @@ export default function Home() {
   }, [appendLog, liveRequest, liveSession?.connected]);
   const submitManualEntry = useCallback(async (marketId: string, side: PaperSide, stakeUsd: number) => {
     const market = liveMarketMap.get(marketId);
-    if (!liveSession?.connected || !market || liveRunning || livePaused || manualOrderBusy || killSwitch) return;
+    if (!liveSession?.connected || !market || liveRunning || manualOrderBusy || killSwitch) return;
     const risk = enforceLiveExecutionRisk(liveRisk);
     const freshnessIssue = marketDataFreshnessIssue(market, clock);
     const signal = analyzeMarketSignal(market, { feeRate: risk.feeRate, slippageBps: risk.slippageBps }, stakeUsd, risk.minEdge, clock);
@@ -1147,9 +1147,9 @@ export default function Home() {
       const detail = error instanceof Error ? error.message : "Manual live entry failed.";
       setLiveStatus({ lastAction: "MANUAL ENTRY ERROR", lastDetail: detail, lastError: detail, lastLatencyMs: Date.now() - startedAt });
     } finally { setManualOrderBusy(false); }
-  }, [appendLog, clock, killSwitch, liveMarketMap, livePaused, liveRequest, liveRisk, liveRunning, liveSession, manualOrderBusy, refreshLivePositions]);
+  }, [appendLog, clock, killSwitch, liveMarketMap, liveRequest, liveRisk, liveRunning, liveSession, manualOrderBusy, refreshLivePositions]);
   const submitManualExit = useCallback(async (position: LivePositionSnapshot, marketId: string, side: PaperSide, amount: number, bestBid: number | null) => {
-    if (!liveSession?.connected || liveRunning || livePaused || manualOrderBusy || killSwitch || !position.tokenID || !bestBid || amount <= 0) return;
+    if (!liveSession?.connected || liveRunning || manualOrderBusy || killSwitch || !position.tokenID || !bestBid || amount <= 0) return;
     const market = liveMarketMap.get(marketId);
     if (!market) return;
     const risk = enforceLiveExecutionRisk(liveRisk);
@@ -1169,7 +1169,7 @@ export default function Home() {
       const detail = error instanceof Error ? error.message : "Manual live exit failed.";
       setLiveStatus({ lastAction: "MANUAL EXIT ERROR", lastDetail: detail, lastError: detail, lastLatencyMs: Date.now() - startedAt });
     } finally { setManualOrderBusy(false); }
-  }, [appendLog, killSwitch, liveMarketMap, livePaused, liveRequest, liveRisk, liveRunning, liveSession?.connected, manualOrderBusy, refreshLivePositions]);
+  }, [appendLog, killSwitch, liveMarketMap, liveRequest, liveRisk, liveRunning, liveSession?.connected, manualOrderBusy, refreshLivePositions]);
   const startLiveExecutor = () => {
     if (!liveSession?.connected) { setView("account"); setAccountDialogOpen(true); return; }
     if (!liveConsent || killSwitch) { setLiveStatus((current) => ({ ...current, lastError: killSwitch ? "Reset the paper risk halt before starting live execution." : "Confirm the live-order risk notice before starting." })); return; }

@@ -106,7 +106,7 @@ export default function LiveExecutionPanel({ session, running, paused, consent, 
     && selectedProbability !== null && sizing?.approved && stakeUsd >= 1 && stakeUsd <= maxManualStake + 1e-8
     && sizing && stakeUsd <= sizing.stakeUsd + 1e-8);
   const manualHoldReason = !session?.connected ? "Link the wallet and read its current collateral balance to enable manual orders."
-    : running || paused ? "Stop the live runner before placing manual orders."
+    : running ? "Stop the live runner before placing manual orders."
       : killSwitch ? "The kill switch is active; reset the paper risk halt first."
         : session.openOrders > 0 ? "Cancel or reconcile the open CLOB order before manual entry."
           : selectedPosition ? "A position already exists in this market; use the position panel to manage it."
@@ -245,7 +245,7 @@ export default function LiveExecutionPanel({ session, running, paused, consent, 
                     <div className="manual-position-market">{position.market.question}</div>
                     <div className="manual-position-values"><span>SHARES <b>{(position.size ?? 0).toFixed(4)}</b></span><span>BEST BID <b>{position.bid === null ? "—" : cents(position.bid)}</b></span></div>
                     <label className="manual-exit-input"><span>SHARES TO SELL</span><input inputMode="decimal" max={position.size ?? undefined} min="0.0001" onChange={(event) => setExitAmounts((current) => ({ ...current, [position.tokenID ?? position.id]: event.target.value }))} step="0.0001" type="number" value={exitAmounts[position.tokenID ?? position.id] ?? String(position.size ?? "")} /></label>
-                    <button className="button-secondary manual-sell-button" disabled={!session?.connected || running || paused || manualBusy || killSwitch || !validAmount || position.bid === null} onClick={() => onManualExit(position, position.market.id, position.side, amount, position.bid)} type="button">{manualBusy ? "WORKING…" : `SELL ${validAmount ? amount.toFixed(4) : "—"} SHARES`}</button>
+                    <button className="button-secondary manual-sell-button" disabled={!session?.connected || running || manualBusy || killSwitch || !validAmount || position.bid === null} onClick={() => onManualExit(position, position.market.id, position.side, amount, position.bid)} type="button">{manualBusy ? "WORKING…" : `SELL ${validAmount ? amount.toFixed(4) : "—"} SHARES`}</button>
                   </div>;
                 })}
                 <div className="manual-sizing-note">Manual sells use the current live bid and a slippage floor. Settlement or already-expired positions are handled in Account.</div>
