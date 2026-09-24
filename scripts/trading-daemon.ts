@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { rmSync } from "node:fs";
+import { createServer as createNetServer } from "node:net";
 import { mkdir, open as openFile, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,9 +78,8 @@ const pauseFile = path.join(stateDir, "PAUSED");
 const staleHaltFile = path.join(stateDir, "STALE_DATA_HALT");
 const riskHaltFile = path.join(stateDir, "RISK_HALT");
 const resetStartingCashFile = path.join(stateDir, "PAPER_RESET_BALANCE");
-const stateOperationLockFile = path.join(stateDir, "STATE_OPERATION.lock");
-const stateOperationRecoveryLockFile = path.join(stateDir, "STATE_OPERATION_RECOVERY.lock");
 const healthPort = 8788;
+const stateOperationPort = 8789;
 const dashboardOrigins = new Set((process.env.PQE_DASHBOARD_ORIGINS ?? "")
   .split(",")
   .map((origin) => origin.trim())
@@ -94,55 +93,16 @@ const staleRecoveryCyclesRequired = integerSetting("DATA_STALE_RECOVERY_CYCLES",
 const staleRecoveryMinimumMarkets = integerSetting("DATA_STALE_RECOVERY_MIN_MARKETS", 1, 1, 100);
 const configuredPaperStartingCash = numberSetting("PAPER_STARTING_CASH", 100, 1, 1_000_000_000);
 await mkdir(stateDir, { recursive: true, mode: 0o750 });
-async function openStateOperationLock() {
-  try {
-    return await openFile(stateOperationLockFile, "wx", 0o640);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
-  let recoveryLock;
-  try { recoveryLock = await openFile(stateOperationRecoveryLockFile, "wx", 0o640); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Another daemon startup or paper reset is using this state directory.");
-    throw error;
-  }
-  try {
-    const owner = Number((await readFile(stateOperationLockFile, "utf8")).trim());
-    if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("A daemon startup or paper reset is still initializing its lock.");
-    try {
-      process.kill(owner, 0);
-      throw new Error("Another daemon startup or paper reset is using this state directory.");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-    }
-    await rm(stateOperationLockFile, { force: true });
-    const lock = await openFile(stateOperationLockFile, "wx", 0o640).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "EEXIST") throw new Error("Another daemon startup or paper reset is using this state directory.");
-      throw error;
-    });
-    return lock;
-  } finally {
-    await recoveryLock.close();
-    await rm(stateOperationRecoveryLockFile, { force: true });
-  }
-}
-const stateOperationLock = await openStateOperationLock();
-await stateOperationLock.writeFile(`${process.pid}\n`);
-await stateOperationLock.sync();
-let stateOperationLockReleased = false;
-const removeStateOperationLock = () => {
-  if (stateOperationLockReleased) return;
-  stateOperationLockReleased = true;
-  try { rmSync(stateOperationLockFile, { force: true }); } catch {}
-};
-process.once("exit", removeStateOperationLock);
-const releaseStateOperationLock = async () => {
-  if (stateOperationLockReleased) return;
-  process.off("exit", removeStateOperationLock);
-  await stateOperationLock.close();
-  await rm(stateOperationLockFile, { force: true });
-  stateOperationLockReleased = true;
-};
+const stateOperationLockServer = createNetServer((socket) => socket.destroy());
+await new Promise<void>((resolve, reject) => {
+  stateOperationLockServer.once("error", (error) => {
+    const code = (error as NodeJS.ErrnoException).code;
+    reject(code === "EADDRINUSE"
+      ? new Error("Another daemon startup or paper reset is using this host.")
+      : error);
+  });
+  stateOperationLockServer.listen({ host: "127.0.0.1", port: stateOperationPort, exclusive: true }, resolve);
+});
 let requestedPaperStartingCash: number | null = null;
 const paperStartingCash = await (async () => {
   try {
@@ -694,7 +654,6 @@ await new Promise<void>((resolve, reject) => {
   healthServer.once("error", reject);
   healthServer.listen(healthPort, "127.0.0.1", () => resolve());
 });
-await releaseStateOperationLock();
 log("INFO", "Headless paper daemon started", { mode: "paper", readiness: `http://127.0.0.1:${healthPort}/healthz`, liveness: `http://127.0.0.1:${healthPort}/livez`, decisionIntervalMs, marketRefreshIntervalMs: pollIntervalMs });
 const markTimer = setInterval(() => {
   if (latestMarkets.size) state.account = markAccount(state.account, latestMarkets, Date.now());
@@ -1440,4 +1399,5 @@ if (clobReconnectTimer) clearTimeout(clobReconnectTimer);
 if (clobHeartbeatTimer) clearInterval(clobHeartbeatTimer);
 closeMarketStreams();
 await new Promise<void>((resolve) => healthServer.close(() => resolve()));
+await new Promise<void>((resolve) => stateOperationLockServer.close(() => resolve()));
 log("INFO", "Headless paper daemon stopped");

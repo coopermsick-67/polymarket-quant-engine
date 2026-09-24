@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { connect } from "node:net";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { connect, createServer as createNetServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,34 +14,15 @@ const flags = {
   risk: path.join(stateDir, "RISK_HALT"),
   resetRiskDay: path.join(stateDir, "RESET_RISK_DAY"),
 };
-const stateOperationLockFile = path.join(stateDir, "STATE_OPERATION.lock");
-const stateOperationRecoveryLockFile = path.join(stateDir, "STATE_OPERATION_RECOVERY.lock");
-
 async function acquireStateOperationLock() {
-  await mkdir(stateDir, { recursive: true, mode: 0o750 });
-  try { return await open(stateOperationLockFile, "wx", 0o640); }
-  catch (error) {
-    if (error.code !== "EEXIST") throw error;
-  }
-  let recoveryLock;
-  try { recoveryLock = await open(stateOperationRecoveryLockFile, "wx", 0o640); }
-  catch (error) { if (error.code === "EEXIST") throw new Error("A daemon startup or paper reset is already recovering this state directory."); throw error; }
-  try {
-    const owner = Number((await readFile(stateOperationLockFile, "utf8")).trim());
-    if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("A daemon startup or paper reset is still initializing its lock.");
-    try {
-      process.kill(owner, 0);
-      throw new Error("A daemon startup or paper reset is already using this state directory.");
-    } catch (error) { if (error.code !== "ESRCH") throw error; }
-    await rm(stateOperationLockFile, { force: true });
-    let lock;
-    try { lock = await open(stateOperationLockFile, "wx", 0o640); }
-    catch (error) { if (error.code === "EEXIST") throw new Error("A daemon startup or paper reset is already using this state directory."); throw error; }
-    return lock;
-  } finally {
-    await recoveryLock.close();
-    await rm(stateOperationRecoveryLockFile, { force: true });
-  }
+  const server = createNetServer((socket) => socket.destroy());
+  await new Promise((resolve, reject) => {
+    server.once("error", (error) => reject(error.code === "EADDRINUSE"
+      ? new Error("A daemon startup or paper reset is already using this host.")
+      : error));
+    server.listen({ host: "127.0.0.1", port: 8789, exclusive: true }, resolve);
+  });
+  return server;
 }
 
 async function withStateOperationLock(work) {
@@ -53,12 +34,9 @@ async function withStateOperationLock(work) {
     return;
   }
   try {
-    await lock.writeFile(`${process.pid}\n`);
-    await lock.sync();
     await work();
   } finally {
-    await lock.close();
-    await rm(stateOperationLockFile, { force: true });
+    await new Promise((resolve) => lock.close(resolve));
   }
 }
 
