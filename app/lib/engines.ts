@@ -869,11 +869,11 @@ export const marketStreamingDataFreshnessIssue = (market: LiveMarket, now = Date
       return "An order-book snapshot is stale or has no usable timestamp.";
     }
   }
-  const newest5mClose = newestCompletedCandleAt(market.chart5m, 300, marketNow);
-  const newest15mClose = newestCompletedCandleAt(market.chart15m, 900, marketNow);
-  if (newest5mClose === null || marketNow - newest5mClose > 2 * 300_000
-    || newest15mClose === null || marketNow - newest15mClose > 2 * 900_000) {
-    return "Completed 5m or 15m candle data is stale; waiting for fresh usable bars on both charts.";
+  const chartDuration = market.duration === "5m" ? 300 : 900;
+  const chartHistory = market.duration === "5m" ? market.chart5m : market.chart15m;
+  const newestChartClose = newestCompletedCandleAt(chartHistory, chartDuration, marketNow);
+  if (newestChartClose === null || marketNow - newestChartClose > 2 * chartDuration * 1000) {
+    return `Completed ${market.duration} candle data is stale; waiting for fresh usable bars for this market.`;
   }
   return null;
 };
@@ -954,12 +954,10 @@ const directionalRead = (market: LiveMarket, stats5m: ChartTrendStats | null, st
   const ageSeconds = Math.max(0, (now - marketStart) / 1000);
   const early = ageSeconds <= 90;
   const micro = liveMicroScore(market.spotHistory, marketStart, now, early);
-  const target = market.duration === "5m" ? stats5m?.score : stats15m?.score;
-  const context = market.duration === "5m" ? stats15m?.score : stats5m?.score;
-  const chartScore = target !== undefined && target !== null && context !== undefined && context !== null
-    ? target * 0.62 + context * 0.38
-    : target !== undefined && target !== null ? target * 0.75
-      : context !== undefined && context !== null ? context * 0.5 : null;
+  // Each contract uses only its own horizon's chart score. The other
+  // timeframe remains visible as context in the UI, but cannot steer this
+  // market's live signal or veto its entry.
+  const chartScore = market.duration === "5m" ? stats5m?.score ?? null : stats15m?.score ?? null;
   const referenceScore = market.fairUp !== null
     ? clampScore((market.fairUp - 0.5) * 3)
     : market.distance !== null ? tanh(market.distance / 0.0008) : null;
@@ -990,13 +988,10 @@ const directionalRead = (market: LiveMarket, stats5m: ChartTrendStats | null, st
 };
 
 const modelUncertainty = (market: LiveMarket, stats5m: ChartTrendStats | null, stats15m: ChartTrendStats | null, read: DirectionalRead) => {
-  // The probability model has not been calibrated. Penalize an opening-reference
-  // proxy, missing early micro observations, and disagreement between realized
-  // volatility estimates normalized to the same one-minute scale.
-  const vol5 = stats5m?.volatility ? stats5m.volatility / Math.sqrt(5) : null;
-  const vol15 = stats15m?.volatility ? stats15m.volatility / Math.sqrt(15) : null;
-  const volDisagreement = vol5 && vol15 ? Math.min(0.2, Math.abs(Math.log(vol5 / vol15)) / Math.log(4) * 0.2) : 0.2;
-  return Math.min(1, 0.35 + volDisagreement
+  // Keep uncertainty market-specific too; do not use the other horizon's
+  // volatility as an input to this contract's probability.
+  const targetStats = market.duration === "5m" ? stats5m : stats15m;
+  return Math.min(1, 0.35 + (targetStats?.volatility ? 0 : 0.2)
     + (market.referenceSource === "POLYMARKET" ? 0 : 0.2)
     + (read.ageSeconds !== null && read.ageSeconds <= 90 && read.microScore === null ? 0.2 : 0));
 };
@@ -1068,10 +1063,12 @@ export const analyzeMarketSignal = (
   const freshnessIssue = marketDataFreshnessIssue(market, now);
   if (freshnessIssue) return pass(freshnessIssue, null);
 
-  if (!stats5m || !stats15m) {
-    const reason = !market.chart5m.length && !market.chart15m.length
-      ? `Coinbase OHLC history is unavailable for ${market.asset}.`
-      : "Need at least 8 complete candles on both 5m and 15m charts.";
+  const targetStats = market.duration === "5m" ? stats5m : stats15m;
+  if (!targetStats) {
+    const targetCandles = market.duration === "5m" ? market.chart5m : market.chart15m;
+    const reason = !targetCandles.length
+      ? `Coinbase ${market.duration} OHLC history is unavailable for ${market.asset}.`
+      : `Need at least 8 complete ${market.duration} candles for this market.`;
     return pass(reason);
   }
   if (market.remaining < (market.duration === "5m" ? 30 : 60)) return pass("Too little time remains for a fresh entry.");
@@ -1081,10 +1078,8 @@ export const analyzeMarketSignal = (
   if (marketUp !== null && Math.abs(market.fairUp - marketUp) > MAX_MODEL_MARKET_GAP) {
     return pass(`Raw model P(UP) ${Math.round(market.fairUp * 100)}% is ${Math.round(Math.abs(market.fairUp - marketUp) * 100)} points from the market's ${Math.round(marketUp * 100)}%; a gap that large is more often stale or wrong inputs than edge.`);
   }
-  const target = market.duration === "5m" ? stats5m.score : stats15m.score;
-  const context = market.duration === "5m" ? stats15m.score : stats5m.score;
-  const chartAgreement = Math.sign(target) !== 0 && Math.sign(target) === Math.sign(context) && Math.abs(target) >= 0.2 && Math.abs(context) >= 0.14;
-  if (!chartAgreement) return pass("5m and 15m chart trends do not confirm the same direction.");
+  const target = targetStats.score;
+  if (Math.abs(target) < 0.2) return pass(`${market.duration} trend is not strong enough for an entry.`);
   if (Math.sign(market.fairUp - 0.5) !== Math.sign(target)) return pass("Spot versus the market reference conflicts with the candle trend.");
 
   // Price every edge against the market-anchored probability. The raw candle
@@ -1120,7 +1115,7 @@ export const analyzeMarketSignal = (
   const requiredEdge = Math.max(0.04, minNetEdge);
   if (edge < requiredEdge) return { ...pass(`Best price edge is ${Math.round(edge * 1000) / 10}% on ${side}, below the ${Math.round(requiredEdge * 1000) / 10}% entry floor.`, fairUp), confidence, upEdge: priceComparison.upEdge, downEdge: priceComparison.downEdge, entryPrice: fill.price, edge, estimatedFill: fill, executableCostProbability: executionCostProbability, expectedNetProfitUsd };
 
-  const locked = edge >= Math.max(0.08, requiredEdge * 2) && Math.abs(target) >= 0.5 && Math.abs(context) >= 0.25;
+  const locked = edge >= Math.max(0.08, requiredEdge * 2) && Math.abs(target) >= 0.5;
   const referenceLabel = market.referenceSource === "COINBASE ESTIMATE" ? "Coinbase opening-reference estimate (paper only)" : "Polymarket reference";
   return {
     action: side,
@@ -1139,13 +1134,13 @@ export const analyzeMarketSignal = (
     downEdge: priceComparison.downEdge,
     entryPrice: fill.price,
     edge,
-    trend5m: trendLabel(stats5m.score),
-    trend15m: trendLabel(stats15m.score),
-    score5m: stats5m.score,
-    score15m: stats15m.score,
-    rsi5m: stats5m.rsi,
-    rsi15m: stats15m.rsi,
-    reason: locked ? `5m and 15m trends align; ${referenceLabel}, order-book depth, and the stricter net-edge gate pass. Edge uses the market-anchored probability; the model is not calibrated.` : `5m and 15m trends align; ${referenceLabel}, order-book depth, and the net-edge gate pass. Edge uses the market-anchored probability; the model is not calibrated.`,
+    trend5m: trendLabel(stats5m?.score ?? null),
+    trend15m: trendLabel(stats15m?.score ?? null),
+    score5m: stats5m?.score ?? null,
+    score15m: stats15m?.score ?? null,
+    rsi5m: stats5m?.rsi ?? null,
+    rsi15m: stats15m?.rsi ?? null,
+    reason: locked ? `${market.duration} trend, ${referenceLabel}, order-book depth, and the stricter net-edge gate pass. Edge uses the market-anchored probability; the model is not calibrated.` : `${market.duration} trend, ${referenceLabel}, order-book depth, and the net-edge gate pass. Edge uses the market-anchored probability; the model is not calibrated.`,
     estimatedFill: fill,
   };
 };

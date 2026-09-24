@@ -76,7 +76,7 @@ export const evaluatePaperMarket = (input: {
       return blockSignal("PASS: MICRO strategy requires a strong, aligned live oracle micro-trend.");
     }
   } else if (profile.tier === "SMALL" && (signal.biasConfidence ?? 0) < 0.58) {
-    return blockSignal("PASS: SMALL strategy requires stronger cross-horizon trend agreement before using limited balance.");
+    return blockSignal(`PASS: SMALL strategy requires stronger ${market.duration}-specific directional confidence before using limited balance.`);
   }
   const book = side === "UP" ? upBook : downBook;
   if (!book.minimumSharesKnown) return { ...base, book, approved: false, reason: "PASS: the exchange minimum share size is unavailable from the current order book." };
