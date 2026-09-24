@@ -57,6 +57,18 @@ button, input { font: inherit; }
 button { color: inherit; }
 
 .terminal-shell { display: flex; min-height: 100vh; width: 100%; }
+.chatgpt-auth-banner {
+  align-items: center; background: rgba(10, 16, 25, 0.94); border-bottom: 1px solid var(--border);
+  color: var(--muted); display: flex; font-family: var(--font-mono); font-size: 10px;
+  gap: 10px; justify-content: flex-end; letter-spacing: 0.04em; min-height: 34px; padding: 5px 24px;
+}
+.chatgpt-auth-banner a {
+  border: 1px solid rgba(111, 216, 255, 0.3); border-radius: 5px; color: var(--cyan);
+  font-size: 9px; font-weight: 700; padding: 4px 9px; text-decoration: none;
+}
+.chatgpt-auth-banner a:hover { background: rgba(111, 216, 255, 0.1); }
+.chatgpt-auth-banner.is-authenticated { color: var(--mint); }
+.chatgpt-auth-dot { background: var(--mint); border-radius: 50%; box-shadow: 0 0 7px rgba(108, 242, 196, 0.7); height: 6px; width: 6px; }
 .sidebar-rail {
   align-items: center; background: rgba(5, 8, 14, 0.84); border-right: 1px solid rgba(146, 166, 191, 0.11);
   display: flex; flex: 0 0 68px; flex-direction: column; min-height: 100vh; padding: 20px 0 18px; position: sticky; top: 0;

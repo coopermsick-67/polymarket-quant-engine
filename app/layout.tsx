@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
+import ChatGPTAuthBanner from "./components/chatgpt-auth-banner";
 import "./globals.css";
+
+export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "PM5 Predictor Terminal",
@@ -20,7 +23,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <ChatGPTAuthBanner />
+        {children}
+      </body>
     </html>
   );
 }
