@@ -359,6 +359,7 @@ for (const [key, tick] of Object.entries(state.openingPriceTicks)) polymarketPri
 let lastPricePruneAt = 0;
 let lastOfficialPriceAt: number | null = null;
 let priceStreamConnected = false;
+let lastPriceStreamStatus: "CONNECTING" | "CONNECTED" | "DISCONNECTED" | null = null;
 let priceSubscriptionKey = "";
 let stopPriceStream: (() => void) | null = null;
 
@@ -931,7 +932,10 @@ function ensureMarketStreams(markets: LiveMarket[]): void {
         lastStreamUpdateAt = now;
       }, (status) => {
         priceStreamConnected = status === "CONNECTED";
-        if (status !== "CONNECTING") log(status === "CONNECTED" ? "INFO" : "WARN", `Polymarket oracle-aligned price stream ${status.toLowerCase()}`);
+        if (status !== lastPriceStreamStatus) {
+          lastPriceStreamStatus = status;
+          if (status !== "CONNECTING") log(status === "CONNECTED" ? "INFO" : "WARN", `Polymarket oracle-aligned price stream ${status.toLowerCase()}`);
+        }
       }, shutdownController.signal);
     }
   }
