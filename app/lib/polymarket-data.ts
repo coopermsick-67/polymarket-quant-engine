@@ -551,6 +551,9 @@ const fetchClobFeeSchedule = (conditionId: string | null, signal?: AbortSignal):
 
 const polymarketNow = () => Date.now() + polymarketClockOffsetMs;
 
+/** Convert a local clock reading to Polymarket's synchronized event time. */
+export const synchronizedPolymarketTime = (localTime = Date.now()): number => localTime + polymarketClockOffsetMs;
+
 const fetchPolymarketNow = async (signal?: AbortSignal): Promise<number> => {
   if (Date.now() - polymarketClockSyncedAt < POLYMARKET_TIME_CACHE_MS) return polymarketNow();
   try {
@@ -946,13 +949,14 @@ export const buildLiveMarket = (
   // cannot be compared with a Chainlink TWAP target. Wait for the market's
   // configured Polymarket feed before calculating an entry probability.
   const spot = null;
-  const remaining = Math.max(0, Math.ceil((definition.endTime - (now + polymarketClockOffsetMs)) / 1000));
+  const marketNow = synchronizedPolymarketTime(now);
+  const remaining = Math.max(0, Math.ceil((definition.endTime - marketNow) / 1000));
   const chart5m = candleHistory?.fiveMinute ?? [];
   const chart15m = candleHistory?.fifteenMinute ?? [];
   const reference = definition.priceFeed !== "UNSUPPORTED" ? definition.reference : null;
   const referenceSource = reference !== null ? definition.referenceSource : "MISSING";
   const targetCandles = definition.duration === "5m" ? chart5m : chart15m;
-  const fairUp = chartFairProbability(reference, spot, remaining, definition.duration, targetCandles, now);
+  const fairUp = chartFairProbability(reference, spot, remaining, definition.duration, targetCandles, marketNow);
   const upBid = bestBid(upBook);
   const upAsk = bestAsk(upBook);
   const downBid = bestBid(downBook);
@@ -1008,9 +1012,10 @@ export const applyPolymarketPriceTicks = (
   now = Date.now(),
 ): LiveMarket => {
   if (market.priceFeed === "UNSUPPORTED") return market;
+  const marketNow = synchronizedPolymarketTime(now);
   const matching = ticks.filter((tick) => tick.asset === market.asset && tick.priceFeed === market.priceFeed
     && Number.isFinite(tick.price) && tick.price > 0 && Number.isFinite(tick.timestamp)
-    && tick.timestamp <= now + 1000 && tick.timestamp <= market.endTime
+    && tick.timestamp <= marketNow + 1000 && tick.timestamp <= market.endTime
     && (market.startTime === null || tick.timestamp >= market.startTime));
   let reference = market.referenceVerified && market.referenceSource === "POLYMARKET" ? market.reference : null;
   let referenceUpdatedAt = reference !== null ? market.referenceUpdatedAt : null;
@@ -1023,21 +1028,21 @@ export const applyPolymarketPriceTicks = (
       referenceUpdatedAt = opening.timestamp;
     }
   }
-  const latest = matching.filter((tick) => tick.timestamp >= now - 10_000)
+  const latest = matching.filter((tick) => tick.timestamp >= marketNow - 10_000)
     .reduce<PolymarketPriceTick | null>((current, tick) => !current || tick.timestamp > current.timestamp ? tick : current, null);
   const priorSpotFresh = market.spotSource === "POLYMARKET" && market.spotUpdatedAt !== null
-    && market.spotUpdatedAt >= now - 10_000 && market.spotUpdatedAt <= now + 1000;
+    && market.spotUpdatedAt >= marketNow - 10_000 && market.spotUpdatedAt <= marketNow + 1000;
   const useLatest = latest !== null && (!priorSpotFresh || latest.timestamp >= market.spotUpdatedAt!);
   const spot = useLatest ? latest.price : priorSpotFresh ? market.spot : null;
   const spotUpdatedAt = useLatest ? latest.timestamp : priorSpotFresh ? market.spotUpdatedAt : null;
-  const remaining = Math.max(0, Math.ceil((market.endTime - (now + polymarketClockOffsetMs)) / 1000));
+  const remaining = Math.max(0, Math.ceil((market.endTime - marketNow) / 1000));
   const fairUp = chartFairProbability(reference, spot, remaining, market.duration,
-    market.duration === "5m" ? market.chart5m : market.chart15m, now);
+    market.duration === "5m" ? market.chart5m : market.chart15m, marketNow);
   const distance = reference !== null && spot !== null ? (spot - reference) / reference : null;
   const momentum = spot !== null && market.spot !== null && market.spot > 0
     ? Math.log(spot / market.spot) : null;
   const spotHistory = [...(market.spotHistory ?? []), ...matching]
-    .filter((tick) => tick.timestamp >= now - 120_000 && tick.timestamp <= now + 1000)
+    .filter((tick) => tick.timestamp >= marketNow - 120_000 && tick.timestamp <= marketNow + 1000)
     .sort((left, right) => left.timestamp - right.timestamp)
     .filter((tick, index, points) => index === points.length - 1 || tick.timestamp !== points[index + 1].timestamp)
     .slice(-180);

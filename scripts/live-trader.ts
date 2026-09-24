@@ -16,6 +16,7 @@ import {
   fetchCandleHistories,
   fetchOrderBooks,
   anchoredFairUp,
+  synchronizedPolymarketTime,
   type Asset,
   type CandleHistory,
   type LiveMarket,
@@ -784,6 +785,11 @@ async function main() {
             recordBlock(streamHealth.status !== "CONNECTED" ? `oracle ${streamHealth.status.toLowerCase()}` : "outside the active entry window");
             continue;
           }
+          // Future markets are part of Gamma's two-hour discovery window. Skip
+          // them before tallying blocked reasons so they cannot mask the state
+          // of markets that are already trading.
+          if (market.startTimeVerified && market.startTime !== null
+            && market.startTime > synchronizedPolymarketTime(now) + 1_000) continue;
           if (state.attemptedMarkets.includes(marketKey)) { recordBlock("already filled this market cycle"); continue; }
           if ((state.retryAfter[marketKey] ?? 0) > now) { recordBlock("recent FOK no-fill cooldown"); continue; }
           const issue = marketDataFreshnessIssue(market, now);
@@ -803,7 +809,9 @@ async function main() {
         if (!best) {
           if (cycle % 15 === 0) {
             const leadingBlock = [...blockedReasons.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? "no supported active market";
-            console.log(`[${new Date().toLocaleTimeString()}] No actionable LOCK opportunity · ${definitions.length} markets scanned · ${leadingBlock}.`);
+            const activeCount = [...currentMarkets.values()].filter((market) => market.startTimeVerified && market.startTime !== null
+              && market.startTime <= synchronizedPolymarketTime(now) + 1_000 && market.endTime > synchronizedPolymarketTime(now)).length;
+            console.log(`[${new Date().toLocaleTimeString()}] No actionable LOCK opportunity · ${definitions.length} markets discovered · ${activeCount} active · ${leadingBlock}.`);
           }
           await sleep(SCAN_MS);
           continue;

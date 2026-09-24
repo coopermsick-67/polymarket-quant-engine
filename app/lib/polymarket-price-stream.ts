@@ -1,4 +1,4 @@
-import type { Asset, PolymarketPriceTick } from "./polymarket-data";
+import { synchronizedPolymarketTime, type Asset, type PolymarketPriceTick } from "./polymarket-data";
 
 export type PolymarketPriceStreamStatus = "CONNECTING" | "CONNECTED" | "DISCONNECTED";
 
@@ -187,7 +187,7 @@ export const readPolymarketPriceTicks = (
     signal?.addEventListener("abort", abort, { once: true });
     stop = subscribePolymarketPrices([...new Set(markets.map((market) => market.asset))], (batch) => {
       for (const tick of batch) ticks.set(`${tick.asset}:${tick.priceFeed}:${tick.timestamp}`, tick);
-      const now = Date.now();
+      const now = synchronizedPolymarketTime();
       const ready = markets.every((market) => {
         const rows = [...ticks.values()].filter((tick) => tick.asset === market.asset && tick.priceFeed === market.priceFeed);
         const opening = rows.some((tick) => tick.timestamp === market.startTime);

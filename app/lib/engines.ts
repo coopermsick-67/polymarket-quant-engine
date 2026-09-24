@@ -7,6 +7,7 @@ import {
   marketImpliedProbabilityUp,
   orderBookFor,
   sideFairProbability,
+  synchronizedPolymarketTime,
   type Horizon,
   type LiveMarket,
   type MarketCandle,
@@ -855,22 +856,23 @@ const newestCompletedCandleAt = (history: MarketCandle[], barSeconds: number, no
 
 /** Feed/book health, independent of whether this market's exact opening tick was observed. */
 export const marketStreamingDataFreshnessIssue = (market: LiveMarket, now = Date.now()): string | null => {
+  const marketNow = synchronizedPolymarketTime(now);
   if (market.priceFeed === "UNSUPPORTED") return "This market uses an unsupported price-resolution feed; waiting for a supported Polymarket oracle market.";
   if (market.spot === null || market.spot <= 0 || market.spotSource !== "POLYMARKET"
-    || market.spotUpdatedAt === null || market.spotUpdatedAt > now + 1_000) {
+    || market.spotUpdatedAt === null || market.spotUpdatedAt > marketNow + 1_000) {
     return "Waiting for a current observation from this market's Polymarket oracle feed.";
   }
-  if (now - market.spotUpdatedAt > 10_000) return "Polymarket oracle data is stale; waiting for a fresh tick.";
-  if (market.chartUpdatedAt === null || now - market.chartUpdatedAt > 120_000) return "Chart feed is stale; waiting for a fresh candle snapshot.";
+  if (marketNow - market.spotUpdatedAt > 10_000) return "Polymarket oracle data is stale; waiting for a fresh tick.";
+  if (market.chartUpdatedAt === null || marketNow - market.chartUpdatedAt > 120_000) return "Chart feed is stale; waiting for a fresh candle snapshot.";
   for (const orderBook of [market.upBook, market.downBook]) {
-    if (!orderBook || orderBook.timestamp === null || now - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - now > 30_000) {
+    if (!orderBook || orderBook.timestamp === null || marketNow - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - marketNow > 30_000) {
       return "An order-book snapshot is stale or has no usable timestamp.";
     }
   }
-  const newest5mClose = newestCompletedCandleAt(market.chart5m, 300, now);
-  const newest15mClose = newestCompletedCandleAt(market.chart15m, 900, now);
-  if (newest5mClose === null || now - newest5mClose > 2 * 300_000
-    || newest15mClose === null || now - newest15mClose > 2 * 900_000) {
+  const newest5mClose = newestCompletedCandleAt(market.chart5m, 300, marketNow);
+  const newest15mClose = newestCompletedCandleAt(market.chart15m, 900, marketNow);
+  if (newest5mClose === null || marketNow - newest5mClose > 2 * 300_000
+    || newest15mClose === null || marketNow - newest15mClose > 2 * 900_000) {
     return "Completed 5m or 15m candle data is stale; waiting for fresh usable bars on both charts.";
   }
   return null;
@@ -882,7 +884,7 @@ export const marketDataFreshnessIssue = (
 ): string | null => {
   if (market.priceFeed === "UNSUPPORTED") return "This market uses an unsupported price-resolution feed; waiting for a supported Polymarket oracle market.";
   if (!market.startTimeVerified || market.startTime === null) return "Market start time is missing or cannot be verified against the market interval.";
-  if (market.startTime > now + 1_000) return "Market interval has not started yet.";
+  if (market.startTime > synchronizedPolymarketTime(now) + 1_000) return "Market interval has not started yet.";
   const liveIssue = marketStreamingDataFreshnessIssue(market, now);
   if (liveIssue) return liveIssue;
   if (market.reference === null || market.reference <= 0 || !market.referenceVerified
