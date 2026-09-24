@@ -55,9 +55,11 @@ export const parsePolymarketPriceMessage = (raw: unknown): PolymarketPriceTick[]
 };
 
 /**
- * Subscribe to the public Polymarket RTDS oracle feeds. The caller should keep
- * opening observations until its active markets expire. Snapshot history is
- * delivered as one batch and live updates as single-observation batches.
+ * Subscribe to the public Polymarket RTDS oracle feeds. Keep a separate
+ * connection per asset: RTDS can silently multiplex distinct filters for the
+ * same topic on one connection, which leaves all but one asset without live
+ * updates. Snapshot history is delivered as one batch and live updates as
+ * single-observation batches.
  */
 export const subscribePolymarketPrices = (
   assets: readonly Asset[],
@@ -68,95 +70,112 @@ export const subscribePolymarketPrices = (
   const symbols = [...new Set(assets.map((asset) => asset.toLowerCase()).filter((asset) => /^[a-z0-9]+$/.test(asset)))];
   if (!symbols.length || signal?.aborted) return () => undefined;
   let closed = false;
-  let socket: WebSocket | null = null;
-  let heartbeat: ReturnType<typeof setInterval> | null = null;
-  let watchdog: ReturnType<typeof setInterval> | null = null;
-  let reconnect: ReturnType<typeof setTimeout> | null = null;
-  let attempt = 0;
-  let openedAt = 0;
-  let lastTickAt = 0;
-
-  const clearTimers = () => {
-    if (heartbeat !== null) clearInterval(heartbeat);
-    if (watchdog !== null) clearInterval(watchdog);
-    if (reconnect !== null) clearTimeout(reconnect);
-    heartbeat = null;
-    watchdog = null;
-    reconnect = null;
+  const connections = new Map<string, {
+    socket: WebSocket | null;
+    heartbeat: ReturnType<typeof setInterval> | null;
+    watchdog: ReturnType<typeof setInterval> | null;
+    reconnect: ReturnType<typeof setTimeout> | null;
+    attempt: number;
+    openedAt: number;
+    lastTickAt: number;
+    status: PolymarketPriceStreamStatus;
+  }>();
+  for (const symbol of symbols) connections.set(symbol, {
+    socket: null, heartbeat: null, watchdog: null, reconnect: null,
+    attempt: 0, openedAt: 0, lastTickAt: 0, status: "CONNECTING",
+  });
+  const publishStatus = () => {
+    const states = [...connections.values()].map((connection) => connection.status);
+    onStatus?.(states.some((status) => status === "CONNECTED") ? "CONNECTED"
+      : states.every((status) => status === "DISCONNECTED") ? "DISCONNECTED" : "CONNECTING");
+  };
+  const clearConnectionTimers = (connection: NonNullable<ReturnType<typeof connections.get>>) => {
+    if (connection.heartbeat !== null) clearInterval(connection.heartbeat);
+    if (connection.watchdog !== null) clearInterval(connection.watchdog);
+    if (connection.reconnect !== null) clearTimeout(connection.reconnect);
+    connection.heartbeat = null;
+    connection.watchdog = null;
+    connection.reconnect = null;
   };
   const stop = () => {
     if (closed) return;
     closed = true;
-    clearTimers();
     signal?.removeEventListener("abort", stop);
-    socket?.close();
-    socket = null;
+    for (const connection of connections.values()) {
+      clearConnectionTimers(connection);
+      connection.socket?.close();
+      connection.socket = null;
+      connection.status = "DISCONNECTED";
+    }
     onStatus?.("DISCONNECTED");
   };
-  const connect = () => {
+  const connect = (symbol: string) => {
     if (closed || signal?.aborted) return;
-    onStatus?.("CONNECTING");
+    const connection = connections.get(symbol);
+    if (!connection) return;
+    connection.status = "CONNECTING";
+    publishStatus();
     let ws: WebSocket;
     try {
       ws = new WebSocket(RTDS_URL);
     } catch {
-      onStatus?.("DISCONNECTED");
-      const delay = Math.min(MAX_RECONNECT_MS, 500 * 2 ** Math.min(attempt, 5));
-      attempt += 1;
-      reconnect = setTimeout(connect, delay);
+      connection.status = "DISCONNECTED";
+      publishStatus();
+      const delay = Math.min(MAX_RECONNECT_MS, 500 * 2 ** Math.min(connection.attempt, 5));
+      connection.attempt += 1;
+      connection.reconnect = setTimeout(() => connect(symbol), delay);
       return;
     }
-    socket = ws;
+    connection.socket = ws;
     ws.onopen = () => {
-      if (closed || socket !== ws) return;
-      openedAt = Date.now();
-      lastTickAt = 0;
+      if (closed || connection.socket !== ws) return;
+      connection.openedAt = Date.now();
+      connection.lastTickAt = 0;
       ws.send(JSON.stringify({
         action: "subscribe",
-        subscriptions: symbols.flatMap((symbol) => ([
-          { topic: "crypto_prices_twap_sixty", type: "*", filters: JSON.stringify({ symbol: `${symbol}/usd` }) },
-          { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: `${symbol}/usd` }) },
-        ])),
+        subscriptions: [
+          { topic: "crypto_prices_twap_sixty", type: "update", filters: JSON.stringify({ symbol: `${symbol}/usd` }) },
+          { topic: "crypto_prices_chainlink", type: "update", filters: JSON.stringify({ symbol: `${symbol}/usd` }) },
+        ],
       }));
-      heartbeat = setInterval(() => {
+      connection.heartbeat = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send("PING");
       }, HEARTBEAT_MS);
-      watchdog = setInterval(() => {
-        if (closed || socket !== ws) return;
-        const lastHealthyAt = lastTickAt || openedAt;
+      connection.watchdog = setInterval(() => {
+        if (closed || connection.socket !== ws) return;
+        const lastHealthyAt = connection.lastTickAt || connection.openedAt;
         if (Date.now() - lastHealthyAt > TICK_STALE_MS) ws.close();
       }, WATCHDOG_CHECK_MS);
     };
     ws.onmessage = (event: MessageEvent) => {
-      if (closed || socket !== ws) return;
+      if (closed || connection.socket !== ws) return;
       const ticks = parsePolymarketPriceMessage(event.data);
       if (!ticks.length) return;
       const receivedAt = Date.now();
-      lastTickAt = receivedAt;
-      if (receivedAt - openedAt >= STABLE_HEALTH_MS) attempt = 0;
+      connection.lastTickAt = receivedAt;
+      if (receivedAt - connection.openedAt >= STABLE_HEALTH_MS) connection.attempt = 0;
+      connection.status = "CONNECTED";
       onTicks(ticks);
-      onStatus?.("CONNECTED");
+      publishStatus();
     };
     ws.onerror = () => {
       if (ws.readyState !== WebSocket.CLOSED) ws.close();
     };
     ws.onclose = () => {
-      if (socket !== ws) return;
-      socket = null;
-      if (heartbeat !== null) clearInterval(heartbeat);
-      if (watchdog !== null) clearInterval(watchdog);
-      heartbeat = null;
-      watchdog = null;
-      onStatus?.("DISCONNECTED");
+      if (connection.socket !== ws) return;
+      connection.socket = null;
+      clearConnectionTimers(connection);
+      connection.status = "DISCONNECTED";
+      publishStatus();
       if (!closed && !signal?.aborted) {
-        const delay = Math.min(MAX_RECONNECT_MS, 500 * 2 ** Math.min(attempt, 5));
-        attempt += 1;
-        reconnect = setTimeout(connect, delay);
+        const delay = Math.min(MAX_RECONNECT_MS, 500 * 2 ** Math.min(connection.attempt, 5));
+        connection.attempt += 1;
+        connection.reconnect = setTimeout(() => connect(symbol), delay);
       }
     };
   };
   signal?.addEventListener("abort", stop, { once: true });
-  connect();
+  for (const symbol of symbols) connect(symbol);
   return stop;
 };
 
