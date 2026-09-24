@@ -46,7 +46,8 @@ const marketCycleKey = (market: { id: string; endTime: number }) => `${market.id
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const scrubError = (error: unknown, privateKey: string) => {
   const raw = error instanceof Error ? error.message : "Polymarket request failed.";
-  return raw.replaceAll(privateKey, "[redacted]").replace(/0x[a-fA-F0-9]{40,}/g, "[redacted]").slice(0, 240);
+  const withoutPrivateKey = privateKey ? raw.replaceAll(privateKey, "[redacted]") : raw;
+  return withoutPrivateKey.replace(/0x[a-fA-F0-9]{40,}/g, "[redacted]").slice(0, 240);
 };
 
 const ask = async (prompt: string) => {
