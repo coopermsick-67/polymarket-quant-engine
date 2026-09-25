@@ -15,7 +15,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { fetchResolvedMarketOutcomes } from "../app/lib/polymarket-data";
-import { fitStackingCalibration, type CalibrationObservation } from "../app/lib/model-calibration";
+import { evaluateRecordedDecisions, fitStackingCalibration, type DecisionObservation } from "../app/lib/model-calibration";
 import { saveCalibrationFile } from "./calibration-file";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -25,7 +25,7 @@ const outcomeCacheFile = path.join(stateDir, "outcomes.json");
 const calibrationFile = path.resolve(process.env.POLYMARKET_CALIBRATION_FILE || path.join(stateDir, "model-calibration.json"));
 const OUTCOME_BATCH = 20;
 
-type StoredObservation = CalibrationObservation & { upTokenId: string; downTokenId: string };
+type StoredObservation = DecisionObservation & { upTokenId: string; downTokenId: string };
 
 const readObservations = async (): Promise<StoredObservation[]> => {
   let text: string;
@@ -62,11 +62,18 @@ const main = async () => {
   const labelled = observations.map((row) => ({ ...row, outcome: outcomes[row.marketId] ?? null }));
   const report = fitStackingCalibration(labelled, { now });
   await saveCalibrationFile(calibrationFile, report);
+  const evidence = evaluateRecordedDecisions(labelled);
   const fmt = (value: number | null, digits = 3) => value === null ? "n/a" : value.toFixed(digits);
-  console.log(`Observations: ${observations.length} · settled markets: ${report.markets} · settled observations: ${report.observations}`);
-  console.log(`Coefficients: intercept ${fmt(report.intercept)} · model ${fmt(report.modelCoefficient)} [95% ${fmt(report.modelCoefficientLower)}, ${fmt(report.modelCoefficientUpper)}] · market ${fmt(report.marketCoefficient)}`);
-  console.log(`Log loss: fit ${fmt(report.logLoss, 4)} · book mid alone ${fmt(report.marketOnlyLogLoss, 4)}`);
+  console.log(`Model version: ${report.modelVersion} · observations: ${observations.length} · settled markets: ${report.markets} · settled observations: ${report.observations}`);
+  console.log(`Coefficients (fitted on the earlier 70% of markets): intercept ${fmt(report.intercept)} · model ${fmt(report.modelCoefficient)} [95% time-block ${fmt(report.modelCoefficientLower)}, ${fmt(report.modelCoefficientUpper)}] · market ${fmt(report.marketCoefficient)}`);
+  console.log(`In-sample log loss: fit ${fmt(report.logLoss, 4)} · book mid alone ${fmt(report.marketOnlyLogLoss, 4)}`);
+  console.log(`Chronological holdout (${report.heldOutMarkets} most recent markets): fit ${fmt(report.heldOutLogLoss, 4)} · book mid alone ${fmt(report.heldOutMarketLogLoss, 4)}`);
+  for (const segment of report.diagnostics) {
+    if (segment.markets) console.log(`  holdout ${segment.segment}: ${segment.markets} markets · fit ${fmt(segment.logLoss, 4)} · book ${fmt(segment.marketOnlyLogLoss, 4)}`);
+  }
   console.log(`${report.calibration ? "USABLE" : "NOT USABLE"}: ${report.reason}`);
+  console.log(`Recorded entry decisions: ${evidence.entries} settled · mean claimed edge ${fmt(evidence.meanClaimedEdge, 4)} · mean realized ${fmt(evidence.meanRealizedEdge, 4)} [95% ${fmt(evidence.realizedLower, 4)}, ${fmt(evidence.realizedUpper, 4)}] per share`);
+  console.log(evidence.reason);
   console.log(`Wrote ${calibrationFile}`);
 };
 

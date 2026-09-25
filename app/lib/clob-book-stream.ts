@@ -4,6 +4,7 @@ import {
   updateLiveMarketBookLevel,
   type BookLevel,
   type LiveMarket,
+  type OrderBook,
 } from "./polymarket-data";
 
 /** Normalized CLOB market-channel event. */
@@ -146,9 +147,18 @@ export const applyClobStreamEvents = (
       }
       // An invalidated book (timestamp null) is only restored by a full snapshot.
       if (desyncedTokens.has(event.tokenId) || stale || (current && current.timestamp === null)) continue;
-      const updated = event.kind === "level"
-        ? updateLiveMarketBookLevel(market, event.tokenId, event.side, event.price, event.size, localNow, event.timestamp ?? serverNow)
-        : market;
+      if (event.kind === "quote") {
+        // A best_bid_ask that agrees with the book is token-specific evidence
+        // that the book is still current; one that disagrees may simply have
+        // overtaken its price_change, so it is not treated as drift.
+        if (current && current.timestamp !== null && quoteMatches(market, event.tokenId, event.bestBid, event.bestAsk)) {
+          const confirmedAt = Math.max(current.timestamp, event.timestamp ?? serverNow);
+          const book = { ...current, timestamp: confirmedAt };
+          next.set(id, event.tokenId === market.upTokenId ? { ...market, upBook: book } : { ...market, downBook: book });
+        }
+        continue;
+      }
+      const updated = updateLiveMarketBookLevel(market, event.tokenId, event.side, event.price, event.size, localNow, event.timestamp ?? serverNow);
       if (lastCheckIndex.get(event.tokenId) === index && !quoteMatches(updated, event.tokenId, event.bestBid, event.bestAsk)) {
         desyncedTokens.add(event.tokenId);
         next.set(id, invalidateBook(updated, event.tokenId));
@@ -161,23 +171,57 @@ export const applyClobStreamEvents = (
 };
 
 /**
- * While the stream is connected and in sync, an unchanged book is still the
- * current book: re-stamp it so quiet markets stay executable. Books that were
- * invalidated (timestamp null) are left alone until a snapshot repairs them.
+ * Tokens whose book has had no token-specific evidence (snapshot, applied
+ * change, or matching best bid/ask) for `maxAgeMs`, or was invalidated. A
+ * healthy socket is not evidence for a quiet token: a missed frame for one
+ * token would otherwise leave a stale price marked current. Callers refresh
+ * these from REST snapshots.
  */
-export const confirmStreamedBooks = (
-  markets: ReadonlyMap<string, LiveMarket>,
-  streamedTokens: ReadonlySet<string>,
+export const staleBookTokens = (
+  markets: Iterable<LiveMarket>,
+  tokens: ReadonlySet<string>,
   localNow = Date.now(),
-): Map<string, LiveMarket> => {
+  maxAgeMs = 5_000,
+): string[] => {
   const serverNow = synchronizedPolymarketTime(localNow);
-  const next = new Map<string, LiveMarket>();
-  for (const [id, market] of markets) {
-    const confirm = (book: LiveMarket["upBook"], tokenId: string) =>
-      book && book.timestamp !== null && streamedTokens.has(tokenId) && book.timestamp < serverNow ? { ...book, timestamp: serverNow } : book;
-    const upBook = confirm(market.upBook, market.upTokenId);
-    const downBook = confirm(market.downBook, market.downTokenId);
-    next.set(id, upBook === market.upBook && downBook === market.downBook ? market : { ...market, upBook, downBook });
+  const stale = new Set<string>();
+  for (const market of markets) {
+    for (const [tokenId, book] of [[market.upTokenId, market.upBook], [market.downTokenId, market.downBook]] as const) {
+      if (!tokens.has(tokenId)) continue;
+      if (!book || book.timestamp === null || serverNow - book.timestamp > maxAgeMs) stale.add(tokenId);
+    }
   }
-  return next;
+  return [...stale];
+};
+
+/** Apply a REST snapshot unless the stream already holds newer contents for that book. */
+export const applyBookSnapshot = (market: LiveMarket, tokenId: string, snapshot: OrderBook, localNow = Date.now()): LiveMarket => {
+  const current = tokenId === market.upTokenId ? market.upBook : tokenId === market.downTokenId ? market.downBook : null;
+  if (tokenId !== market.upTokenId && tokenId !== market.downTokenId) return market;
+  const currentSequence = current?.updatedAt ?? current?.timestamp ?? null;
+  if (current && current.timestamp !== null && snapshot.timestamp !== null && currentSequence !== null && snapshot.timestamp < currentSequence) return market;
+  const replaced = replaceLiveMarketBook(market, tokenId, snapshot.bids, snapshot.asks, snapshot.timestamp, snapshot.hash, localNow);
+  const book = tokenId === replaced.upTokenId ? replaced.upBook : replaced.downBook;
+  if (!book) return replaced;
+  const withMeta = { ...book, tickSize: snapshot.tickSize ?? book.tickSize ?? null, minOrderSize: snapshot.minOrderSize ?? book.minOrderSize };
+  return tokenId === replaced.upTokenId ? { ...replaced, upBook: withMeta } : { ...replaced, downBook: withMeta };
+};
+
+/** Keep stream evidence received while a full REST market refresh was in flight. */
+export const preserveNewerStreamBooks = (fresh: LiveMarket, previous: LiveMarket | undefined, localNow = Date.now()): LiveMarket => {
+  if (!previous) return fresh;
+  let merged = fresh;
+  for (const tokenId of [fresh.upTokenId, fresh.downTokenId]) {
+    const prior = tokenId === previous.upTokenId ? previous.upBook : tokenId === previous.downTokenId ? previous.downBook : null;
+    const snapshot = tokenId === fresh.upTokenId ? fresh.upBook : fresh.downBook;
+    if (!prior || prior.timestamp === null || snapshot?.timestamp !== null
+      && snapshot?.timestamp !== undefined && prior.timestamp <= snapshot.timestamp) continue;
+    merged = replaceLiveMarketBook(merged, tokenId, prior.bids, prior.asks, prior.timestamp, prior.hash, localNow);
+    const book = tokenId === merged.upTokenId ? merged.upBook : merged.downBook;
+    if (book) {
+      const withMeta = { ...book, tickSize: prior.tickSize ?? book.tickSize, minOrderSize: prior.minOrderSize ?? book.minOrderSize };
+      merged = tokenId === merged.upTokenId ? { ...merged, upBook: withMeta } : { ...merged, downBook: withMeta };
+    }
+  }
+  return merged;
 };

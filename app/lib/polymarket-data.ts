@@ -21,6 +21,8 @@ export type OrderBook = {
   timestamp: number | null;
   /** Server time of the last change to the book's contents; orders stream updates. */
   updatedAt?: number | null;
+  /** Venue price increment for this token, when the source reported it. */
+  tickSize?: number | null;
   minOrderSize: number | null;
   hash: string | null;
 };
@@ -745,6 +747,7 @@ const parseBook = (raw: Record<string, unknown>, tokenId: string): OrderBook => 
     asks: levels(raw.asks).sort((left, right) => left.price - right.price),
     timestamp: epochMs(raw.timestamp),
     updatedAt: epochMs(raw.timestamp),
+    tickSize: finiteNumber(raw.tick_size ?? raw.tickSize),
     minOrderSize: finiteNumber(raw.min_order_size || raw.minOrderSize),
     hash: normalizeText(raw.hash) || null,
   };
@@ -989,8 +992,14 @@ export const chartFairProbability = (
 export const TWAP_WINDOW_SECONDS = 60;
 /** Share of the already-elapsed settlement window that needs spot coverage. */
 const MIN_TWAP_OBSERVED_COVERAGE = 0.8;
+/**
+ * Longest a spot tick is assumed to hold. Chainlink spot arrives about once a
+ * second; a longer silence is a feed gap, and counting it as observed would let
+ * a brief outage near expiry bias the forecast while the last tick still looks fresh.
+ */
+export const MAX_TICK_CARRY_MS = 3_000;
 
-/** Average of a step-interpolated tick series over [from, to]; null without enough coverage. */
+/** Average of a step-interpolated tick series over [from, to]; each tick holds for at most MAX_TICK_CARRY_MS. Null without enough coverage. */
 export const averageObservedPrice = (ticks: readonly MarketPriceTick[], from: number, to: number): number | null => {
   if (!(to > from)) return null;
   const ordered = ticks.filter((tick) => Number.isFinite(tick.price) && tick.price > 0 && tick.timestamp <= to)
@@ -1003,7 +1012,7 @@ export const averageObservedPrice = (ticks: readonly MarketPriceTick[], from: nu
   let covered = 0;
   for (let index = 0; index < usable.length; index += 1) {
     const segmentStart = Math.max(from, usable[index].timestamp);
-    const segmentEnd = Math.min(to, usable[index + 1]?.timestamp ?? to);
+    const segmentEnd = Math.min(to, usable[index + 1]?.timestamp ?? to, usable[index].timestamp + MAX_TICK_CARRY_MS);
     if (segmentEnd <= segmentStart) continue;
     weighted += usable[index].price * (segmentEnd - segmentStart);
     covered += segmentEnd - segmentStart;
@@ -1305,8 +1314,21 @@ export const anchorProbability = (modelUp: number, marketUp: number, modelWeight
  * It replaces the fixed prior weight only when the fit shows the model adds
  * information (see app/lib/model-calibration.ts for the activation rules).
  */
+/**
+ * Identity of the raw forecast whose outputs are recorded and calibrated. Any
+ * change to the forecast (inputs, feed, formula) must change this string, so
+ * weights fitted on an older model can never arm a newer one.
+ */
+export const FORECAST_MODEL_VERSION = "twap60-spot-brownian-v1";
+
 export type StackingCalibration = {
-  version: 1;
+  version: 2;
+  /** FORECAST_MODEL_VERSION of every observation the fit used. */
+  modelVersion: string;
+  /** Market-weighted log loss on the chronological holdout: the fit, and the book mid alone. */
+  heldOutLogLoss: number;
+  heldOutMarketLogLoss: number;
+  heldOutMarkets: number;
   intercept: number;
   modelCoefficient: number;
   marketCoefficient: number;
@@ -1325,7 +1347,11 @@ export const isUsableCalibration = (value: unknown): value is StackingCalibratio
   const calibration = value as Partial<StackingCalibration>;
   const finite = [calibration.intercept, calibration.modelCoefficient, calibration.marketCoefficient,
     calibration.modelCoefficientLower, calibration.markets, calibration.observations, calibration.fittedAt].every((entry) => typeof entry === "number" && Number.isFinite(entry));
-  return calibration.version === 1 && finite
+  const heldOut = [calibration.heldOutLogLoss, calibration.heldOutMarketLogLoss, calibration.heldOutMarkets]
+    .every((entry) => typeof entry === "number" && Number.isFinite(entry));
+  return calibration.version === 2 && finite && heldOut
+    && calibration.modelVersion === FORECAST_MODEL_VERSION
+    && calibration.heldOutLogLoss! < calibration.heldOutMarketLogLoss!
     && calibration.markets! >= MIN_CALIBRATION_MARKETS
     && calibration.modelCoefficientLower! > 0
     && calibration.marketCoefficient! > 0

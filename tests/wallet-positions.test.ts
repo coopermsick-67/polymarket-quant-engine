@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fetchAllWalletPositions, openPositions, parseWalletPositionRows, positionsUrl, settledPositions } from "../app/lib/wallet-positions";
+import { assertNoComboPositions, fetchAllWalletPositions, openPositions, parseWalletPositionRows, positionsUrl, settledPositions } from "../app/lib/wallet-positions";
 
 // Field names and shapes as returned by data-api.polymarket.com/v2/positions (checked Sep 2026).
 const row = (overrides: Record<string, unknown>) => ({
@@ -46,4 +46,33 @@ test("every cursor page is read, and a stuck cursor fails closed", async () => {
   assert.deepEqual(all.map((position) => position.tokenID), ["1", "2"]);
   await assert.rejects(fetchAllWalletPositions(async () => ({ data: [], pagination: { has_more: true, next_cursor: "same" } })), /did not advance/);
   assert.match(positionsUrl("https://data-api.polymarket.com", "0x1", "c2"), /cursor=c2/);
+});
+
+test("a declared further page without a usable cursor fails closed instead of returning a partial wallet", async () => {
+  // The audit's reproduction: has_more with no next_cursor.
+  await assert.rejects(fetchAllWalletPositions(async () => ({ data: [row({ token_id: "abc" })], pagination: { has_more: true } })), /without a usable cursor/);
+  await assert.rejects(fetchAllWalletPositions(async () => ({ data: [row({})], pagination: { has_more: "yes" } })), /whether more pages exist/);
+  await assert.rejects(fetchAllWalletPositions(async () => ({ data: Array.from({ length: 100 }, (_, index) => row({ token_id: String(index) })) })), /without pagination data/);
+  const pages: Record<string, unknown> = {
+    first: { data: [row({ token_id: "1" })], pagination: { has_more: true, next_cursor: "a" } },
+    a: { data: [row({ token_id: "2" })], pagination: { has_more: true, next_cursor: "b" } },
+    b: { data: [row({ token_id: "3" })], pagination: { has_more: true, next_cursor: "a" } },
+  };
+  await assert.rejects(fetchAllWalletPositions(async (cursor) => pages[cursor ?? "first"]), /did not advance/);
+});
+
+test("an open position with shares but neither cost nor price is refused, not valued at zero", () => {
+  assert.throws(() => parseWalletPositionRows([{ current_size: "10", token_id: "abc", status: "OPEN" }]), /neither a cost nor a price/);
+  assert.throws(() => parseWalletPositionRows([row({ avg_price: "NaN", total_cost_usdc: null, current_value: undefined, current_price: undefined })]), /neither a cost nor a price/);
+  const resolved = parseWalletPositionRows([{ current_size: "10", token_id: "abc", status: "REDEEMABLE", current_value: 0 }]);
+  assert.equal(resolved[0].settled, true);
+});
+
+test("wallet reads ask for dust and archived positions, and refuse wallets holding combos", () => {
+  const url = new URL(positionsUrl("https://data-api.polymarket.com", "0x1", null));
+  assert.equal(url.searchParams.get("filter_amount"), "0");
+  assert.equal(url.searchParams.get("include_archived"), "true");
+  assert.doesNotThrow(() => assertNoComboPositions({ data: [], pagination: { has_more: false, next_cursor: null } }));
+  assert.throws(() => assertNoComboPositions({ data: [{ id: "combo" }] }), /combo positions/);
+  assert.throws(() => assertNoComboPositions({ error: "x" }), /could not be read/);
 });

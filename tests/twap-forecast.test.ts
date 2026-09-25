@@ -50,7 +50,7 @@ test("inside the averaging window the observed part of the TWAP is locked in", (
 test("without enough observed coverage inside the window no probability is claimed", () => {
   const sparse = [{ timestamp: NOW - 5_000, price: 100.2 }];
   assert.equal(twapSettlementProbability({ reference: 100, spot: 100, spotHistory: sparse, endTime: NOW + 10_000, now: NOW, sigmaPerSecond: 0.0003 }), null);
-  assert.equal(averageObservedPrice([{ timestamp: NOW - 10_000, price: 1 }, { timestamp: NOW - 5_000, price: 3 }], NOW - 10_000, NOW), 2);
+  assert.equal(averageObservedPrice([{ timestamp: NOW - 10_000, price: 1 }, { timestamp: NOW - 7_000, price: 1 }, { timestamp: NOW - 5_000, price: 3 }, { timestamp: NOW - 2_000, price: 3 }], NOW - 10_000, NOW), 2);
 });
 
 test("TWAP markets forecast from Chainlink spot, not from the lagging TWAP", () => {
@@ -74,4 +74,13 @@ test("TWAP markets forecast from Chainlink spot, not from the lagging TWAP", () 
   assert.equal(applied.settlementPrice, 99.97);
   assert.equal(applied.spot, 100.15);
   assert.ok(applied.fairUp !== null && applied.fairUp > 0.5, `forecast should follow spot above the reference, got ${applied.fairUp}`);
+});
+
+test("a feed gap inside the averaging window is not counted as observed (audit M8)", () => {
+  // Ticks every second for the first 30 s of the 50 s already elapsed, then 20 s of silence.
+  const history = Array.from({ length: 31 }, (_, index) => ({ timestamp: NOW - 50_000 + index * 1000, price: 100.2 }));
+  assert.equal(averageObservedPrice(history, NOW - 50_000, NOW), null, "30 s of real coverage out of 50 s is below the 80% floor");
+  assert.equal(twapSettlementProbability({ reference: 100, spot: 100.2, spotHistory: history, endTime: NOW + 10_000, now: NOW, sigmaPerSecond: 0.0003 }), null);
+  const complete = Array.from({ length: 51 }, (_, index) => ({ timestamp: NOW - 50_000 + index * 1000, price: 100.2 }));
+  assert.ok(Math.abs(averageObservedPrice(complete, NOW - 50_000, NOW)! - 100.2) < 1e-9);
 });

@@ -55,13 +55,28 @@ export const positionRowsFrom = (payload: unknown): unknown[] | null => {
   return null;
 };
 
-export const nextPositionCursor = (payload: unknown): string | null => {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
-  const pagination = (payload as Record<string, unknown>).pagination;
-  if (!pagination || typeof pagination !== "object") return null;
+/**
+ * The next page's cursor, or null when the list is complete. Anything that does
+ * not prove completeness throws: a declared further page without a usable
+ * cursor, a missing or malformed pagination envelope on a full page, or a
+ * non-boolean has_more. A partial wallet must never look like a whole one.
+ */
+export const nextPositionCursor = (payload: unknown, rowsOnPage: number): string | null => {
+  const pagination = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? (payload as Record<string, unknown>).pagination : undefined;
+  if (pagination === undefined || pagination === null) {
+    if (rowsOnPage >= POSITION_PAGE_LIMIT) throw new Error("A full page of positions arrived without pagination data; live orders are blocked.");
+    return null;
+  }
+  if (typeof pagination !== "object" || Array.isArray(pagination)) throw new Error("Position pagination data was unreadable; live orders are blocked.");
   const record = pagination as Record<string, unknown>;
-  if (record.has_more !== true) return null;
-  return typeof record.next_cursor === "string" && record.next_cursor ? record.next_cursor : null;
+  if (record.has_more === false) return null;
+  if (record.has_more !== true) throw new Error("Position pagination did not say whether more pages exist; live orders are blocked.");
+  const cursor = record.next_cursor;
+  if (typeof cursor !== "string" || !/^[A-Za-z0-9_\-=.+/]{1,4096}$/.test(cursor)) {
+    throw new Error("Polymarket reported more positions without a usable cursor; live orders are blocked.");
+  }
+  return cursor;
 };
 
 /** Parse API rows; throws when a row cannot be understood, so live risk never runs on a partial picture. */
@@ -87,6 +102,9 @@ export const parseWalletPositionRows = (rows: readonly unknown[]): WalletPositio
     : currentPrice !== null && currentPrice >= 0 ? size * currentPrice : null;
   // An open position with no recorded cost (for example a transfer in) is
   // still at risk; count its current value instead.
+  if (!settled && costBasisUsd === null && markValue === null) {
+    throw new Error(`Position ${tokenID} has shares but neither a cost nor a price; live orders are blocked until it can be valued.`);
+  }
   const exposureUsd = settled ? 0 : costBasisUsd ?? markValue ?? 0;
   const outcome = firstText(source, "outcome") ?? "—";
   const upper = outcome.toUpperCase();
@@ -117,26 +135,51 @@ export const fetchAllWalletPositions = async (
   fetchPage: (cursor: string | null) => Promise<unknown>,
 ): Promise<WalletPosition[]> => {
   const positions: WalletPosition[] = [];
+  const seenCursors = new Set<string>();
   let cursor: string | null = null;
   for (let page = 0; page < MAX_POSITION_PAGES; page += 1) {
     const payload = await fetchPage(cursor);
     const rows = positionRowsFrom(payload);
     if (!rows) throw new Error("Polymarket returned an unreadable position list; live orders are blocked.");
     positions.push(...parseWalletPositionRows(rows));
-    const next = nextPositionCursor(payload);
+    const next = nextPositionCursor(payload, rows.length);
     if (!next) return positions;
-    if (next === cursor) throw new Error("Polymarket position pagination did not advance; live orders are blocked.");
+    if (seenCursors.has(next)) throw new Error("Polymarket position pagination did not advance; live orders are blocked.");
+    seenCursors.add(next);
     cursor = next;
   }
   throw new Error("The complete position list could not be established within the page limit; live orders are blocked.");
 };
 
+/**
+ * The Data API hides positions under 0.1 shares and archived markets by
+ * default; both still hold funds and risk, so ask for everything.
+ */
 export const positionsUrl = (dataApi: string, wallet: string, cursor: string | null) => {
   const url = new URL(`${dataApi}/v2/positions`);
   url.searchParams.set("user", wallet);
   url.searchParams.set("limit", String(POSITION_PAGE_LIMIT));
+  url.searchParams.set("filter_amount", "0");
+  url.searchParams.set("include_archived", "true");
   if (cursor) url.searchParams.set("cursor", cursor);
   return url.toString();
+};
+
+export const comboPositionsUrl = (dataApi: string, wallet: string) => {
+  const url = new URL(`${dataApi}/v2/positions/combos`);
+  url.searchParams.set("user", wallet);
+  url.searchParams.set("limit", "1");
+  return url.toString();
+};
+
+/**
+ * Combo (multi-leg) positions are served separately and this engine cannot
+ * value them, so a wallet holding any is refused rather than under-counted.
+ */
+export const assertNoComboPositions = (payload: unknown) => {
+  const rows = positionRowsFrom(payload);
+  if (!rows) throw new Error("Combo positions could not be read; live orders are blocked.");
+  if (rows.length) throw new Error("This wallet holds combo positions, which the engine cannot value; use a dedicated trading wallet without combos.");
 };
 
 export const openPositions = (positions: readonly WalletPosition[]) => positions.filter((position) => !position.settled);

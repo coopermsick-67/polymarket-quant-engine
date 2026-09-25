@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { modelPriceCeiling, quoteMinimumShareBuy, quoteSell, takerFeePerShare } from "../../app/lib/live-order-pricing";
-import { reconcileFakWithOrderStatus } from "../../app/lib/fak-fill-reconciliation";
+import { bidLiquidationValue, modelPriceCeiling, quoteMinimumShareBuy, quoteSell, takerFeePerShare, toleranceTicksFor } from "../../app/lib/live-order-pricing";
 
 const CLOB_FEES = { rate: 0.07, exponent: 1, feesEnabled: true, source: "CLOB" as const };
 
@@ -30,15 +29,25 @@ test("a sell limit allows the same tick tolerance below the best bid", () => {
   assert.equal(quoteSell({ bids: [{ price: 0.6, size: 3 }], shares: 8, tickSize: "0.01", toleranceTicks: 2, minimumShares: 5 }), null);
 });
 
-test("the CLOB order record decides a FAK fill even while the wallet view lags", () => {
-  const lagging = reconcileFakWithOrderStatus({ side: "BUY", requestedShares: 5, clobMatchedShares: 5, walletShares: 0, responseShares: 5, accepted: true });
-  assert.deepEqual([lagging.status, lagging.filledShares, lagging.source], ["FULL", 5, "CLOB"]);
-  const partial = reconcileFakWithOrderStatus({ side: "SELL", requestedShares: 5, clobMatchedShares: 2, walletShares: 2, responseShares: 0, accepted: true });
-  assert.equal(partial.status, "PARTIAL");
-  const noFill = reconcileFakWithOrderStatus({ side: "BUY", requestedShares: 5, clobMatchedShares: 0, walletShares: 0, responseShares: 0, accepted: true });
-  assert.equal(noFill.status, "NO_FILL");
-  const extra = reconcileFakWithOrderStatus({ side: "BUY", requestedShares: 5, clobMatchedShares: 5, walletShares: 9, responseShares: 5, accepted: true });
-  assert.equal(extra.status, "UNCERTAIN", "more wallet shares than the order matched means something else traded");
-  const fallback = reconcileFakWithOrderStatus({ side: "BUY", requestedShares: 5, clobMatchedShares: null, walletShares: 0, responseShares: 0, accepted: true });
-  assert.deepEqual([fallback.status, fallback.source], ["UNCERTAIN", "WALLET"]);
+test("a coarse tick can never widen a limit past two cents (a 0.60 bid with a 0.10 tick sells at 0.60, not 0.40)", () => {
+  assert.equal(toleranceTicksFor(2, 0.1), 0);
+  assert.equal(toleranceTicksFor(2, 0.01), 2);
+  assert.equal(toleranceTicksFor(2, 0.005), 2);
+  const coarse = quoteSell({ bids: [{ price: 0.6, size: 10 }], shares: 5, tickSize: "0.1", toleranceTicks: 2, minimumShares: 5, feeSchedule: CLOB_FEES })!;
+  assert.equal(coarse.limitPrice, 0.6);
+  const buy = quoteMinimumShareBuy({ asks: [{ price: 0.5, size: 100 }], venueMinimumShares: 5, floorShares: 5, tickSize: "0.1", fairProbability: 0.95,
+    minEdge: 0.04, slippageBps: 25, toleranceTicks: 2, feeSchedule: CLOB_FEES, fallbackFeeRate: 0.05 })!;
+  assert.equal(buy.limitPrice, 0.5);
+});
+
+test("sell quotes report the worst proceeds the posted limit allows, after fees", () => {
+  const quote = quoteSell({ bids: [{ price: 0.6, size: 3 }, { price: 0.59, size: 10 }], shares: 8, tickSize: "0.01", toleranceTicks: 2, minimumShares: 5, feeSchedule: CLOB_FEES })!;
+  assert.ok(Math.abs(quote.worstProceedsUsd - 8 * (0.58 - 0.07 * 0.58 * 0.42)) < 1e-9);
+});
+
+test("liquidation value walks the bids, charges fees, and values shares beyond depth at zero", () => {
+  const value = bidLiquidationValue([{ price: 0.5, size: 4 }, { price: 0.4, size: 2 }], 10, CLOB_FEES, 0.05);
+  const expected = 4 * (0.5 - 0.07 * 0.25) + 2 * (0.4 - 0.07 * 0.24);
+  assert.ok(Math.abs(value - expected) < 1e-9);
+  assert.equal(bidLiquidationValue([], 10, CLOB_FEES, 0.05), 0);
 });

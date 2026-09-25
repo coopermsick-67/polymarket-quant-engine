@@ -13,8 +13,8 @@ Polymarket Quant Engine is a paper-first terminal for active crypto Up/Down mark
 - Resolution-aware paper settlement: winning shares pay $1, losing shares pay $0 when an expired market outcome is available; realized cash flows into the same balance used by newly opened markets.
 - Browser-local decision ledger for all active markets with UP/DOWN/PASS, outcomes, timestamps, sizing, and CSV export.
 - Timeframe paper tests with a chosen starting balance and duration, Telegram test/report delivery, and Sunday 9 PM Eastern browser-assisted scheduling.
-- Optional owner-authenticated Polymarket account reads and live execution gates in the hosted Site, with balance checks, risk limits, fractional Kelly sizing, duration filters, pause, and cancel-all controls.
-- Model-aware cashouts for paper positions and an opt-in live exit policy: the current executable bid must clear the model fair probability, minimum dollar/percentage profit, remaining-time, and repeated-confirmation checks before a sell is attempted. The server revalidates the position and market immediately before submitting a non-retried FAK sell.
+- Wallet account reads in the browser (public data anywhere; an authenticated session only on a local, loopback-bound server) and cancel-all. Live orders are placed only by the terminal trader.
+- Model-aware cashouts for paper positions, and an opt-in exit policy in the terminal trader. It judges each sale on the worst proceeds its posted limit allows, and rechecks the fresh position, market, and book before a FAK sell.
 
 The raw model forecasts the market's actual settlement value. For TWAP markets that is the 60-second Chainlink TWAP at expiry, and the forecast starts from Chainlink spot, not from the TWAP, which lags spot by about half its window. It then combines that forecast with the order book. By default a conservative prior gives the model a quarter of the weight in log-odds. `pnpm run calibrate` fits the weights from settled outcomes (`logit P = a + b_model·logit(model) + b_market·logit(mid)`, clustered by market). A fit is used only once 300+ markets have settled and the model coefficient's lower 95% bound is above zero. A usable fit shows the model adds information to the book; it does not establish profit. Nothing in the interface guarantees a profit or a fill. Live orders use real funds and must be independently tested with paper data first.
 
@@ -111,7 +111,9 @@ The daemon appends one decision-time observation per market every 15 seconds to 
 pnpm run calibrate
 ```
 
-It resolves outcomes from Gamma, fits the stacking regression, and writes `var/model-calibration.json`. The daemon reloads it every 10 minutes, and `pnpm run live` loads it at startup. Both use the fitted weights only when the fit is usable, and the conservative prior otherwise. `POLYMARKET_CALIBRATION_FILE` points both at another file.
+It resolves outcomes from Gamma, fits the stacking regression on observations of the current model version only (`FORECAST_MODEL_VERSION`), and writes `var/model-calibration.json` tagged with that version. The weights are fitted on the earlier 70% of markets. The interval for the model coefficient resamples hour blocks, and the fit must beat the book mid alone on the most recent 30%. The daemon reloads the file every 10 minutes and `pnpm run live` loads it at startup. Both refuse a file from a different model version, or one that failed any gate, and use the conservative prior instead. `POLYMARKET_CALIBRATION_FILE` points both at another file.
+
+The same command reports the candidate-level evidence: for each settled market, the first recorded entry decision's claimed net edge against what settlement paid, per share, with a time-block 95% interval. A usable calibration shows the model adds information; only a positive lower bound on realized edge, over many markets, suggests a net-of-fee edge.
 
 Paper mode requires no API keys or wallet credentials. Keep any future live credentials in host-only secret storage; this daemon has no live executor, and the dashboard's browser-authenticated live routes are not part of this service.
 
@@ -125,7 +127,7 @@ pnpm exec tsx scripts/backtest-bankrolls.ts recorded-market-history.csv
 
 The CSV needs timestamps, market IDs, duration, an explicit matching `model_version`, recorded model action and P(UP), remaining time, asks, bids, ask depth, and the CLOB minimum share size or cost. Bid depth is needed for usable liquidation marks. Outcomes and resolution times are needed for settled return and calibration metrics. Use `--help` for optional fee/slippage and explicit research assumptions. Missing bid, depth, minimum, probability, model decision, or matching model version causes the row to be excluded or PASS; missing outcomes leave result fields unavailable. The repository does not ship a candidate/order-book history sufficient to establish historical profitability. A paper fill ledger alone cannot reconstruct missed candidates or executable books.
 
-The replay reports bankroll-specific trades, returns when settled, fees, slippage assumptions, exposure, minimum-order rejections, and probability buckets. When ask-level snapshots are present, it walks those levels separately for each bankroll and resizes against the resulting VWAP. Rows without a ladder use a fixed recorded entry price or the top ask plus configured slippage, so their price impact cannot be inferred. Liquidation equity uses each recorded top bid and bid depth with the flat exit-fee approximation; missing executable bid depth is valued at zero. Sparse rows cannot reproduce a full order-book exit or continuous intramarket drawdown. Its walk-forward probability adjustment waits for at least 200 previously resolved markets overall and 30 in the matching confidence bucket. Do not treat this replay as proof of live readiness.
+The replay reports bankroll-specific trades, returns when settled, fees, slippage assumptions, exposure, minimum-order rejections, and probability buckets. When ask-level snapshots are present, it walks those levels separately for each bankroll and resizes against the resulting VWAP. Rows without a ladder use a fixed recorded entry price or the top ask plus configured slippage, so their price impact cannot be inferred. Fees follow Polymarket's taker curve (`rate × p × (1 − p)` per share), using each row's recorded `fee_rate` or the 0.07 crypto default, with no fee on redemption. Liquidation equity uses each recorded top bid and bid depth after that fee; missing executable bid depth is valued at zero. Sparse rows cannot reproduce a full order-book exit or continuous intramarket drawdown. Its walk-forward probability adjustment waits for at least 200 previously resolved markets overall and 30 in the matching confidence bucket. Do not treat this replay as proof of live readiness.
 
 ## Interactive terminal live trader
 
@@ -140,31 +142,31 @@ The trader uses the shared model and bankroll evaluator.
 - **Signals and edge:** it accepts ENTRY or LOCK signals, or only LOCK when `POLYMARKET_LIVE_REQUIRE_LOCK=true`, with a net edge of at least 4%. Fees come from each market's own CLOB fee schedule; the flat 5% rate is used only when that schedule can't be read.
 - **Orders:** every order is the venue minimum of five shares (or more if the venue requires it), and never more than $5. Each order is a FAK limit order priced up to two ticks past the observed price, never above the model's price ceiling.
 - **Startup checks:** the trader checks whether your balance can place any entry at all, and refuses to arm if it can't. For example, $10 at a 15% per-entry cap can't buy five shares at the tier's 30¢ floor.
-- **Fill reconciliation:** fills are reconciled from the CLOB's own order record (`size_matched`), with the Data API wallet view as a cross-check that is given up to 10 s to catch up. An order whose result can't be proven leaves a pending marker and halts the trader, so a restart can't silently submit a duplicate.
-- **Wallet positions:** positions are read across every page. Resolved positions awaiting redemption don't count as open exposure or toward position limits. The trader doesn't send on-chain redemption transactions; it reports what is waiting, and you redeem on polymarket.com.
-- **Exits:** model-aware cashouts are optional. An optional 20% take-profit and stop-loss only sell when the model doesn't value holding above the fee-adjusted sale.
+- **Order journal:** each order is written as SUBMITTING before it is posted. If the process stops there, a restart halts for manual reconciliation. Once the CLOB returns an order ID, the order is SETTLING: a CLOB match is not a fill until every one of its trades is CONFIRMED (or FAILED) and the wallet shows the confirmed shares. Nothing else is ordered while an order settles, a restart resumes the reconciliation, and unexpected wallet movement or 10 minutes unresolved halts the trader.
+- **Wallet positions:** positions are read across every page, including dust and archived markets. A missing cursor, an open position with neither cost nor price, or any combo position blocks trading. Resolved positions awaiting redemption don't count as open exposure or toward position limits. The trader doesn't send on-chain redemption transactions; it reports what is waiting, and you redeem on polymarket.com.
+- **Equity and baselines:** liquidation equity marks open positions against their executable bids after fees (unmarkable positions count as zero). Collateral is converted from raw six-decimal units. The wallet and marks refresh every 3 s whatever the exit setting, and the drawdown peak persists across UTC days.
+- **Exits:** model-aware cashouts are optional. A sale is judged on the worst proceeds its posted limit allows, with the book's own tick size. Limits never sit more than $0.02 past the observed price. An optional 20% take-profit and stop-loss only sell when the model doesn't value holding above the fee-adjusted sale.
 - **Private key:** the signer key is only read at the hidden prompt, never from the environment.
 
 Press `Q` then Enter to stop. Live orders use real funds, and none of this establishes profitability.
 
 ## Local environment
 
-Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by production live execution.
+Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. Any deployment reachable from the network must set `POLYMARKET_HOSTED=true`, which disables the local-owner bypass whatever else is configured.
 
 Raw signer private keys are only accepted by a local server bound to loopback with `POLYMARKET_LIVE_ALLOW_LOCALHOST=true`. A hosted deployment refuses them, because the key would travel over the network and sit (encrypted) in a session cookie. On a hosted deployment the Account view accepts read-only CLOB API credentials instead; for live orders, use the terminal trader.
 
-Live linking retries transient Polymarket credential, balance, and open-order reads. If the upstream socket is reset, the request returns a readable error and no order is retried or assumed successful; reconcile the Account view before trying any uncertain execution again. Live buy and sell submissions are disabled unless the server-side `POLYMARKET_LIVE_EXECUTION_ENABLED` value is exactly `true`; keep it `false` for paper operation. The daemon's `TRADING_MODE` setting is separate and remains paper-only.
+Live linking retries transient Polymarket credential, balance, and open-order reads. The web routes never submit orders: `execute`, `manual-entry`, `exit`, and `manual-exit` return `410 TERMINAL_ONLY`, because a serverless route cannot hold a durable per-wallet order journal. The daemon's `TRADING_MODE` setting is separate and remains paper-only.
 
-For live execution on a trusted localhost machine, explicitly opt in to the loopback-only gate and provide a 32-byte session secret:
+To link a wallet session on a trusted localhost machine (balance, positions, cancel-all), explicitly opt in to the loopback-only gate and provide a 32-byte session secret:
 
 ```text
 POLYMARKET_LIVE_ALLOW_LOCALHOST=true
 POLYMARKET_LIVE_SESSION_SECRET=<64 hexadecimal characters>
-POLYMARKET_LIVE_EXECUTION_ENABLED=false
 POLYMARKET_TELEGRAM_SESSION_SECRET=<another 64 hexadecimal characters>
 ```
 
-Generate each session secret with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, restart the server, and then link the wallet or Telegram bot in the local dashboard. Local live and Telegram sessions are encrypted, and the local bypass requires a matching localhost request host without forwarding headers. The Fetch API does not expose the socket peer, so bind the app directly to loopback and never put this bypass behind a reverse proxy. Keep `POLYMARKET_LIVE_EXECUTION_ENABLED=false` unless you have independently established live readiness and deliberately intend to submit real orders. The localhost flag must remain `false` on shared or production deployments.
+Generate each session secret with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, restart the server, and then link the wallet or Telegram bot in the local dashboard. Local live and Telegram sessions are encrypted, and the local bypass requires a matching localhost request host without forwarding headers. The Fetch API does not expose the socket peer, so bind the app directly to loopback and never put this bypass behind a reverse proxy. The localhost flag must remain `false` on shared or production deployments, and those deployments must set `POLYMARKET_HOSTED=true`.
 
 ## Safety and live integration boundary
 

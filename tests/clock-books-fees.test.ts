@@ -17,6 +17,7 @@ import {
   updateLiveMarketBookLevel,
 } from "../app/lib/polymarket-data";
 import { book, marketWith } from "./market-fixture";
+import { cancelPendingPaperOrderOnRestart } from "../app/lib/paper-orders";
 
 test("the clock offset uses the middle of the whole-second server reading and of the round trip", () => {
   // Server said 1000 s; the request took 200 ms locally from t=1_062_000.
@@ -95,4 +96,26 @@ test("the replay charges the fee curve on entry only and never invents a probabi
   const allIn = 0.5 + 0.07 * 0.25;
   const shares = 10 / allIn;
   assert.ok(Math.abs(result.netPnl! - (shares - 10)) < 1e-4, `net ${result.netPnl} vs ${shares - 10}`);
+});
+
+test("a paper FAK records a positive partial fill below the venue minimum; a quote does not (audit M4)", () => {
+  const now = Date.now();
+  setPolymarketClockOffsetForTesting(0);
+  const market = marketWith(now, 0.6, 0.49, 0.51);
+  const thin = { ...market, upBook: { ...market.upBook!, asks: [{ price: 0.51, size: 2 }] } };
+  const fak = buyPaper(createPaperAccount(100, now), thin, "UP", 5, { feeRate: 0, slippageBps: 0 }, "t", now, 0.52, true);
+  assert.ok(fak.fill && Math.abs(fak.fill.shares - 2) < 1e-9, "the submitted ~9.5 shares met the minimum; 2 matched");
+  const quote = buyPaper(createPaperAccount(100, now), thin, "UP", 5, { feeRate: 0, slippageBps: 0 }, "t", now, 0.52);
+  assert.equal(quote.fill, null, "a non-FAK quote still needs the minimum filled");
+  const tooSmall = buyPaper(createPaperAccount(100, now), thin, "UP", 1, { feeRate: 0, slippageBps: 0 }, "t", now, 0.52, true);
+  assert.equal(tooSmall.fill, null, "an order submitted below the minimum is rejected");
+});
+
+test("a paper order pending at shutdown is cancelled on restart, never filled or resubmitted at once (audit M5)", () => {
+  const order = { marketId: "m1", side: "UP" as const, stakeUsd: 5, maxPrice: 0.52, submittedAt: 1, reason: "t" };
+  const restart = cancelPendingPaperOrderOnRestart({ pendingPaperOrder: order, lastEntryByMarket: {} as Record<string, number> }, 1_000);
+  assert.deepEqual(restart.cancelled, order);
+  assert.equal(restart.state.pendingPaperOrder, null);
+  assert.equal(restart.state.lastEntryByMarket.m1, 1_000);
+  assert.equal(cancelPendingPaperOrderOnRestart({ pendingPaperOrder: null, lastEntryByMarket: {} }, 1_000).cancelled, null);
 });
