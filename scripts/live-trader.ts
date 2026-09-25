@@ -198,34 +198,46 @@ const acquireLock = async () => {
 };
 
 const readPositions = async (wallet: string): Promise<PositionRow[]> => {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const response = await fetch(`${DATA_API}/v2/positions?user=${encodeURIComponent(wallet)}&limit=100`, { cache: "no-store", signal: controller.signal });
-    if (!response.ok) throw new Error(`Polymarket position lookup returned ${response.status}.`);
-    const payload = await response.json() as unknown;
-    const rows = Array.isArray(payload) ? payload : payload && typeof payload === "object" && Array.isArray((payload as Record<string, unknown>).data) ? (payload as { data: unknown[] }).data : null;
-    if (!rows || rows.length >= 100) throw new Error("The complete position list could not be established; live orders are blocked.");
-    return rows.map((row): PositionRow => {
-      if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("A position row was unreadable; live orders are blocked.");
-      const source = row as Record<string, unknown>;
-      const tokenID = typeof (source.asset ?? source.asset_id ?? source.token_id) === "string" ? String(source.asset ?? source.asset_id ?? source.token_id) : null;
-      const conditionId = typeof (source.conditionId ?? source.condition_id ?? source.market) === "string" ? String(source.conditionId ?? source.condition_id ?? source.market) : null;
-      const slug = typeof (source.slug ?? source.eventSlug ?? source.event_slug) === "string" ? String(source.slug ?? source.eventSlug ?? source.event_slug) : null;
-      const rawOutcome = typeof source.outcome === "string" ? source.outcome.trim().toUpperCase() : "";
-      const outcome = rawOutcome === "UP" ? "UP" : rawOutcome === "DOWN" ? "DOWN" : null;
-      const size = number(source.current_size ?? source.size ?? source.total_size);
-      const averagePrice = number(source.avgPrice ?? source.avg_price ?? source.average_price);
-      const initialValue = number(source.initialValue ?? source.initial_value ?? source.costBasis ?? source.cost_basis);
-      const currentValue = number(source.currentValue ?? source.current_value ?? source.current_value_usd ?? source.value);
-      if (size === null || size < 0) throw new Error("Position size was unreadable; live orders are blocked.");
-      if (size > 0 && !tokenID) throw new Error("A position has no exact token ID; live orders are blocked until wallet positions are fully readable.");
-      const basis = averagePrice !== null && averagePrice > 0 && averagePrice <= 1 ? size * averagePrice : initialValue;
-      if (size > 0 && (basis === null || basis <= 0)) throw new Error("Position cost basis was unreadable; live orders are blocked.");
-      const exposureUsd = size > 0 ? Math.max(size * (averagePrice ?? 0), initialValue ?? 0) : 0;
-      return { tokenID, conditionId, slug, outcome, size, averagePrice, exposureUsd, currentValueUsd: size > 0 ? Math.max(0, currentValue ?? exposureUsd) : 0 };
-    }).filter((position) => position.size > 0);
-  } finally { clearTimeout(timer); }
+  let response: Response | null = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      response = await fetch(`${DATA_API}/v2/positions?user=${encodeURIComponent(wallet)}&limit=100`, { cache: "no-store", signal: controller.signal });
+    } finally { clearTimeout(timer); }
+    if (response.ok || ![429, 500, 502, 503, 504].includes(response.status) || attempt === 2) break;
+    // This endpoint is read-only, so retry temporary upstream failures before
+    // holding a whole scan. Never substitute cached positions for a failed read.
+    const retryAfter = Number(response.headers.get("retry-after"));
+    const delay = Number.isFinite(retryAfter) && retryAfter > 0
+      ? Math.min(2_000, retryAfter * 1_000)
+      : 250 * (2 ** attempt);
+    await response.body?.cancel().catch(() => undefined);
+    await sleep(delay);
+  }
+  if (!response?.ok) throw new Error(`Polymarket position lookup returned ${response?.status ?? "no response"} after up to 3 attempts.`);
+  const payload = await response.json() as unknown;
+  const rows = Array.isArray(payload) ? payload : payload && typeof payload === "object" && Array.isArray((payload as Record<string, unknown>).data) ? (payload as { data: unknown[] }).data : null;
+  if (!rows || rows.length >= 100) throw new Error("The complete position list could not be established; live orders are blocked.");
+  return rows.map((row): PositionRow => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("A position row was unreadable; live orders are blocked.");
+    const source = row as Record<string, unknown>;
+    const tokenID = typeof (source.asset ?? source.asset_id ?? source.token_id) === "string" ? String(source.asset ?? source.asset_id ?? source.token_id) : null;
+    const conditionId = typeof (source.conditionId ?? source.condition_id ?? source.market) === "string" ? String(source.conditionId ?? source.condition_id ?? source.market) : null;
+    const slug = typeof (source.slug ?? source.eventSlug ?? source.event_slug) === "string" ? String(source.slug ?? source.eventSlug ?? source.event_slug) : null;
+    const rawOutcome = typeof source.outcome === "string" ? source.outcome.trim().toUpperCase() : "";
+    const outcome = rawOutcome === "UP" ? "UP" : rawOutcome === "DOWN" ? "DOWN" : null;
+    const size = number(source.current_size ?? source.size ?? source.total_size);
+    const averagePrice = number(source.avgPrice ?? source.avg_price ?? source.average_price);
+    const initialValue = number(source.initialValue ?? source.initial_value ?? source.costBasis ?? source.cost_basis);
+    const currentValue = number(source.currentValue ?? source.current_value ?? source.current_value_usd ?? source.value);
+    if (size === null || size < 0) throw new Error("Position size was unreadable; live orders are blocked.");
+    if (size > 0 && !tokenID) throw new Error("A position has no exact token ID; live orders are blocked until wallet positions are fully readable.");
+    const basis = averagePrice !== null && averagePrice > 0 && averagePrice <= 1 ? size * averagePrice : initialValue;
+    if (size > 0 && (basis === null || basis <= 0)) throw new Error("Position cost basis was unreadable; live orders are blocked.");
+    const exposureUsd = size > 0 ? Math.max(size * (averagePrice ?? 0), initialValue ?? 0) : 0;
+    return { tokenID, conditionId, slug, outcome, size, averagePrice, exposureUsd, currentValueUsd: size > 0 ? Math.max(0, currentValue ?? exposureUsd) : 0 };
+  }).filter((position) => position.size > 0);
 };
 
 const readClosedTrades = async (wallet: string, now: number): Promise<ClosedPaperTrade[]> => {
@@ -587,7 +599,9 @@ async function main() {
     const streamHealth: { status: PolymarketPriceStreamStatus } = { status: "CONNECTING" };
     let lastDiscoveryAt = 0;
     let definitions: Awaited<ReturnType<typeof discoverCryptoMarkets>> = [];
-    let histories = new Map<Asset, CandleHistory>();
+    const histories = new Map<Asset, CandleHistory>();
+    let lastHistoryRefreshAt = 0;
+    let historyRefreshInFlight = false;
     let cycle = 0;
     const controller = new AbortController();
     const input = createInterface({ input: stdin, output: stdout, terminal: true });
@@ -629,6 +643,7 @@ async function main() {
           if (assets !== subscribedAssets) {
             stopStream();
             subscribedAssets = assets;
+            lastHistoryRefreshAt = 0;
             stopStream = subscribePolymarketPrices(next.map((market) => market.asset), (ticks) => {
               for (const tick of ticks) priceTicks.set(`${tick.asset}:${tick.priceFeed}:${tick.timestamp}`, tick);
               const cutoff = Date.now() - 24 * 60 * 60_000;
@@ -652,7 +667,19 @@ async function main() {
       }
       try {
         const [books] = await Promise.all([fetchOrderBooks(tokenIds, controller.signal)]);
-        if (cycle % 30 === 0) histories = await fetchCandleHistories([...new Set(definitions.map((market) => market.asset))], controller.signal);
+        if (!historyRefreshInFlight && Date.now() - lastHistoryRefreshAt >= 30_000) {
+          historyRefreshInFlight = true;
+          const candleAssets = [...new Set(definitions.map((market) => market.asset))];
+          void fetchCandleHistories(candleAssets, controller.signal)
+            .then((freshHistories) => {
+              for (const [asset, history] of freshHistories) histories.set(asset, history);
+              lastHistoryRefreshAt = Date.now();
+            })
+            .catch((error) => {
+              if (!controller.signal.aborted) console.log(`[${new Date().toLocaleTimeString()}] Candle refresh held: ${scrubError(error, privateKey)}`);
+            })
+            .finally(() => { historyRefreshInFlight = false; });
+        }
         // Discovery, books, and candle requests can take several seconds. Use
         // the post-I/O clock for oracle filtering so valid RTDS ticks received
         // during those requests are not discarded as future-dated.
