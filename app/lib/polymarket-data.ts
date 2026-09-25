@@ -924,30 +924,45 @@ const normalCdf = (value: number): number => {
   return value >= 0 ? 1 - tail : tail;
 };
 
-const returnVolatility = (closes: number[]): number | null => {
+/** Half-life of the volatility estimate; comparable to the 5m and 15m forecast horizons. */
+const VOLATILITY_HALF_LIFE_SECONDS = 30 * 60;
+/** Bars of history the EWMA looks back over (8 hours of 5m bars). */
+const VOLATILITY_LOOKBACK_SECONDS = 8 * 60 * 60;
+
+/**
+ * Zero-mean exponentially weighted volatility of log returns (RiskMetrics).
+ * Returns are listed oldest first; the newest carries weight 1.
+ */
+const ewmaVolatility = (closes: number[], halfLifeBars: number): number | null => {
   const returns = closes.slice(1).map((close, index) => Math.log(close / closes[index]));
   if (returns.length < 12) return null;
-  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
-  const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (returns.length - 1);
-  const volatility = Math.sqrt(variance);
+  const decay = Math.pow(0.5, 1 / halfLifeBars);
+  let weight = 0;
+  let weighted = 0;
+  returns.forEach((value, index) => {
+    const w = decay ** (returns.length - 1 - index);
+    weight += w;
+    weighted += w * value * value;
+  });
+  const volatility = Math.sqrt(weighted / weight);
   return Number.isFinite(volatility) && volatility > 0 ? volatility : null;
 };
 
 /**
- * Per-bar volatility. A calm 20-bar stretch understates the moves that decide
- * these markets, so use the larger of the recent and the longer (up to 80-bar)
- * estimate. Underestimated volatility is what turns a small spot lead into a
- * falsely confident probability.
+ * Per-bar volatility as an EWMA with a 30-minute half-life. The previous
+ * max(20-bar, 80-bar) estimate reached back 7 to 20 hours and, in a calm hour,
+ * priced about twice the realized volatility: on the Sep 25 2026 smoke run the
+ * raw model's implied sigma was 1.4-2.8x the last hour's realized sigma for
+ * every asset, and it lost to the book on log loss (0.446 vs 0.364). Replayed on
+ * the same resolved markets, this estimator scored 0.348.
  */
 const candleVolatility = (candles: MarketCandle[], durationSeconds: number, now: number): number | null => {
   const completed = candles.filter((candle) => candle.timestamp + durationSeconds * 1000 <= now && candle.close > 0)
     .sort((left, right) => left.timestamp - right.timestamp);
   if (completed.length < 20) return null;
-  const closes = completed.map((candle) => candle.close);
-  const recent = returnVolatility(closes.slice(-21));
-  const longer = returnVolatility(closes.slice(-81));
-  if (recent === null) return longer;
-  return longer === null ? recent : Math.max(recent, longer);
+  const lookbackBars = Math.max(20, Math.round(VOLATILITY_LOOKBACK_SECONDS / durationSeconds));
+  return ewmaVolatility(completed.slice(-(lookbackBars + 1)).map((candle) => candle.close),
+    Math.max(1, VOLATILITY_HALF_LIFE_SECONDS / durationSeconds));
 };
 
 /**
@@ -1067,14 +1082,21 @@ export const twapSettlementProbability = (input: {
   return clamp(normalCdf((expected - reference) / sd), 0.01, 0.99);
 };
 
-/** Per-second volatility and drift from the market's own horizon candles. */
-export const candleDynamicsPerSecond = (candles: MarketCandle[], duration: Horizon, now: number) => {
+/**
+ * Per-second volatility and drift. Volatility comes from 5m candles when they
+ * are supplied (finer bars give a steadier 30-minute estimate for either
+ * horizon), else from the market's own horizon candles; drift always comes from
+ * the horizon candles.
+ */
+export const candleDynamicsPerSecond = (candles: MarketCandle[], duration: Horizon, now: number, fiveMinuteCandles: MarketCandle[] = []) => {
   const barSeconds = duration === "5m" ? 300 : 900;
   const perBar = candleVolatility(candles, barSeconds, now);
-  if (perBar === null) return null;
+  const fineSigma = candleVolatility(fiveMinuteCandles, 300, now);
+  const sigmaPerSecond = fineSigma !== null ? fineSigma / Math.sqrt(300) : perBar !== null ? perBar / Math.sqrt(barSeconds) : null;
+  if (sigmaPerSecond === null) return null;
   return {
-    sigmaPerSecond: perBar / Math.sqrt(barSeconds),
-    driftPerSecond: candleDriftPerBar(candles, barSeconds, now, perBar) / barSeconds,
+    sigmaPerSecond,
+    driftPerSecond: candleDriftPerBar(candles, barSeconds, now, sigmaPerSecond * Math.sqrt(barSeconds)) / barSeconds,
   };
 };
 
@@ -1082,7 +1104,7 @@ export const candleDynamicsPerSecond = (candles: MarketCandle[], duration: Horiz
 export const marketFairProbability = (market: Pick<LiveMarket, "priceFeed" | "reference" | "spot" | "remaining" | "duration" | "endTime" | "chart5m" | "chart15m"> & { spotHistory?: MarketPriceTick[] }, now: number): number | null => {
   const candles = market.duration === "5m" ? market.chart5m : market.chart15m;
   if (market.priceFeed === "TWAP_60") {
-    const dynamics = candleDynamicsPerSecond(candles, market.duration, now);
+    const dynamics = candleDynamicsPerSecond(candles, market.duration, now, market.chart5m);
     if (!dynamics) return null;
     return twapSettlementProbability({ reference: market.reference, spot: market.spot, spotHistory: market.spotHistory ?? [],
       endTime: market.endTime, now, ...dynamics });
@@ -1319,7 +1341,7 @@ export const anchorProbability = (modelUp: number, marketUp: number, modelWeight
  * change to the forecast (inputs, feed, formula) must change this string, so
  * weights fitted on an older model can never arm a newer one.
  */
-export const FORECAST_MODEL_VERSION = "twap60-spot-brownian-v1";
+export const FORECAST_MODEL_VERSION = "twap60-spot-ewma30m-v2";
 
 export type StackingCalibration = {
   version: 2;

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   applyPolymarketPriceTicks,
   averageObservedPrice,
+  candleDynamicsPerSecond,
   setPolymarketClockOffsetForTesting,
   twapSettlementProbability,
   type LiveMarket,
@@ -83,4 +84,32 @@ test("a feed gap inside the averaging window is not counted as observed (audit M
   assert.equal(twapSettlementProbability({ reference: 100, spot: 100.2, spotHistory: history, endTime: NOW + 10_000, now: NOW, sigmaPerSecond: 0.0003 }), null);
   const complete = Array.from({ length: 51 }, (_, index) => ({ timestamp: NOW - 50_000 + index * 1000, price: 100.2 }));
   assert.ok(Math.abs(averageObservedPrice(complete, NOW - 50_000, NOW)! - 100.2) < 1e-9);
+});
+
+/** 5m candles: `volatileBars` of 0.4% swings, then `calmBars` of 0.05% swings, ending before NOW. */
+const regimeCandles = (volatileBars: number, calmBars: number) => {
+  let close = 100;
+  const total = volatileBars + calmBars;
+  return Array.from({ length: total }, (_, index) => {
+    const size = index < volatileBars ? 0.004 : 0.0005;
+    close *= Math.exp(index % 2 ? size : -size);
+    return { timestamp: NOW - (total - index + 1) * 300_000, open: close, close, high: close, low: close, volume: 1 };
+  });
+};
+
+test("volatility follows the last half hour, so a calm spell after a volatile morning is priced as calm", () => {
+  const calm = candleDynamicsPerSecond(regimeCandles(60, 24), "5m", NOW)!;
+  const volatile = candleDynamicsPerSecond(regimeCandles(60, 0), "5m", NOW)!;
+  // Two hours of 0.05% moves after five hours of 0.4% moves: the old max(20, 80-bar)
+  // estimate stayed near 0.36% per bar; the 30-minute EWMA falls to about 0.11%, the
+  // volatile spell keeping 1/16 of the weight after four half-lives.
+  assert.ok(calm.sigmaPerSecond * Math.sqrt(300) < 0.0015, `calm per-bar sigma ${calm.sigmaPerSecond * Math.sqrt(300)}`);
+  assert.ok(volatile.sigmaPerSecond * Math.sqrt(300) > 0.0035);
+});
+
+test("a 15m market takes its volatility from 5m candles when they are supplied", () => {
+  const fifteen = regimeCandles(40, 0).map((candle, index, all) => ({ ...candle, timestamp: NOW - (all.length - index + 1) * 900_000 }));
+  const coarse = candleDynamicsPerSecond(fifteen, "15m", NOW)!;
+  const fine = candleDynamicsPerSecond(fifteen, "15m", NOW, regimeCandles(60, 24))!;
+  assert.ok(fine.sigmaPerSecond < coarse.sigmaPerSecond / 1.5);
 });
