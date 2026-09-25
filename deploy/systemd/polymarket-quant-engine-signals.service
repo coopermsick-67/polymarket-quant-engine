@@ -1,0 +1,32 @@
+[Unit]
+Description=Polymarket Quant Engine 24/7 live 5m signal scanner
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pqe
+Group=pqe
+WorkingDirectory=/opt/polymarket-quant-engine
+EnvironmentFile=-/etc/polymarket-quant-engine/signals.env
+ExecStart=/usr/bin/node /opt/polymarket-quant-engine/node_modules/tsx/dist/cli.mjs scripts/live-signal-daemon.ts
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
