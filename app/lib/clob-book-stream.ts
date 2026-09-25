@@ -110,17 +110,40 @@ export const invalidateBook = (market: LiveMarket, tokenId: string): LiveMarket 
 };
 
 /**
+ * How long a top-of-book mismatch may last before the book counts as drifted.
+ * The venue splits one book change (a trade that clears several levels, say)
+ * across frames about a millisecond apart, and each frame reports the top of
+ * book after the whole change. Recorded live (Sep 25 2026, 8 tokens, 90 s):
+ * 58 mismatches, every one healed by later frames within 2 ms, and the derived
+ * book matched the venue's next full snapshot 212 times out of 214. Without a
+ * grace window each of these threw away a correct book and fired a REST
+ * refresh, hundreds of times a minute across the tracked markets.
+ */
+export const DRIFT_GRACE_MS = 250;
+
+/** Tokens whose derived top of book disagreed with the venue, keyed to when the disagreement began (local ms). */
+export type DriftSuspects = ReadonlyMap<string, number>;
+
+/**
  * Apply stream events to the tracked markets. Returns the tokens whose derived
  * book disagreed with the venue's reported top of book: their books are
  * invalidated and the caller must fetch a fresh snapshot.
+ *
+ * With `driftSuspects`, a mismatch only invalidates the book once it has
+ * lasted DRIFT_GRACE_MS; the caller keeps the returned `driftSuspects` for
+ * its next call and sweeps quiet ones with expireDriftSuspects. Without it,
+ * any mismatch invalidates at once.
  */
 export const applyClobStreamEvents = (
   markets: ReadonlyMap<string, LiveMarket>,
   events: readonly ClobStreamEvent[],
   localNow = Date.now(),
-): { markets: Map<string, LiveMarket>; desyncedTokens: Set<string>; touched: boolean } => {
+  driftSuspects?: DriftSuspects,
+): { markets: Map<string, LiveMarket>; desyncedTokens: Set<string>; touched: boolean; driftSuspects: Map<string, number> } => {
   const next = new Map(markets);
   const desyncedTokens = new Set<string>();
+  const suspects = new Map(driftSuspects ?? []);
+  const graceMs = driftSuspects ? DRIFT_GRACE_MS : 0;
   let touched = false;
   const serverNow = synchronizedPolymarketTime(localNow);
   // A frame can carry several level changes for one token; the reported top
@@ -142,6 +165,7 @@ export const applyClobStreamEvents = (
       if (event.kind === "book") {
         if (stale && current?.timestamp !== null) continue;
         desyncedTokens.delete(event.tokenId);
+        suspects.delete(event.tokenId);
         next.set(id, replaceLiveMarketBook(market, event.tokenId, event.bids, event.asks, event.timestamp ?? serverNow, event.hash, localNow));
         continue;
       }
@@ -159,15 +183,48 @@ export const applyClobStreamEvents = (
         continue;
       }
       const updated = updateLiveMarketBookLevel(market, event.tokenId, event.side, event.price, event.size, localNow, event.timestamp ?? serverNow);
-      if (lastCheckIndex.get(event.tokenId) === index && !quoteMatches(updated, event.tokenId, event.bestBid, event.bestAsk)) {
-        desyncedTokens.add(event.tokenId);
-        next.set(id, invalidateBook(updated, event.tokenId));
-      } else {
+      if (lastCheckIndex.get(event.tokenId) !== index) {
         next.set(id, updated);
+      } else if (quoteMatches(updated, event.tokenId, event.bestBid, event.bestAsk)) {
+        suspects.delete(event.tokenId);
+        next.set(id, updated);
+      } else {
+        const since = suspects.get(event.tokenId) ?? localNow;
+        if (localNow - since >= graceMs) {
+          suspects.delete(event.tokenId);
+          desyncedTokens.add(event.tokenId);
+          next.set(id, invalidateBook(updated, event.tokenId));
+        } else {
+          suspects.set(event.tokenId, since);
+          next.set(id, updated);
+        }
       }
     }
   });
-  return { markets: next, desyncedTokens, touched };
+  return { markets: next, desyncedTokens, touched, driftSuspects: suspects };
+};
+
+/**
+ * Invalidate books whose mismatch has outlasted the grace window without a
+ * later frame to confirm or clear it (a token that went quiet mid-change).
+ */
+export const expireDriftSuspects = (
+  markets: ReadonlyMap<string, LiveMarket>,
+  driftSuspects: DriftSuspects,
+  localNow = Date.now(),
+): { markets: Map<string, LiveMarket>; desyncedTokens: Set<string>; driftSuspects: Map<string, number> } => {
+  const next = new Map(markets);
+  const suspects = new Map(driftSuspects);
+  const desyncedTokens = new Set<string>();
+  for (const [tokenId, since] of driftSuspects) {
+    if (localNow - since < DRIFT_GRACE_MS) continue;
+    suspects.delete(tokenId);
+    desyncedTokens.add(tokenId);
+    for (const [id, market] of next) {
+      if (market.upTokenId === tokenId || market.downTokenId === tokenId) next.set(id, invalidateBook(market, tokenId));
+    }
+  }
+  return { markets: next, desyncedTokens, driftSuspects: suspects };
 };
 
 /**

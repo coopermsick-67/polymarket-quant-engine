@@ -46,7 +46,7 @@ import {
 import { evaluatePaperMarket, paperLossHistory, type PaperOpportunity } from "../app/lib/paper-bankroll";
 import { subscribePolymarketPrices } from "../app/lib/polymarket-price-stream";
 import { StaleRecoveryTracker } from "../app/lib/stale-recovery";
-import { applyBookSnapshot, applyClobStreamEvents, preserveNewerStreamBooks, staleBookTokens } from "../app/lib/clob-book-stream";
+import { applyBookSnapshot, applyClobStreamEvents, expireDriftSuspects, preserveNewerStreamBooks, staleBookTokens, type DriftSuspects } from "../app/lib/clob-book-stream";
 import { ClobSocketPool } from "../app/lib/clob-socket-pool";
 import { modelPriceCeiling } from "../app/lib/live-order-pricing";
 import { loadCalibrationFile } from "./calibration-file";
@@ -431,6 +431,8 @@ const desyncedClobTokens = new Set<string>();
 let desyncRefreshInFlight = false;
 let bookDriftCount = 0;
 let lastBookDriftLogAt = 0;
+/** Top-of-book mismatches still inside their grace window (see DRIFT_GRACE_MS). */
+let driftSuspects: DriftSuspects = new Map();
 /**
  * Order-book streams, one connection per market (see ClobSocketPool). Level
  * changes are checked against the venue's reported top of book; a mismatch
@@ -440,8 +442,11 @@ let lastBookDriftLogAt = 0;
 const clobPool = new ClobSocketPool({
   onEvents: (events) => {
     const now = Date.now();
-    const applied = applyClobStreamEvents(latestMarkets, events, now);
+    const streamed = applyClobStreamEvents(latestMarkets, events, now, driftSuspects);
+    const applied = { ...expireDriftSuspects(streamed.markets, streamed.driftSuspects, now), touched: streamed.touched };
+    for (const tokenId of streamed.desyncedTokens) applied.desyncedTokens.add(tokenId);
     latestMarkets = applied.markets;
+    driftSuspects = applied.driftSuspects;
     for (const event of events) if (event.kind === "book") desyncedClobTokens.delete(event.tokenId);
     for (const tokenId of applied.desyncedTokens) desyncedClobTokens.add(tokenId);
     if (applied.touched) {
