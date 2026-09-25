@@ -50,7 +50,6 @@ import {
   fetchOrderBooks,
   fetchResolvedMarketOutcomes,
   replaceLiveMarketBook,
-  updateLiveMarketBookLevel,
   updateLiveCandles,
   type Asset,
   type Horizon,
@@ -58,6 +57,7 @@ import {
   type PolymarketPriceTick,
 } from "./lib/polymarket-data";
 import { subscribePolymarketPrices, type PolymarketPriceStreamStatus } from "./lib/polymarket-price-stream";
+import { applyClobStreamEvents, confirmStreamedBooks, parseClobStreamMessage } from "./lib/clob-book-stream";
 import {
   accountDeployed,
   accountEquity,
@@ -666,7 +666,7 @@ export default function Home() {
     try {
       const definitions = await discoverCryptoMarkets(controller.signal); const tokenIds = definitions.flatMap((market) => [market.upTokenId, market.downTokenId]); const assets = [...new Set(definitions.map((market) => market.asset))]; const [books, candles] = await Promise.all([fetchOrderBooks(tokenIds, controller.signal), fetchCandleHistories(assets, controller.signal)]); const timestamp = Date.now(); const oracleTicks = [...new Map([...polymarketOpeningTickCache.current.values(), ...polymarketPriceTickCache.current.values()].map((tick) => [`${tick.asset}:${tick.priceFeed}:${tick.timestamp}`, tick])).values()]; const nextMarkets = definitions.map((definition) => applyPolymarketPriceTicks(buildLiveMarket(definition, books, new Map<Asset, number>(), null, timestamp, candles.get(definition.asset) ?? null), oracleTicks, timestamp)).filter((market) => market.remaining > 0);
       setMarkets(nextMarkets); if (nextMarkets.length) { setDataStatus("ready"); setDataError(""); if (dataLogState.current !== "ready") appendLog("Public market data synchronized", `${nextMarkets.length} eligible crypto markets · Polymarket oracle + CLOB + Coinbase research candles`, "positive"); dataLogState.current = "ready"; } else { setDataStatus("ready"); setDataError("No active crypto 5m/15m markets were returned by Gamma right now."); if (dataLogState.current !== "empty") appendLog("No eligible public markets", "The engine is holding new trades until Gamma returns a matching market.", "warning"); dataLogState.current = "empty"; }
-      const usableTicks = nextMarkets.filter((market) => market.referenceVerified && market.reference !== null && market.spotSource === "POLYMARKET" && market.spot !== null && market.spotUpdatedAt !== null && market.upAsk !== null && market.downAsk !== null).map((market) => ({ timestamp: market.spotUpdatedAt as number, asset: market.asset, duration: market.duration, marketId: market.id, reference: market.reference as number, spot: market.spot as number, upAsk: market.upAsk as number, downAsk: market.downAsk as number, outcome: null, remainingSeconds: market.remaining }));
+      const usableTicks = nextMarkets.filter((market) => market.referenceVerified && market.reference !== null && market.spotSource === "POLYMARKET" && market.spot !== null && market.spotUpdatedAt !== null && market.upAsk !== null && market.downAsk !== null).map((market) => ({ timestamp: market.spotUpdatedAt as number, asset: market.asset, duration: market.duration, marketId: market.id, reference: market.reference as number, spot: market.spot as number, upAsk: market.upAsk as number, downAsk: market.downAsk as number, outcome: null, remainingSeconds: market.remaining, modelFairUp: anchoredFairUp(market) }));
       if (usableTicks.length) setRecordedTicks((current) => { const seen = new Set(current.map((tick) => `${tick.marketId}:${tick.timestamp}`)); const fresh = usableTicks.filter((tick) => !seen.has(`${tick.marketId}:${tick.timestamp}`)); return [...current, ...fresh].slice(-5000); }); setLastUpdated(timestamp);
     } catch (error) { if (controller.signal.aborted) return; const detail = error instanceof Error ? error.message : "Public market request failed"; setDataStatus("error"); setDataError(detail); if (dataLogState.current !== "error") appendLog("Public data unavailable", detail, "negative"); dataLogState.current = "error"; } finally { refreshBusy.current = false; setRefreshing(false); }
   }, [appendLog]);
@@ -712,6 +712,8 @@ export default function Home() {
     let disposed = false;
     let liveSockets = 0;
     let fallbackActivated = false;
+    let lastClobMessageAt: number | null = null;
+    const desyncedTokens = new Set<string>();
     const retries = new Set<number>();
     const markSocket = (isLive: boolean) => {
       liveSockets = Math.max(0, liveSockets + (isLive ? 1 : -1));
@@ -759,49 +761,48 @@ export default function Home() {
         socket.send(JSON.stringify({ type: "market", assets_ids: streamTokens, custom_feature_enabled: true }));
       };
       socket.onmessage = (message) => {
-        try {
-          const packet = JSON.parse(String(message.data)); const events = Array.isArray(packet) ? packet : [packet]; const now = Date.now();
-          for (const rawEvent of events) {
-            const event = rawEvent.payload && typeof rawEvent.payload === "object" ? { ...rawEvent.payload, event_type: rawEvent.type } : rawEvent;
-            const kind = event.event_type ?? event.type;
-            if (kind === "book") {
-              const tokenId = String(event.asset_id ?? event.token_id ?? event.tokenId ?? "");
-              const parseLevels = (value: unknown) => Array.isArray(value) ? value.flatMap((level: { price?: unknown; size?: unknown }) => { const price = Number(level.price); const size = Number(level.size); return Number.isFinite(price) && Number.isFinite(size) && price > 0 && size > 0 ? [{ price, size }] : []; }) : [];
-              const bids = parseLevels(event.bids); const asks = parseLevels(event.asks);
-              if (!tokenId) continue;
-              setMarkets((current) => current.map((market) => replaceLiveMarketBook(market, tokenId, bids, asks, Number(event.timestamp) || now, String(event.hash ?? "") || null, now)));
-              setLastUpdated(now);
-              continue;
-            }
-            const updates = kind === "price_change" ? (event.price_changes ?? event.priceChanges ?? []) : [event];
-            if (!Array.isArray(updates)) continue;
-            for (const update of updates) {
-              const tokenId = String(update.asset_id ?? update.token_id ?? update.tokenId ?? "");
-              if (!tokenId) continue;
-              const bidValue = update.best_bid ?? update.bestBid;
-              const askValue = update.best_ask ?? update.bestAsk;
-              const bid = bidValue === null || bidValue === undefined ? null : Number(bidValue);
-              const ask = askValue === null || askValue === undefined ? null : Number(askValue);
-              const price = Number(update.price); const size = Number(update.size);
-              setMarkets((current) => current.map((market) => {
-                if (market.upTokenId !== tokenId && market.downTokenId !== tokenId) return market;
-                if (kind === "price_change" && (update.side === "BUY" || update.side === "SELL") && Number.isFinite(price) && Number.isFinite(size)) return updateLiveMarketBookLevel(market, tokenId, update.side, price, size, now);
-                const isUp = market.upTokenId === tokenId;
-                const upBid = isUp && bidValue !== undefined ? (bid !== null && Number.isFinite(bid) ? bid : null) : market.upBid;
-                const upAsk = isUp && askValue !== undefined ? (ask !== null && Number.isFinite(ask) ? ask : null) : market.upAsk;
-                const downBid = !isUp && bidValue !== undefined ? (bid !== null && Number.isFinite(bid) ? bid : null) : market.downBid;
-                const downAsk = !isUp && askValue !== undefined ? (ask !== null && Number.isFinite(ask) ? ask : null) : market.downAsk;
-                const fairUp = market.fairUp;
-                const spreads = [upBid !== null && upAsk !== null ? upAsk - upBid : null, downBid !== null && downAsk !== null ? downAsk - downBid : null].filter((value): value is number => value !== null);
-                return { ...market, upBid, upAsk, downBid, downAsk, spread: spreads.length ? Math.max(...spreads) : null, edgeUp: fairUp !== null && upAsk !== null ? fairUp - upAsk : null, edgeDown: fairUp !== null && downAsk !== null ? 1 - fairUp - downAsk : null, sourceTimestamp: now };
-              }));
-              setLastUpdated(now);
-            }
-          }
-        } catch { /* Ignore malformed CLOB messages; REST refresh remains available. */ }
+        const events = parseClobStreamMessage(message.data);
+        const now = Date.now();
+        lastClobMessageAt = now;
+        if (!events.length) return;
+        // Level changes are checked against the venue's reported top of book.
+        // A mismatch means an update was missed: that book is invalidated and a
+        // fresh REST snapshot replaces it. Applying the same events twice is
+        // harmless (levels are absolute sizes), so the ref snapshot is only
+        // used to learn which books drifted.
+        const probe = applyClobStreamEvents(new Map(marketsRef.current.map((market) => [market.id, market])), events, now);
+        for (const event of events) if (event.kind === "book") desyncedTokens.delete(event.tokenId);
+        setMarkets((current) => {
+          const applied = applyClobStreamEvents(new Map(current.map((market) => [market.id, market])), events, now);
+          return current.map((market) => applied.markets.get(market.id) ?? market);
+        });
+        setLastUpdated(now);
+        const drifted = [...probe.desyncedTokens].filter((token) => !desyncedTokens.has(token));
+        if (!drifted.length) return;
+        for (const token of drifted) desyncedTokens.add(token);
+        void fetchOrderBooks(drifted).then((books) => {
+          const repairedAt = Date.now();
+          setMarkets((current) => current.map((market) => {
+            let next = market;
+            for (const [tokenId, book] of books) next = replaceLiveMarketBook(next, tokenId, book.bids, book.asks, book.timestamp, book.hash, repairedAt);
+            return next;
+          }));
+          for (const tokenId of books.keys()) desyncedTokens.delete(tokenId);
+        }).catch(() => { /* The book stays invalidated until the next REST refresh. */ });
       };
       const heartbeat = window.setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send("PING"); }, 10000);
-      socket.onclose = () => { window.clearInterval(heartbeat); if (opened) markSocket(false); reconnect(connectClob, 1500); };
+      // While the stream is connected and in sync, re-confirm quiet books so
+      // they stay executable under the short book-age limit.
+      const confirmTimer = window.setInterval(() => {
+        const now = Date.now();
+        if (socket.readyState !== WebSocket.OPEN || lastClobMessageAt === null || now - lastClobMessageAt > 15_000) return;
+        const streamed = new Set(streamTokens.filter((token) => !desyncedTokens.has(token)));
+        setMarkets((current) => {
+          const confirmed = confirmStreamedBooks(new Map(current.map((market) => [market.id, market])), streamed, now);
+          return current.map((market) => confirmed.get(market.id) ?? market);
+        });
+      }, 2000);
+      socket.onclose = () => { window.clearInterval(heartbeat); window.clearInterval(confirmTimer); if (opened) markSocket(false); reconnect(connectClob, 1500); };
       socket.onerror = () => socket.close();
       sockets.push(socket);
     };

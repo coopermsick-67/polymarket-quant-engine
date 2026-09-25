@@ -29,6 +29,7 @@ import {
 } from "../../../lib/polymarket-session";
 import { env } from "cloudflare:workers";
 import { readPolymarketPriceTicks } from "../../../lib/polymarket-price-stream";
+import { fetchAllWalletPositions, openPositions, positionsUrl, settledPositions } from "../../../lib/wallet-positions";
 
 const CLOB_HOST = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
@@ -41,7 +42,6 @@ const recentLiveEntryMarketKeys = new Map<string, number>();
 const recentLiveExitTokenKeys = new Map<string, number>();
 const activeLiveEntryKeys = new Map<string, symbol>();
 const VALID_TICK_SIZES = new Set(["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"]);
-const POSITION_PAGE_LIMIT = 100;
 
 type LiveAction = "connect" | "balance" | "positions" | "execute" | "manual-entry" | "exit" | "manual-exit" | "cancel-all" | "disconnect";
 type LiveRequest = {
@@ -80,24 +80,6 @@ const record = (value: unknown): JsonRecord => value && typeof value === "object
 const finiteNumber = (value: unknown): number | null => {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
-  return null;
-};
-const positionRowsFrom = (value: unknown): JsonRecord[] => {
-  if (Array.isArray(value)) {
-    if (value.some((item) => !item || typeof item !== "object" || Array.isArray(item))) throw new Error("Position data contained an unreadable row.");
-    return value as JsonRecord[];
-  }
-  const source = record(value);
-  for (const key of ["data", "items", "results", "positions"]) {
-    if (Array.isArray(source[key])) return positionRowsFrom(source[key]);
-  }
-  throw new Error("Position data was unreadable; live entry is blocked.");
-};
-const safeText = (source: JsonRecord, ...keys: string[]) => {
-  for (const key of keys) {
-    const value = text(source[key]);
-    if (value) return value;
-  }
   return null;
 };
 const validAddress = (value: string) => /^0x[a-fA-F0-9]{40}$/.test(value);
@@ -244,51 +226,25 @@ const cleanBalance = async (client: ClobClient) => {
   return balanceNumber(payload.balance);
 };
 
-const readLivePositions = async (walletAddress: string) => {
-  const payload = await retryTransient(async () => {
-    const controller = new AbortController();
-    const timeoutId = globalThis.setTimeout(() => controller.abort(), 10_000);
-    try {
-      const response = await fetch(`${DATA_API}/v2/positions?user=${encodeURIComponent(walletAddress)}&limit=${POSITION_PAGE_LIMIT}`, { cache: "no-store", signal: controller.signal });
-      if (!response.ok) throw new Error(`Position data returned ${response.status}.`);
-      return await response.json() as unknown;
-    } finally {
-      globalThis.clearTimeout(timeoutId);
-    }
-  });
-  const rows = positionRowsFrom(payload);
-  // The Data API may truncate at its limit. Never base live risk on a possibly
-  // incomplete list of positions.
-  if (rows.length >= POSITION_PAGE_LIMIT) throw new Error("The complete position list could not be established; live entry is blocked.");
-  return rows.map((source) => {
-    const tokenID = safeText(source, "asset", "asset_id", "token_id");
-    const conditionId = safeText(source, "conditionId", "condition_id", "market");
-    const slug = safeText(source, "slug", "eventSlug", "event_slug");
-    const size = finiteNumber(source.current_size ?? source.size ?? source.total_size);
-    if (size === null || size < 0) throw new Error("Position size was unreadable; live entry is blocked.");
-    if (size === 0) return null;
-    return {
-      id: tokenID ?? conditionId ?? slug ?? safeText(source, "title", "question") ?? "unknown-position",
-      tokenID,
-      conditionId,
-      slug,
-      title: safeText(source, "title", "question") ?? "Untitled market",
-      outcome: safeText(source, "outcome", "name") ?? "—",
-      size,
-      averagePrice: finiteNumber(source.avgPrice ?? source.avg_price ?? source.average_price),
-      exposureUsd: (() => {
-        if (!tokenID && !conditionId && !slug) throw new Error("A live position could not be matched to its market; live entry is blocked.");
-        const averagePrice = finiteNumber(source.avgPrice ?? source.avg_price ?? source.average_price);
-        const averageCost = averagePrice !== null && averagePrice > 0 && averagePrice <= 1 ? size * averagePrice : null;
-        const initialValue = finiteNumber(source.initialValue ?? source.initial_value ?? source.costBasis ?? source.cost_basis);
-        const validCostBasis = initialValue !== null && initialValue > 0 ? initialValue : null;
-        const candidates = [averageCost, validCostBasis].filter((value): value is number => value !== null && Number.isFinite(value) && value > 0);
-        if (!candidates.length) throw new Error("Position cost basis was unreadable; live entry is blocked.");
-        return Math.max(...candidates);
-      })(),
-    };
-  }).filter((position): position is NonNullable<typeof position> => position !== null);
-};
+/** Every wallet position across all pages, with resolved (redeemable) rows flagged. */
+const readWalletPositions = (walletAddress: string) => fetchAllWalletPositions((cursor) => retryTransient(async () => {
+  const controller = new AbortController();
+  const timeoutId = globalThis.setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(positionsUrl(DATA_API, walletAddress, cursor), { cache: "no-store", signal: controller.signal });
+    if (!response.ok) throw new Error(`Position data returned ${response.status}.`);
+    return await response.json() as unknown;
+  } finally {
+    globalThis.clearTimeout(timeoutId);
+  }
+}));
+
+/**
+ * Open positions only. Resolved positions are waiting for redemption: they are
+ * not open risk and cannot be sold on the CLOB, so they never block entries or
+ * count toward exposure.
+ */
+const readLivePositions = async (walletAddress: string) => openPositions(await readWalletPositions(walletAddress));
 
 const ensureLiveUser = async (request: Request) => {
   if (isLoopbackRequest(request) && localLiveEnabled()) {
@@ -390,6 +346,12 @@ export async function POST(request: Request) {
   if ((action === "execute" || action === "manual-entry" || action === "exit" || action === "manual-exit") && !liveExecutionEnabled()) return json({ ok: false, status: "DISABLED", error: "Live order submissions are disabled. Set POLYMARKET_LIVE_EXECUTION_ENABLED=true only after the live prerequisites are explicitly enabled." }, 503);
 
   if (action === "connect") {
+    // A raw signer key may only be handed to a server on this machine. A hosted
+    // deployment would receive the key over the network and hold it (encrypted)
+    // in a cookie; use the terminal trader instead.
+    if (!(isLoopbackRequest(request) && localLiveEnabled())) {
+      return json({ ok: false, error: "Private keys are only accepted by a local server bound to loopback with POLYMARKET_LIVE_ALLOW_LOCALHOST=true. Use the terminal trader (pnpm run live) for live orders." }, 403);
+    }
     try {
       const connected = await sessionFromConnection(input, gate.user.userId);
       const token = await sealLiveSession(connected.session);
@@ -416,7 +378,8 @@ export async function POST(request: Request) {
 
   if (action === "positions") {
     try {
-      return json({ ok: true, status: "READY", positions: await readLivePositions(session.walletAddress) });
+      const walletPositions = await readWalletPositions(session.walletAddress);
+      return json({ ok: true, status: "READY", positions: openPositions(walletPositions), redeemablePositions: settledPositions(walletPositions) });
     } catch (error) {
       return json({ ok: false, error: errorMessage(error) }, 502);
     }

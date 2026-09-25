@@ -16,7 +16,7 @@ Polymarket Quant Engine is a paper-first terminal for active crypto Up/Down mark
 - Optional owner-authenticated Polymarket account reads and live execution gates in the hosted Site, with balance checks, risk limits, fractional Kelly sizing, duration filters, pause, and cancel-all controls.
 - Model-aware cashouts for paper positions and an opt-in live exit policy: the current executable bid must clear the model fair probability, minimum dollar/percentage profit, remaining-time, and repeated-confirmation checks before a sell is attempted. The server revalidates the position and market immediately before submitting a non-retried FAK sell.
 
-The raw model is heuristic and uncalibrated by default. Walk-forward calibration diagnostics require settled outcomes and sufficient prior samples; they do not establish profit. Nothing in the interface guarantees a profit or a fill. Live orders use real funds and must be independently tested with paper data first.
+The raw model forecasts the market's actual settlement value. For TWAP markets that is the 60-second Chainlink TWAP at expiry, and the forecast starts from Chainlink spot, not from the TWAP, which lags spot by about half its window. It then combines that forecast with the order book. By default a conservative prior gives the model a quarter of the weight in log-odds. `pnpm run calibrate` fits the weights from settled outcomes (`logit P = a + b_model·logit(model) + b_market·logit(mid)`, clustered by market). A fit is used only once 300+ markets have settled and the model coefficient's lower 95% bound is above zero. A usable fit shows the model adds information to the book; it does not establish profit. Nothing in the interface guarantees a profit or a fill. Live orders use real funds and must be independently tested with paper data first.
 
 ## Clone this repository
 
@@ -101,6 +101,18 @@ These percentages are policy ceilings, not target allocations. The sizing code c
 
 For an interactive terminal monitor, start the daemon in one terminal and run `pnpm run dashboard` in another. The monitor clock, countdowns, and display refresh every second with account cash/equity/P&L, open positions, recent fills and closed trades, current signals, feed freshness, and halt state. The daemon runs an independent one-second decision loop against its current cached and streaming data; REST market discovery, candles, and books refresh in the background every 15 seconds. Status reports the actual last decision duration and how many cycles exceeded the target. Press `q` to exit the monitor without stopping the daemon or `r` to refresh immediately. If it reports that the endpoint is unreachable, start `pnpm run daemon` in a separate terminal. It reads the daemon's loopback-only status endpoint and does not place orders.
 
+Paper entries are FAK limit orders. The daemon decides on one snapshot and fills after `PAPER_FILL_LATENCY_MS` (default 1000) against the book as it is then, capped at the model's price ceiling, so paper results include price moves in flight. Order books stream for every active market. Each price change is checked against the venue's reported top of book; a book that drifts is invalidated and replaced by a fresh snapshot. Books older than 10 s (in Polymarket server time) never price a decision.
+
+## Model calibration
+
+The daemon appends one decision-time observation per market every 15 seconds to `var/observations.jsonl`: the raw model probability, the book's mid, the books, and the oracle values. After enough markets have settled, run:
+
+```bash
+pnpm run calibrate
+```
+
+It resolves outcomes from Gamma, fits the stacking regression, and writes `var/model-calibration.json`. The daemon reloads it every 10 minutes, and `pnpm run live` loads it at startup. Both use the fitted weights only when the fit is usable, and the conservative prior otherwise. `POLYMARKET_CALIBRATION_FILE` points both at another file.
+
 Paper mode requires no API keys or wallet credentials. Keep any future live credentials in host-only secret storage; this daemon has no live executor, and the dashboard's browser-authenticated live routes are not part of this service.
 
 ## Multi-bankroll research replay
@@ -124,11 +136,22 @@ pnpm install
 pnpm run live
 ```
 
-The trader uses the shared model and bankroll evaluator, LOCK signals, a 4% minimum net edge, a minimum of five shares (or the venue minimum if larger), FOK market orders, and a $5 maximum order. For balances up to $100, the live tier permits up to 15% per entry and aggregate exposure to cover the five-share minimum; its daily-loss and drawdown stops are also 15%, and a single order may consume up to 50% of visible ask depth after the full executable quantity is checked. The tier's duration, trend, price, spread, data-quality, and depth gates still apply. Recent closed-position P&L is loaded from the Polymarket Data API so the shared loss-streak controls apply to live sizing. Larger balances keep their existing tier sizing and loss limits. The terminal asks whether to enable model-aware automatic exits for positions opened by this trader; when enabled, it uses fresh full bid depth, repeated model confirmations, and FOK sell orders. FOK requires the full requested quantity or no fill; changing books can still produce a no-fill, after which the market retries after a cooldown. The trader stops if an order result cannot be reconciled and writes a pending marker so restart cannot silently submit a duplicate. Press `Q` then Enter to stop. Live orders use real funds, and the uncalibrated model does not establish profitability; run paper history and independently reconcile every wallet/order assumption before opting in.
+The trader uses the shared model and bankroll evaluator.
+- **Signals and edge:** it accepts ENTRY or LOCK signals, or only LOCK when `POLYMARKET_LIVE_REQUIRE_LOCK=true`, with a net edge of at least 4%. Fees come from each market's own CLOB fee schedule; the flat 5% rate is used only when that schedule can't be read.
+- **Orders:** every order is the venue minimum of five shares (or more if the venue requires it), and never more than $5. Each order is a FAK limit order priced up to two ticks past the observed price, never above the model's price ceiling.
+- **Startup checks:** the trader checks whether your balance can place any entry at all, and refuses to arm if it can't. For example, $10 at a 15% per-entry cap can't buy five shares at the tier's 30¢ floor.
+- **Fill reconciliation:** fills are reconciled from the CLOB's own order record (`size_matched`), with the Data API wallet view as a cross-check that is given up to 10 s to catch up. An order whose result can't be proven leaves a pending marker and halts the trader, so a restart can't silently submit a duplicate.
+- **Wallet positions:** positions are read across every page. Resolved positions awaiting redemption don't count as open exposure or toward position limits. The trader doesn't send on-chain redemption transactions; it reports what is waiting, and you redeem on polymarket.com.
+- **Exits:** model-aware cashouts are optional. An optional 20% take-profit and stop-loss only sell when the model doesn't value holding above the fee-adjusted sale.
+- **Private key:** the signer key is only read at the hidden prompt, never from the environment.
+
+Press `Q` then Enter to stop. Live orders use real funds, and none of this establishes profitability.
 
 ## Local environment
 
 Paper mode works without secrets. Copy `.env.example` to `.env.local` only when configuring local server values, and keep that file untracked. The hosted Site supplies the owner-authenticated ChatGPT headers required by production live execution.
+
+Raw signer private keys are only accepted by a local server bound to loopback with `POLYMARKET_LIVE_ALLOW_LOCALHOST=true`. A hosted deployment refuses them, because the key would travel over the network and sit (encrypted) in a session cookie. On a hosted deployment the Account view accepts read-only CLOB API credentials instead; for live orders, use the terminal trader.
 
 Live linking retries transient Polymarket credential, balance, and open-order reads. If the upstream socket is reset, the request returns a readable error and no order is retried or assumed successful; reconcile the Account view before trying any uncertain execution again. Live buy and sell submissions are disabled unless the server-side `POLYMARKET_LIVE_EXECUTION_ENABLED` value is exactly `true`; keep it `false` for paper operation. The daemon's `TRADING_MODE` setting is separate and remains paper-only.
 

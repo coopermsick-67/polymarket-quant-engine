@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
-import { mkdir, open as openFile, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open as openFile, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -11,9 +11,10 @@ import {
   fetchCandleHistories,
   fetchOrderBooks,
   fetchResolvedMarketOutcomes,
+  marketImpliedProbabilityUp,
   replaceLiveMarketBook,
+  synchronizedPolymarketTime,
   updateLiveCandles,
-  updateLiveMarketBookLevel,
   type LiveMarket,
   type PolymarketPriceTick,
 } from "../app/lib/polymarket-data";
@@ -44,6 +45,9 @@ import {
 import { evaluatePaperMarket, paperLossHistory, type PaperOpportunity } from "../app/lib/paper-bankroll";
 import { subscribePolymarketPrices } from "../app/lib/polymarket-price-stream";
 import { StaleRecoveryTracker } from "../app/lib/stale-recovery";
+import { applyClobStreamEvents, confirmStreamedBooks, parseClobStreamMessage } from "../app/lib/clob-book-stream";
+import { modelPriceCeiling } from "../app/lib/live-order-pricing";
+import { loadCalibrationFile } from "./calibration-file";
 
 type ExitObservation = { count: number; lastSeen: number };
 type PersistedState = {
@@ -127,6 +131,15 @@ const costs = {
   feeRate: numberSetting("PAPER_FEE_RATE", 0.02, 0, 0.5),
   slippageBps: numberSetting("PAPER_SLIPPAGE_BPS", 15, 0, 10_000),
 };
+/**
+ * Paper orders are decided on one snapshot and filled against the book this
+ * much later, as a FAK limit order, so paper results include the price moves
+ * a real order would meet in flight.
+ */
+const paperFillLatencyMs = integerSetting("PAPER_FILL_LATENCY_MS", 1_000, 0, 10_000);
+const observationFile = path.join(stateDir, "observations.jsonl");
+const observationIntervalMs = integerSetting("OBSERVATION_INTERVAL_MS", 15_000, 5_000, 300_000);
+const calibrationFile = path.resolve(process.env.POLYMARKET_CALIBRATION_FILE || path.join(stateDir, "model-calibration.json"));
 const RESOLUTION_RECHECK_MS = 60_000;
 const EXIT_CONFIRMATION_WINDOW_MS = Math.max(20_000, pollIntervalMs * 2 + 5_000);
 
@@ -409,6 +422,15 @@ let coinbaseReconnectAttempts = 0;
 let clobReconnectAttempts = 0;
 let coinbaseConnectedAt: number | null = null;
 let clobConnectedAt: number | null = null;
+let lastClobMessageAt: number | null = null;
+let clobSubscribedTokens = new Set<string>();
+const desyncedClobTokens = new Set<string>();
+let desyncRefreshInFlight = false;
+let bookDriftCount = 0;
+let lastBookDriftLogAt = 0;
+type PendingPaperOrder = { marketId: string; side: PaperSide; stakeUsd: number; maxPrice: number; submittedAt: number; reason: string };
+let pendingPaperOrder: PendingPaperOrder | null = null;
+const lastObservationAt = new Map<string, number>();
 
 function reconnectDelay(attempt: number): number {
   return Math.min(STREAM_RECONNECT_MAX_MS, STREAM_RECONNECT_BASE_MS * 2 ** Math.min(attempt, 10));
@@ -656,6 +678,15 @@ await new Promise<void>((resolve, reject) => {
   healthServer.listen(healthPort, "127.0.0.1", () => resolve());
 });
 log("INFO", "Headless paper daemon started", { mode: "paper", readiness: `http://127.0.0.1:${healthPort}/healthz`, liveness: `http://127.0.0.1:${healthPort}/livez`, decisionIntervalMs, marketRefreshIntervalMs: pollIntervalMs });
+const reportCalibration = async () => {
+  const status = await loadCalibrationFile(calibrationFile);
+  log("INFO", status.active ? "Using fitted stacking calibration for the model weight" : "Using the conservative prior model weight", status.active
+    ? { markets: status.active.markets, modelCoefficient: status.active.modelCoefficient, modelCoefficientLower: status.active.modelCoefficientLower }
+    : { reason: status.reason });
+};
+await reportCalibration();
+const calibrationTimer = setInterval(() => void reportCalibration(), 10 * 60_000);
+calibrationTimer.unref();
 const markTimer = setInterval(() => {
   if (latestMarkets.size) state.account = markAccount(state.account, latestMarkets, Date.now());
 }, 1000);
@@ -683,6 +714,8 @@ async function refreshMarketSnapshot(): Promise<void> {
     const refreshed = await collectMarkets();
     if (stopping || shutdownController.signal.aborted) return;
     latestMarkets = new Map(refreshed.map((market) => [market.id, market]));
+    // Every book was just replaced by a REST snapshot, so none is drifted now.
+    desyncedClobTokens.clear();
     pruneTrackingMaps(refreshed);
     ensureMarketStreams(refreshed);
     lastMarketRefreshAt = Date.now();
@@ -704,17 +737,6 @@ function scheduleExpiredPositionResolution(now: number): void {
   void resolveExpiredPositions(now)
     .catch((error) => log("WARN", "Background paper-position resolution failed", { error: errorMessage(error) }))
     .finally(() => { resolutionCheckInFlight = false; });
-}
-
-function parseBookLevels(value: unknown): Array<{ price: number; size: number }> {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((raw) => {
-    if (!raw || typeof raw !== "object") return [];
-    const level = raw as { price?: unknown; size?: unknown };
-    const price = Number(level.price);
-    const size = Number(level.size);
-    return Number.isFinite(price) && Number.isFinite(size) && price > 0 && size > 0 ? [{ price, size }] : [];
-  });
 }
 
 function scheduleCoinbaseReconnect(key: string): void {
@@ -818,7 +840,9 @@ function connectClob(key: string): void {
     if (clobSocket !== socket) return;
     clobConnected = true;
     clobConnectedAt = Date.now();
+    lastClobMessageAt = Date.now();
     const tokenIds = key.split(",");
+    clobSubscribedTokens = new Set(tokenIds);
     const batches: string[][] = [];
     for (let index = 0; index < tokenIds.length; index += 100) batches.push(tokenIds.slice(index, index + 100));
     const [firstBatch, ...remainingBatches] = batches;
@@ -834,72 +858,29 @@ function connectClob(key: string): void {
   };
   socket.onmessage = (message) => {
     if (clobSocket !== socket) return;
-    if (String(message.data) === "PONG") return;
-    try {
-      const packet = JSON.parse(String(message.data));
-      const events = Array.isArray(packet) ? packet : [packet];
-      const now = Date.now();
-      for (const raw of events) {
-        if (!raw || typeof raw !== "object") continue;
-        const event = raw.payload && typeof raw.payload === "object"
-          ? { ...raw.payload, event_type: raw.type }
-          : raw;
-        const kind = event.event_type ?? event.type;
-        if (kind === "book") {
-          const tokenId = String(event.asset_id ?? event.token_id ?? event.tokenId ?? "");
-          if (!tokenId) continue;
-          const bids = parseBookLevels(event.bids);
-          const asks = parseBookLevels(event.asks);
-          const rawBookTimestamp = Number(event.timestamp);
-          const bookTimestamp = Number.isFinite(rawBookTimestamp) && rawBookTimestamp > 0
-            ? rawBookTimestamp < 10_000_000_000 ? rawBookTimestamp * 1000 : rawBookTimestamp
-            : now;
-          for (const [id, market] of latestMarkets) {
-            if (market.upTokenId === tokenId || market.downTokenId === tokenId) {
-              latestMarkets.set(id, replaceLiveMarketBook(market, tokenId, bids, asks,
-                bookTimestamp, String(event.hash ?? "") || null, now));
-              lastStreamUpdateAt = now;
-              lastClobUpdateAt = now;
-            }
-          }
-          continue;
-        }
-        const updates = kind === "price_change" ? (event.price_changes ?? event.priceChanges ?? []) : [event];
-        if (!Array.isArray(updates)) continue;
-        for (const update of updates) {
-          const tokenId = String(update.asset_id ?? update.token_id ?? update.tokenId ?? "");
-          if (!tokenId) continue;
-          const bidValue = update.best_bid ?? update.bestBid;
-          const askValue = update.best_ask ?? update.bestAsk;
-          const bid = bidValue === null || bidValue === undefined ? null : Number(bidValue);
-          const ask = askValue === null || askValue === undefined ? null : Number(askValue);
-          const price = Number(update.price);
-          const size = Number(update.size);
-          for (const [id, market] of latestMarkets) {
-            if (market.upTokenId !== tokenId && market.downTokenId !== tokenId) continue;
-            let changed: LiveMarket;
-            if (kind === "price_change" && (update.side === "BUY" || update.side === "SELL") && Number.isFinite(price) && Number.isFinite(size)) {
-              changed = updateLiveMarketBookLevel(market, tokenId, update.side, price, size, now);
-            } else {
-              const isUp = market.upTokenId === tokenId;
-              const upBid = isUp && bidValue !== undefined ? (bid !== null && Number.isFinite(bid) ? bid : null) : market.upBid;
-              const upAsk = isUp && askValue !== undefined ? (ask !== null && Number.isFinite(ask) ? ask : null) : market.upAsk;
-              const downBid = !isUp && bidValue !== undefined ? (bid !== null && Number.isFinite(bid) ? bid : null) : market.downBid;
-              const downAsk = !isUp && askValue !== undefined ? (ask !== null && Number.isFinite(ask) ? ask : null) : market.downAsk;
-              const fairUp = market.fairUp;
-              const spreads = [upBid !== null && upAsk !== null ? upAsk - upBid : null, downBid !== null && downAsk !== null ? downAsk - downBid : null].filter((value): value is number => value !== null);
-              changed = { ...market, upBid, upAsk, downBid, downAsk, spread: spreads.length ? Math.max(...spreads) : null,
-                edgeUp: fairUp !== null && upAsk !== null ? fairUp - upAsk : null,
-                edgeDown: fairUp !== null && downAsk !== null ? 1 - fairUp - downAsk : null, sourceTimestamp: now };
-            }
-            latestMarkets.set(id, changed);
-            lastStreamUpdateAt = now;
-            lastClobUpdateAt = now;
-          }
-        }
+    const now = Date.now();
+    lastClobMessageAt = now;
+    const events = parseClobStreamMessage(message.data);
+    if (!events.length) return;
+    // Level changes are checked against the venue's reported top of book; a
+    // mismatch means an update was missed, so that book is invalidated and a
+    // fresh snapshot is fetched instead of trading on a drifted book.
+    const applied = applyClobStreamEvents(latestMarkets, events, now);
+    latestMarkets = applied.markets;
+    for (const event of events) if (event.kind === "book") desyncedClobTokens.delete(event.tokenId);
+    for (const tokenId of applied.desyncedTokens) desyncedClobTokens.add(tokenId);
+    if (applied.touched) {
+      lastStreamUpdateAt = now;
+      lastClobUpdateAt = now;
+    }
+    if (applied.desyncedTokens.size) {
+      bookDriftCount += applied.desyncedTokens.size;
+      if (now - lastBookDriftLogAt >= 60_000) {
+        log("INFO", "Order-book stream drifted from the venue's top of book; affected books were invalidated and refreshed from snapshots", { driftsSinceLastReport: bookDriftCount });
+        lastBookDriftLogAt = now;
+        bookDriftCount = 0;
       }
-    } catch (error) {
-      log("WARN", "Ignoring an invalid Polymarket stream message", { error: errorMessage(error) });
+      void repairDesyncedBooks();
     }
   };
   socket.onclose = (event) => {
@@ -954,9 +935,13 @@ function ensureMarketStreams(markets: LiveMarket[]): void {
     }
     if (coinbaseKey) connectCoinbase(coinbaseKey);
   }
+  // Stream books for every market that is trading now or about to, plus any
+  // market holding a position; REST snapshots every poll are the fallback.
   const positionMarketIds = new Set(state.account.positions.map((position) => position.marketId));
-  const marketsWithPositions = markets.filter((market) => positionMarketIds.has(market.id));
-  const clobKey = [...new Set(marketsWithPositions.flatMap((market) => [market.upTokenId, market.downTokenId]).filter(Boolean))].sort().join(",");
+  const serverNow = synchronizedPolymarketTime();
+  const streamedMarkets = markets.filter((market) => positionMarketIds.has(market.id)
+    || ((market.startTime === null || market.startTime <= serverNow + 60_000) && market.endTime > serverNow));
+  const clobKey = [...new Set(streamedMarkets.flatMap((market) => [market.upTokenId, market.downTokenId]).filter(Boolean))].sort().join(",");
   if (clobKey !== clobSubscriptionKey) {
     clobSubscriptionKey = clobKey;
     clobReconnectAttempts = 0;
@@ -973,6 +958,85 @@ function ensureMarketStreams(markets: LiveMarket[]): void {
     }
     if (clobKey) connectClob(clobKey);
   }
+}
+
+async function repairDesyncedBooks(): Promise<void> {
+  if (desyncRefreshInFlight || !desyncedClobTokens.size) return;
+  desyncRefreshInFlight = true;
+  try {
+    const tokens = [...desyncedClobTokens];
+    const books = await fetchOrderBooks(tokens, shutdownController.signal);
+    const now = Date.now();
+    for (const [tokenId, book] of books) {
+      for (const [id, market] of latestMarkets) {
+        if (market.upTokenId !== tokenId && market.downTokenId !== tokenId) continue;
+        latestMarkets.set(id, replaceLiveMarketBook(market, tokenId, book.bids, book.asks, book.timestamp, book.hash, now));
+      }
+      desyncedClobTokens.delete(tokenId);
+    }
+  } catch (error) {
+    log("WARN", "Could not refresh drifted order books; they stay unusable until a snapshot arrives", { error: errorMessage(error) });
+  } finally {
+    desyncRefreshInFlight = false;
+    // Books that drifted while this repair was in flight get their own pass.
+    if (desyncedClobTokens.size && !stopping && !shutdownController.signal.aborted) {
+      setTimeout(() => void repairDesyncedBooks(), 1_000).unref();
+    }
+  }
+}
+
+/** A connected, in-sync stream re-confirms quiet books so they stay executable. */
+function confirmLiveBooks(now: number): void {
+  if (!clobConnected || lastClobMessageAt === null || now - lastClobMessageAt > 15_000) return;
+  const confirmed = new Set([...clobSubscribedTokens].filter((token) => !desyncedClobTokens.has(token)));
+  latestMarkets = confirmStreamedBooks(latestMarkets, confirmed, now);
+}
+
+/** Record decision-time model and book probabilities; `pnpm run calibrate` pairs them with outcomes. */
+function recordObservations(markets: LiveMarket[], now: number): void {
+  const lines: string[] = [];
+  for (const market of markets) {
+    if (market.fairUp === null) continue;
+    const marketUp = marketImpliedProbabilityUp(market);
+    if (marketUp === null) continue;
+    if (now - (lastObservationAt.get(market.id) ?? 0) < observationIntervalMs) continue;
+    lastObservationAt.set(market.id, now);
+    lines.push(JSON.stringify({
+      marketId: market.id, upTokenId: market.upTokenId, downTokenId: market.downTokenId, asset: market.asset, duration: market.duration,
+      at: now, remainingSeconds: market.remaining, rawModelUp: market.fairUp, marketUp,
+      upBid: market.upBid, upAsk: market.upAsk, downBid: market.downBid, downAsk: market.downAsk,
+      reference: market.reference, spot: market.spot, settlementPrice: market.settlementPrice ?? null,
+    }));
+  }
+  if (!lines.length) return;
+  for (const [id, at] of lastObservationAt) if (now - at > 60 * 60_000) lastObservationAt.delete(id);
+  void appendFile(observationFile, `${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o640 })
+    .catch((error) => log("WARN", "Could not append calibration observations", { error: errorMessage(error) }));
+}
+
+/** Fill a pending paper order once its simulated latency has elapsed, against the book as it is then. */
+function processPendingPaperOrder(marketMap: Map<string, LiveMarket>, now: number): void {
+  const order = pendingPaperOrder;
+  if (!order || now - order.submittedAt < paperFillLatencyMs) return;
+  pendingPaperOrder = null;
+  const market = marketMap.get(order.marketId);
+  if (!market || !marketHasFreshInputs(market, now)) {
+    log("INFO", "Paper order expired unfilled: its market data was not fresh at fill time", { marketId: order.marketId });
+    return;
+  }
+  const result = buyPaper(state.account, market, order.side, order.stakeUsd, costs, order.reason, now, order.maxPrice);
+  if (!result.fill) {
+    log("INFO", "Paper FAK order did not fill within its limit after the simulated latency", {
+      marketId: order.marketId, side: order.side, limit: order.maxPrice, latencyMs: now - order.submittedAt,
+    });
+    return;
+  }
+  state.account = markAccount(result.account, marketMap, now);
+  state.tokenIdsByMarket[market.id] = { upTokenId: market.upTokenId, downTokenId: market.downTokenId };
+  log("INFO", "Paper fill recorded", {
+    asset: market.asset, duration: market.duration, side: order.side, notional: result.fill.totalCost,
+    averagePrice: result.fill.price, limit: order.maxPrice, latencyMs: now - order.submittedAt, marketId: market.id,
+  });
 }
 
 function closeMarketStreams(): void {
@@ -1160,9 +1224,10 @@ async function runCycle(): Promise<void> {
     // Check before attempting recovery so a successful fetch cannot erase evidence
     // that the last complete snapshot was already stale.
     await latchStaleDataIfNeeded(cycleStartedAt);
-    const allMarkets = [...latestMarkets.values()];
     if (stopping || shutdownController.signal.aborted) return;
     const now = Date.now();
+    confirmLiveBooks(now);
+    const allMarkets = [...latestMarkets.values()];
     await latchStaleDataIfNeeded(now);
     const markets = allMarkets.filter((market) => market.endTime > now);
     pruneTrackingMaps(markets);
@@ -1176,6 +1241,7 @@ async function runCycle(): Promise<void> {
       if (issue) blockerCounts[issue] = (blockerCounts[issue] ?? 0) + 1;
     }
     latestEligibleMarketCount = eligibleMarkets.length;
+    recordObservations(usableMarkets, now);
     latestMarketDataIssues = blockerCounts;
     if (eligibleMarkets.length > 0 && usableMarkets.length === 0 && now - lastDataGapWarningAt >= 60_000) {
       lastDataGapWarningAt = now;
@@ -1217,6 +1283,7 @@ async function runCycle(): Promise<void> {
     await recoverStaleDataHaltAfterFreshCycles(freshDataMarkets.length, recoveryPortfolioMarkable, recoveryObservationSignature);
 
     if (usableMarkets.length || (state.account.positions.length > 0 && recoveryPortfolioMarkable)) {
+      processPendingPaperOrder(marketMap, now);
       state.account = markAccount(state.account, marketMap, now);
       applyEarlyExits(marketMap, now);
       state.account = markAccount(state.account, marketMap, now);
@@ -1314,44 +1381,34 @@ async function runCycle(): Promise<void> {
         };
       });
       const canEnter = !stopping && !shutdownController.signal.aborted && !killed && !paused && !stale && !riskHalted
-        && state.lastError === null && portfolioMarkable;
-      if (canEnter && state.account.cash >= paperMinBetUsd && state.account.positions.length < paperMaxOpenPositions) {
+        && state.lastError === null && portfolioMarkable
+        && state.account.positions.length + (pendingPaperOrder ? 1 : 0) < paperMaxOpenPositions;
+      if (canEnter && pendingPaperOrder === null && state.account.cash >= paperMinBetUsd && state.account.positions.length < paperMaxOpenPositions) {
         const candidate = opportunities.find(({ opportunity }) => opportunity.approved && opportunity.signal.action !== "PASS");
         if (candidate) {
           const lastEntryAt = state.lastEntryByMarket[candidate.market.id] ?? 0;
-          if (!stopping && !shutdownController.signal.aborted && now - lastEntryAt >= 15_000 &&
+          const side = candidate.opportunity.signal.action as PaperSide;
+          const fairUp = candidate.opportunity.signal.fairUp;
+          // Limit price: the highest price at which every share still clears
+          // the edge floor after fees and the slippage buffer.
+          const maxPrice = fairUp === null ? null : modelPriceCeiling({
+            fairProbability: side === "UP" ? fairUp : 1 - fairUp, minEdge: paperMinNetEdge, tickSize: 0.01,
+            slippageBps: costs.slippageBps, feeSchedule: candidate.market.feeSchedule, fallbackFeeRate: costs.feeRate,
+          });
+          if (maxPrice !== null && !stopping && !shutdownController.signal.aborted && now - lastEntryAt >= 15_000 &&
               marketHasFreshInputs(candidate.market, Date.now())) {
             const referenceLabel = "verified Polymarket 60-second TWAP opening reference";
-            const result = buyPaper(state.account, candidate.market, candidate.opportunity.signal.action as PaperSide,
-              candidate.opportunity.stakeUsd, costs,
-              `headless bankroll-aware paper engine; ${candidate.opportunity.sizing?.tier ?? "UNKNOWN"}; ${referenceLabel}; score ${candidate.opportunity.score?.score ?? 0}`, now);
-            if (result.fill) {
-              state.account = markAccount(result.account, marketMap, now);
-              state.lastEntryByMarket[candidate.market.id] = now;
-              state.tokenIdsByMarket[candidate.market.id] = {
-                upTokenId: candidate.market.upTokenId,
-                downTokenId: candidate.market.downTokenId,
-              };
-              log("INFO", "Paper fill recorded", {
-                asset: candidate.market.asset,
-                duration: candidate.market.duration,
-                side: candidate.opportunity.signal.action,
-                notional: result.fill.totalCost,
-                targetBetPct: currentLiquidationEquity! > 0 ? result.fill.totalCost / currentLiquidationEquity! : 0,
-                edge: candidate.opportunity.signal.edge,
-                expectedNetProfitUsd: candidate.opportunity.sizing?.expectedNetProfitUsd,
-                opportunityScore: candidate.opportunity.score?.score,
-                tier: candidate.opportunity.sizing?.tier,
-                minimumExecutableOrderUsd: candidate.opportunity.sizing?.minimumExecutableOrderUsd,
-                marketId: candidate.market.id,
-              });
-            } else {
-              log("WARN", "Ranked paper opportunity could not be filled at the approved stake", {
-                marketId: candidate.market.id,
-                stakeUsd: candidate.opportunity.stakeUsd,
-                reason: result.error,
-              });
-            }
+            pendingPaperOrder = {
+              marketId: candidate.market.id, side, stakeUsd: candidate.opportunity.stakeUsd, maxPrice, submittedAt: now,
+              reason: `headless bankroll-aware paper engine; ${candidate.opportunity.sizing?.tier ?? "UNKNOWN"}; ${referenceLabel}; score ${candidate.opportunity.score?.score ?? 0}; FAK limit ${maxPrice.toFixed(2)} after ${paperFillLatencyMs} ms`,
+            };
+            state.lastEntryByMarket[candidate.market.id] = now;
+            log("INFO", "Paper FAK order submitted", {
+              asset: candidate.market.asset, duration: candidate.market.duration, side, stakeUsd: candidate.opportunity.stakeUsd,
+              limit: maxPrice, edge: candidate.opportunity.signal.edge, tier: candidate.opportunity.sizing?.tier,
+              opportunityScore: candidate.opportunity.score?.score, latencyMs: paperFillLatencyMs, marketId: candidate.market.id,
+            });
+            if (paperFillLatencyMs === 0) processPendingPaperOrder(marketMap, now);
           }
         }
       }

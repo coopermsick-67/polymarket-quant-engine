@@ -262,6 +262,11 @@ export async function POST(request: Request) {
   if (suppliedPrivateFields > 0 && (suppliedPrivateFields < 4 || !validAddress(signerAddress))) return json({ ok: false, error: "Provide signer address, API key, secret, and passphrase together, or leave all private fields blank." }, 400);
   if (privateKey && !validPrivateKey(privateKey)) return json({ ok: false, error: "Enter a 64-character hex signer private key, with or without the 0x prefix." }, 400);
   if (!/^[0-3]$/.test(signatureType)) return json({ ok: false, error: "Signature type must be 0, 1, 2, or 3." }, 400);
+  // A raw signer key may only be handed to a server on this machine; a hosted
+  // deployment accepts read-only CLOB API credentials instead.
+  if (privateKey && !(isLoopbackRequest(request) && localLiveEnabled())) {
+    return json({ ok: false, error: "Private keys are only accepted by a local server bound to loopback with POLYMARKET_LIVE_ALLOW_LOCALHOST=true. On a hosted deployment, provide the signer address and CLOB API key, secret, and passphrase instead." }, 403);
+  }
 
   const sessionUserId = !privateKey && suppliedPrivateFields === 0
     ? isLoopbackRequest(request) && localLiveEnabled()

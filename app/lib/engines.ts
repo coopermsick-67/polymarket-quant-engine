@@ -3,7 +3,6 @@ import {
   bestAskFor,
   bestBidFor,
   CONSERVATIVE_CRYPTO_FEE_SCHEDULE,
-  estimateFairProbability,
   marketImpliedProbabilityUp,
   orderBookFor,
   sideFairProbability,
@@ -182,6 +181,8 @@ export type BacktestTrade = {
 
 export type BacktestResult = {
   signals: number;
+  /** Rows skipped because no live model probability was recorded for them. */
+  skippedWithoutModel: number;
   settled: number;
   unsettled: number;
   wins: number;
@@ -198,9 +199,14 @@ export type BacktestResult = {
 
 const round = (value: number, digits = 8) => Number(value.toFixed(digits));
 const roundFee = (value: number) => Number((Math.round(Math.max(0, value) * 100_000) / 100_000).toFixed(5));
-const MAX_ORDER_BOOK_AGE_MS = 60_000;
+/**
+ * A book older than this cannot price a decision on a 5-minute market. Books
+ * are stamped in Polymarket server time; a healthy stream re-confirms quiet
+ * books, so this only trips when data has genuinely stopped arriving.
+ */
+export const MAX_ORDER_BOOK_AGE_MS = 10_000;
 
-const feeScheduleFor = (market: LiveMarket) => {
+const feeScheduleFor = (market: Pick<LiveMarket, "feeSchedule">) => {
   const schedule = market.feeSchedule;
   if (schedule && Number.isFinite(schedule.rate) && schedule.rate >= 0 && schedule.rate <= 1
     && Number.isFinite(schedule.exponent) && schedule.exponent >= 0 && schedule.exponent <= 8) return schedule;
@@ -209,13 +215,17 @@ const feeScheduleFor = (market: LiveMarket) => {
 
 /**
  * Polymarket's taker fee curve is shares * rate * (price * (1-price)) ** exponent.
- * Keep the configured legacy notional fee as a conservative floor for manual paper settings.
+ * When the market's own schedule was read from the CLOB it is exact and is
+ * used as is. The configured notional rate is only a conservative stand-in
+ * when that schedule could not be read; applying it on top of a known
+ * schedule overstated fees several times over near the price extremes.
  */
-const feePerShareAt = (market: LiveMarket, price: number, costs: CostConfig): number => {
+export const feePerShareAt = (market: Pick<LiveMarket, "feeSchedule">, price: number, costs: CostConfig): number => {
   const schedule = feeScheduleFor(market);
   const boundedPrice = Math.min(1, Math.max(0, price));
   const curve = Math.pow(boundedPrice * (1 - boundedPrice), schedule.exponent);
   const marketFee = schedule.feesEnabled ? schedule.rate * curve : 0;
+  if (schedule.source === "CLOB") return marketFee;
   const configuredRate = Number.isFinite(costs.feeRate) ? Math.max(0, costs.feeRate) : 0;
   return Math.max(marketFee, boundedPrice * configuredRate);
 };
@@ -324,7 +334,7 @@ export const markAccount = (account: PaperAccount, markets: Map<string, LiveMark
   return shouldAppend ? { ...withRiskBaselines, equityHistory: [...withRiskBaselines.equityHistory, { timestamp, equity }].slice(-5000) } : withRiskBaselines;
 };
 
-const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: CostConfig): FillResult | null => {
+const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: CostConfig, maxPrice = 1): FillResult | null => {
   const book = orderBookFor(market, side);
   if (!isBookFreshForExecution(book) || !book.asks.length || budget <= 0) return null;
   const slippageBps = Number.isFinite(costs.slippageBps) ? Math.max(0, costs.slippageBps) : 0;
@@ -335,6 +345,8 @@ const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: Co
   let fee = 0;
   let levels = 0;
   for (const level of [...book.asks].sort((left, right) => left.price - right.price)) {
+    // A limit order never takes liquidity above its limit price.
+    if (level.price > maxPrice + 1e-9) break;
     const effectivePrice = level.price * slippageMultiplier;
     if (!Number.isFinite(effectivePrice) || effectivePrice <= 0 || effectivePrice >= 1) continue;
     const feePerShare = feePerShareAt(market, effectivePrice, costs);
@@ -356,8 +368,12 @@ const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: Co
   return { shares: round(shares), price: round(notional / shares), notional: round(notional), fee: round(fee, 5), totalCost: round(notional + fee, 5), levels };
 };
 
-const isBookFreshForExecution = (book: OrderBook | null, now = Date.now()): book is OrderBook =>
-  Boolean(book && book.timestamp !== null && book.timestamp <= now + 30_000 && now - book.timestamp <= MAX_ORDER_BOOK_AGE_MS);
+/** Book timestamps are server time, so compare them with the synchronized clock, not the local one. */
+export const isBookFreshForExecution = (book: OrderBook | null, now = Date.now()): book is OrderBook => {
+  if (!book || book.timestamp === null) return false;
+  const serverNow = synchronizedPolymarketTime(now);
+  return book.timestamp <= serverNow + 2_000 && serverNow - book.timestamp <= MAX_ORDER_BOOK_AGE_MS;
+};
 
 /**
  * Quote one side at the requested cash size. `netEdge` compares blended fair
@@ -481,9 +497,10 @@ export const buyPaper = (
   costs: CostConfig,
   reason: string,
   timestamp = Date.now(),
+  maxPrice = 1,
 ): TradeResult => {
   const boundedBudget = Math.min(Math.max(0, budget), account.cash);
-  const fill = walkAsks(market, side, boundedBudget, costs);
+  const fill = walkAsks(market, side, boundedBudget, costs, maxPrice);
   if (!fill) return { account, fill: null, error: "No executable ask depth or the order is below the market minimum." };
   const marketLabel = `${market.asset} ${market.duration}`;
   const existing = account.positions.find((position) => position.marketId === market.id && position.side === side);
@@ -650,7 +667,13 @@ export const settleResolvedPaperPositions = (
   for (const position of account.positions) {
     const market = markets.get(position.marketId);
     const isExpired = market ? market.endTime <= timestamp : position.endTime <= timestamp;
-    const outcome = market && market.reference !== null && market.spot !== null && isExpired ? market.spot >= market.reference ? "UP" : "DOWN" : null;
+    // Settle on the feed named by the market rules (the TWAP for TWAP markets),
+    // and only from an observation taken at or after expiry.
+    const settlement = market?.settlementPrice ?? null;
+    const settledAtExpiry = market && market.settlementUpdatedAt !== null && market.settlementUpdatedAt !== undefined
+      && market.settlementUpdatedAt >= market.endTime - 1_000;
+    const outcome = market && market.reference !== null && settlement !== null && isExpired && settledAtExpiry
+      ? settlement >= market.reference ? "UP" : "DOWN" : null;
     if (!isExpired || !outcome) {
       remaining.push(position);
       if (isExpired) skipped += 1;
@@ -865,7 +888,7 @@ export const marketStreamingDataFreshnessIssue = (market: LiveMarket, now = Date
   if (marketNow - market.spotUpdatedAt > 10_000) return "Polymarket oracle data is stale; waiting for a fresh tick.";
   if (market.chartUpdatedAt === null || marketNow - market.chartUpdatedAt > 120_000) return "Chart feed is stale; waiting for a fresh candle snapshot.";
   for (const orderBook of [market.upBook, market.downBook]) {
-    if (!orderBook || orderBook.timestamp === null || marketNow - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - marketNow > 30_000) {
+    if (!orderBook || orderBook.timestamp === null || marketNow - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - marketNow > 2_000) {
       return "An order-book snapshot is stale or has no usable timestamp.";
     }
   }
@@ -1160,15 +1183,18 @@ export const runBacktest = (
   const startingCash = Math.max(1, Number.isFinite(params.startingCash) ? params.startingCash : 1000);
   const minEdge = Math.max(0, Number.isFinite(params.minEdge) ? params.minEdge : 0);
   const maxTrade = Math.max(0, Number.isFinite(params.maxTrade) ? params.maxTrade : 0);
+  // Polymarket's taker fee curve: rate * p * (1 - p) per share, charged when
+  // buying. Redemption of a winning share at $1 carries no fee.
   const feeRate = Math.max(0, Number.isFinite(params.feeRate) ? params.feeRate : 0);
   const slippageMultiplier = 1 + Math.max(0, Number.isFinite(params.slippageBps) ? params.slippageBps : 0) / 10_000;
-  const feeMultiplier = 1 + feeRate;
+  const allInCost = (price: number) => price + feeRate * price * (1 - price);
   let cash = startingCash;
   let committed = 0;
   let realized = 0;
   let peak = startingCash;
   let maxDrawdown = 0;
   let signals = 0;
+  let skippedWithoutModel = 0;
   let settled = 0;
   let wins = 0;
   let losses = 0;
@@ -1201,9 +1227,8 @@ export const runBacktest = (
     if (!open) return;
     const won = outcome === open.side;
     const payout = won ? open.shares : 0;
-    const exitFee = payout * feeRate;
-    const pnl = round(payout - open.entryCost - exitFee);
-    cash = round(cash + payout - exitFee);
+    const pnl = round(payout - open.entryCost);
+    cash = round(cash + payout);
     committed = Math.max(0, round(committed - open.entryCost));
     realized = round(realized + pnl);
     settled += 1;
@@ -1231,12 +1256,15 @@ export const runBacktest = (
     const remainingValue = row.remainingSeconds ?? (row.duration === "5m" ? 300 : 900);
     const remaining = Number.isFinite(remainingValue) ? Math.max(0, remainingValue) : row.duration === "5m" ? 300 : 900;
     if (remaining < 30) continue;
-    const fairUp = row.modelFairUp !== null && row.modelFairUp !== undefined && Number.isFinite(row.modelFairUp)
-      ? Math.min(0.99, Math.max(0.01, row.modelFairUp))
-      : estimateFairProbability(row.reference, row.spot, remaining);
-    if (fairUp === null) continue;
-    const upCost = row.upAsk * slippageMultiplier * feeMultiplier;
-    const downCost = row.downAsk * slippageMultiplier * feeMultiplier;
+    // Only probabilities the live model actually produced are replayed; a
+    // made-up stand-in formula would test something that never traded.
+    if (row.modelFairUp === null || row.modelFairUp === undefined || !Number.isFinite(row.modelFairUp)) {
+      skippedWithoutModel += 1;
+      continue;
+    }
+    const fairUp = Math.min(0.99, Math.max(0.01, row.modelFairUp));
+    const upCost = allInCost(row.upAsk * slippageMultiplier);
+    const downCost = allInCost(row.downAsk * slippageMultiplier);
     const upEdge = fairUp - upCost;
     const downEdge = 1 - fairUp - downCost;
     if (row.modelAction === "PASS") continue;
@@ -1256,10 +1284,10 @@ export const runBacktest = (
       ? row.modelStakeUsd
       : maxTrade;
     const entryBudget = Math.min(requestedBudget, maxTrade, cash);
-    const shares = entryBudget / (entry * feeMultiplier);
+    const shares = entryBudget / allInCost(entry);
     if (!Number.isFinite(shares) || shares <= 0 || entryBudget <= 0) continue;
     const notional = shares * entry;
-    const entryFee = notional * feeRate;
+    const entryFee = shares * feeRate * entry * (1 - entry);
     const entryCost = round(notional + entryFee);
     signals += 1;
     edgeSum += edge;
@@ -1272,6 +1300,7 @@ export const runBacktest = (
   const unsettled = openTrades.size;
   return {
     signals,
+    skippedWithoutModel,
     settled,
     unsettled,
     wins,
