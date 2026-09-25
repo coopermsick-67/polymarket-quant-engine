@@ -900,13 +900,31 @@ const returnVolatility = (closes: number[]): number | null => {
  * falsely confident probability.
  */
 const candleVolatility = (candles: MarketCandle[], durationSeconds: number, now: number): number | null => {
-  const completed = candles.filter((candle) => candle.timestamp + durationSeconds * 1000 <= now && candle.close > 0);
+  const completed = candles.filter((candle) => candle.timestamp + durationSeconds * 1000 <= now && candle.close > 0)
+    .sort((left, right) => left.timestamp - right.timestamp);
   if (completed.length < 20) return null;
   const closes = completed.map((candle) => candle.close);
   const recent = returnVolatility(closes.slice(-21));
   const longer = returnVolatility(closes.slice(-81));
   if (recent === null) return longer;
   return longer === null ? recent : Math.max(recent, longer);
+};
+
+/**
+ * A small, deliberately shrunk drift term from the last three completed bars.
+ * The caller supplies only the market's own horizon candles, so 5m markets do
+ * not borrow 15m trend and vice versa. The hard cap prevents a short streak
+ * from overpowering the opening-price distance and realized-volatility base.
+ */
+const candleDriftPerBar = (candles: MarketCandle[], durationSeconds: number, now: number, volatility: number): number => {
+  const completed = candles.filter((candle) => candle.timestamp + durationSeconds * 1000 <= now
+    && Number.isFinite(candle.close) && candle.close > 0)
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const closes = completed.slice(-4).map((candle) => candle.close);
+  if (closes.length < 4) return 0;
+  const returns = closes.slice(1).map((close, index) => Math.log(close / closes[index]));
+  const recentMean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  return clamp(recentMean * 0.2, -volatility * 0.2, volatility * 0.2);
 };
 
 export const chartFairProbability = (
@@ -924,7 +942,9 @@ export const chartFairProbability = (
   const remainingBars = Math.max(1 / 60, remainingSeconds / barSeconds);
   const sigmaRemaining = volatility * Math.sqrt(remainingBars);
   if (!Number.isFinite(sigmaRemaining) || sigmaRemaining <= 0) return null;
-  const zScore = Math.log(spot / reference) / sigmaRemaining;
+  const driftPerBar = candleDriftPerBar(candles, barSeconds, now, volatility);
+  const expectedLogReturn = Math.log(spot / reference) + driftPerBar * remainingBars;
+  const zScore = expectedLogReturn / sigmaRemaining;
   return clamp(normalCdf(zScore), 0.01, 0.99);
 };
 

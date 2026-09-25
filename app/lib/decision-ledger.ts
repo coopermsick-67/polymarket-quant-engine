@@ -3,7 +3,7 @@ import type { MarketSignal, PaperSide } from "./engines";
 
 export type LedgerDecision = PaperSide | "PASS";
 export type LedgerResult = "WIN" | "LOSS" | "PENDING" | "NOT TRADED";
-export const ACTIVE_MODEL_VERSION = "chainlink-vol-v3-anchored";
+export const ACTIVE_MODEL_VERSION = "chainlink-vol-v4-horizon-drift";
 export type RecordedAskLevel = { price: number; size: number };
 
 export type MarketDecisionRow = {
