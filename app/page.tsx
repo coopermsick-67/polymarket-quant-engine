@@ -58,7 +58,7 @@ import {
 } from "./lib/polymarket-data";
 import { subscribePolymarketPrices, type PolymarketPriceStreamStatus } from "./lib/polymarket-price-stream";
 import { accountLinkPlan, isLoopbackHostname, type AccountConnection } from "./lib/account-link";
-import { applyBookSnapshot, applyClobStreamEvents, preserveNewerStreamBooks, staleBookTokens } from "./lib/clob-book-stream";
+import { applyBookSnapshot, applyClobStreamEvents, expireDriftSuspects, preserveNewerStreamBooks, staleBookTokens, type DriftSuspects } from "./lib/clob-book-stream";
 import { ClobSocketPool } from "./lib/clob-socket-pool";
 import {
   accountDeployed,
@@ -777,18 +777,27 @@ export default function Home() {
       sockets.push(socket);
     };
     let clobMarkedLive = false;
+    let driftSuspects: DriftSuspects = new Map();
     const pool = new ClobSocketPool({
       onEvents: (events) => {
         const now = Date.now();
         // Level changes are checked against the venue's reported top of book.
-        // A mismatch means an update was missed: that book is invalidated and a
-        // fresh REST snapshot replaces it. Applying the same events twice is
-        // harmless (levels are absolute sizes), so the ref snapshot is only
-        // used to learn which books drifted.
-        const probe = applyClobStreamEvents(new Map(marketsRef.current.map((market) => [market.id, market])), events, now);
+        // A mismatch that outlasts DRIFT_GRACE_MS means an update was missed:
+        // that book is invalidated and a fresh REST snapshot replaces it.
+        // Applying the same events twice is harmless (levels are absolute
+        // sizes), so the ref snapshot is only used to learn which books
+        // drifted; both passes start from the same suspects and agree.
+        const suspectsBefore = driftSuspects;
+        const apply = (markets: Map<string, LiveMarket>) => {
+          const streamed = applyClobStreamEvents(markets, events, now, suspectsBefore);
+          const expired = expireDriftSuspects(streamed.markets, streamed.driftSuspects, now);
+          return { ...expired, desyncedTokens: new Set([...streamed.desyncedTokens, ...expired.desyncedTokens]) };
+        };
+        const probe = apply(new Map(marketsRef.current.map((market) => [market.id, market])));
+        driftSuspects = probe.driftSuspects;
         for (const event of events) if (event.kind === "book") desyncedTokens.delete(event.tokenId);
         setMarkets((current) => {
-          const applied = applyClobStreamEvents(new Map(current.map((market) => [market.id, market])), events, now);
+          const applied = apply(new Map(current.map((market) => [market.id, market])));
           return current.map((market) => applied.markets.get(market.id) ?? market);
         });
         setLastUpdated(now);

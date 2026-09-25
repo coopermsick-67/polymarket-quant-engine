@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyBookSnapshot, applyClobStreamEvents, parseClobStreamMessage, preserveNewerStreamBooks, staleBookTokens } from "../app/lib/clob-book-stream";
+import { applyBookSnapshot, applyClobStreamEvents, DRIFT_GRACE_MS, expireDriftSuspects, parseClobStreamMessage, preserveNewerStreamBooks, staleBookTokens } from "../app/lib/clob-book-stream";
 import { setPolymarketClockOffsetForTesting } from "../app/lib/polymarket-data";
 import { marketWith } from "./market-fixture";
 
@@ -102,4 +102,61 @@ test("an empty side reported as best_ask 1 / best_bid 0 (as the live venue sends
     { asset_id: "down", price: "0.01", size: "37829.64", side: "SELL", best_bid: "0", best_ask: "0.01" },
   ] }));
   assert.equal(applyClobStreamEvents(markets(), [...downOnly, ...downChange], NOW).desyncedTokens.size, 0);
+});
+
+// The venue reports the top of book after a whole change, but may split the
+// change's level updates across frames about a millisecond apart (seen live).
+const splitChange = [
+  // A trade takes the 0.50 bid; this frame already reports the post-trade best bid of 0.48...
+  { event_type: "price_change", timestamp: String(NOW), price_changes: [
+    { asset_id: "up", side: "BUY", price: "0.48", size: "30", best_bid: "0.48", best_ask: "0.51" },
+  ] },
+  // ...and the next frame removes the 0.49 level, after which the book agrees.
+  { event_type: "price_change", timestamp: String(NOW), price_changes: [
+    { asset_id: "up", side: "BUY", price: "0.49", size: "0", best_bid: "0.48", best_ask: "0.51" },
+  ] },
+].map((frame) => parseClobStreamMessage(JSON.stringify(frame)));
+
+test("a mismatch that the next frame resolves is not drift when the caller tracks suspects", () => {
+  const first = applyClobStreamEvents(markets(), splitChange[0], NOW, new Map());
+  assert.equal(first.desyncedTokens.size, 0);
+  assert.equal(first.driftSuspects.get("up"), NOW);
+  assert.notEqual(first.markets.get("m1")!.upBook!.timestamp, null, "the book is kept while the mismatch is inside its grace window");
+  const second = applyClobStreamEvents(first.markets, splitChange[1], NOW + 1, first.driftSuspects);
+  assert.equal(second.desyncedTokens.size, 0);
+  assert.equal(second.driftSuspects.size, 0);
+  assert.equal(second.markets.get("m1")!.upBid, 0.48);
+});
+
+test("without suspect tracking the same split change still invalidates at once", () => {
+  assert.deepEqual([...applyClobStreamEvents(markets(), splitChange[0], NOW).desyncedTokens], ["up"]);
+});
+
+test("a mismatch that outlasts the grace window invalidates the book", () => {
+  const first = applyClobStreamEvents(markets(), splitChange[0], NOW, new Map());
+  const stillWrong = parseClobStreamMessage(JSON.stringify({ event_type: "price_change", timestamp: String(NOW + DRIFT_GRACE_MS), price_changes: [
+    { asset_id: "up", side: "SELL", price: "0.52", size: "10", best_bid: "0.48", best_ask: "0.51" },
+  ] }));
+  const later = applyClobStreamEvents(first.markets, stillWrong, NOW + DRIFT_GRACE_MS, first.driftSuspects);
+  assert.deepEqual([...later.desyncedTokens], ["up"]);
+  assert.equal(later.markets.get("m1")!.upBook!.timestamp, null);
+  assert.equal(later.driftSuspects.size, 0);
+});
+
+test("a suspect token that goes quiet is invalidated once its grace window passes", () => {
+  const first = applyClobStreamEvents(markets(), splitChange[0], NOW, new Map());
+  const early = expireDriftSuspects(first.markets, first.driftSuspects, NOW + DRIFT_GRACE_MS - 1);
+  assert.equal(early.desyncedTokens.size, 0);
+  assert.equal(early.driftSuspects.size, 1);
+  const expired = expireDriftSuspects(first.markets, first.driftSuspects, NOW + DRIFT_GRACE_MS);
+  assert.deepEqual([...expired.desyncedTokens], ["up"]);
+  assert.equal(expired.markets.get("m1")!.upBook!.timestamp, null);
+  assert.equal(expired.driftSuspects.size, 0);
+});
+
+test("a full book snapshot clears a pending suspect", () => {
+  const first = applyClobStreamEvents(markets(), splitChange[0], NOW, new Map());
+  const snapshot = parseClobStreamMessage(JSON.stringify({ event_type: "book", asset_id: "up", timestamp: String(NOW + 1),
+    bids: [{ price: "0.48", size: "30" }], asks: [{ price: "0.51", size: "30" }] }));
+  assert.equal(applyClobStreamEvents(first.markets, snapshot, NOW + 1, first.driftSuspects).driftSuspects.size, 0);
 });
