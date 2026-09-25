@@ -69,6 +69,9 @@ const sessionTime = (expiresAt: number | null) => {
   return Math.floor(seconds / 60) + "m " + String(seconds % 60).padStart(2, "0") + "s";
 };
 
+/** Web order submission is disabled; the terminal trader is the single live executor. */
+const TERMINAL_ONLY_ORDERS = true;
+
 export default function LiveExecutionPanel({ session, running, paused, consent, killSwitch, risk, marketCount, candidateCount, status, clock, markets, manualPositions, manualBusy, onManualEntry, onManualExit, onLink, onStart, onPause, onKill, onRefresh, onConsentChange, onRiskChange }: Props) {
   const [selectedMarketId, setSelectedMarketId] = useState("");
   const [selectedSide, setSelectedSide] = useState<PaperSide>("UP");
@@ -77,7 +80,8 @@ export default function LiveExecutionPanel({ session, running, paused, consent, 
   const baseUnit = session?.balance === null || session?.balance === undefined ? null : session.balance * risk.unitBalancePct;
   const exposureCap = session?.balance === null || session?.balance === undefined ? null : session.balance * risk.maxExposurePct;
   const maxStake = Math.min(risk.maxTradeUsd, exposureCap ?? risk.maxTradeUsd);
-  const canStart = Boolean(session?.connected && consent && !running && !killSwitch);
+  // Order submission is terminal-only (pnpm run live); the web panel reads state and can cancel orders.
+  const canStart = TERMINAL_ONLY_ORDERS ? false : Boolean(session?.connected && consent && !running && !killSwitch);
   const liveRisk = enforceLiveExecutionRisk(risk);
   const selectedMarket = markets.find((market) => market.id === selectedMarketId) ?? markets[0] ?? null;
   const stakeUsd = Number(stakeInput);
@@ -100,7 +104,7 @@ export default function LiveExecutionPanel({ session, running, paused, consent, 
     : null;
   const maxManualStake = session?.balance === null || session?.balance === undefined ? 0 : liveUnitUsd(session.balance, liveRisk);
   const selectedPosition = selectedMarket ? manualPositions.find((position) => position.market.id === selectedMarket.id) : undefined;
-  const canManualEnter = Boolean(session?.connected && selectedMarket && !running && !paused && !manualBusy && !killSwitch
+  const canManualEnter = !TERMINAL_ONLY_ORDERS && Boolean(session?.connected && selectedMarket && !running && !paused && !manualBusy && !killSwitch
     && session.openOrders === 0 && !selectedPosition && !marketFreshnessIssue && manualSignal?.fairUp !== null
     && selectedQuote?.fill && selectedQuote.netEdge !== null && selectedQuote.netEdge >= liveRisk.minEdge
     && selectedProbability !== null && sizing?.approved && stakeUsd >= 1 && stakeUsd <= maxManualStake + 1e-8
@@ -150,6 +154,7 @@ export default function LiveExecutionPanel({ session, running, paused, consent, 
         </article>
       ) : (
         <>
+          <div className="data-alert" role="note"><AlertTriangle size={16} /><div><strong>Orders run from the terminal</strong><span>Live orders are placed only by <code>pnpm run live</code>, which journals each order and reconciles it against the CLOB and on-chain trade status. This panel shows the linked balance and positions and can cancel open orders.</span></div></div>
           <div className="live-stat-grid">
             <article className="live-stat-card"><span>AVAILABLE USDC</span><strong>{money(session.balance)}</strong><small>fresh CLOB collateral</small></article>
             <article className="live-stat-card"><span>BASE UNIT</span><strong>{money(baseUnit)}</strong><small>{percent(risk.unitBalancePct)} of balance</small></article>
@@ -245,7 +250,7 @@ export default function LiveExecutionPanel({ session, running, paused, consent, 
                     <div className="manual-position-market">{position.market.question}</div>
                     <div className="manual-position-values"><span>SHARES <b>{(position.size ?? 0).toFixed(4)}</b></span><span>BEST BID <b>{position.bid === null ? "—" : cents(position.bid)}</b></span></div>
                     <label className="manual-exit-input"><span>SHARES TO SELL</span><input inputMode="decimal" max={position.size ?? undefined} min="0.0001" onChange={(event) => setExitAmounts((current) => ({ ...current, [position.tokenID ?? position.id]: event.target.value }))} step="0.0001" type="number" value={exitAmounts[position.tokenID ?? position.id] ?? String(position.size ?? "")} /></label>
-                    <button className="button-secondary manual-sell-button" disabled={!session?.connected || running || manualBusy || killSwitch || !validAmount || position.bid === null} onClick={() => onManualExit(position, position.market.id, position.side, amount, position.bid)} type="button">{manualBusy ? "WORKING…" : `SELL ${validAmount ? amount.toFixed(4) : "—"} SHARES`}</button>
+                    <button className="button-secondary manual-sell-button" disabled={TERMINAL_ONLY_ORDERS || !session?.connected || running || manualBusy || killSwitch || !validAmount || position.bid === null} onClick={() => onManualExit(position, position.market.id, position.side, amount, position.bid)} type="button">{manualBusy ? "WORKING…" : `SELL ${validAmount ? amount.toFixed(4) : "—"} SHARES`}</button>
                   </div>;
                 })}
                 <div className="manual-sizing-note">Manual sells use the current live bid and a slippage floor. Settlement or already-expired positions are handled in Account.</div>
@@ -259,8 +264,8 @@ export default function LiveExecutionPanel({ session, running, paused, consent, 
             <div className="risk-controls live-risk-controls">
               <label className="range-control"><span><b>Minimum cashout USD</b><em>{money(risk.earlyExitMinProfitUsd)}</em></span><input disabled={!risk.earlyExitEnabled} max="50" min="0.05" onChange={(event) => onRiskChange({ earlyExitMinProfitUsd: Number(event.target.value) })} step="0.05" type="range" value={risk.earlyExitMinProfitUsd} /></label>
               <label className="range-control"><span><b>Minimum profit</b><em>{percent(risk.earlyExitMinProfitPct)}</em></span><input disabled={!risk.earlyExitEnabled} max="1" min="0.05" onChange={(event) => onRiskChange({ earlyExitMinProfitPct: Number(event.target.value) })} step="0.05" type="range" value={risk.earlyExitMinProfitPct} /></label>
-              <label className="range-control"><span><b>Take-profit target</b><em>{percent(risk.earlyExitTakeProfitPct)}</em></span><input disabled={!risk.earlyExitEnabled} max="1" min="0.05" onChange={(event) => onRiskChange({ earlyExitTakeProfitPct: Number(event.target.value) })} step="0.05" type="range" value={risk.earlyExitTakeProfitPct} /></label>
-              <label className="range-control"><span><b>Stop-loss limit</b><em>{percent(risk.earlyExitStopLossPct)}</em></span><input disabled={!risk.earlyExitEnabled} max="0.2" min="0.05" onChange={(event) => onRiskChange({ earlyExitStopLossPct: Number(event.target.value) })} step="0.01" type="range" value={risk.earlyExitStopLossPct} /></label>
+              <label className="range-control"><span><b>Take-profit target</b><em>{percent(risk.earlyExitTakeProfitPct)}</em></span><input disabled={!risk.earlyExitEnabled} max="1" min="0" onChange={(event) => onRiskChange({ earlyExitTakeProfitPct: Number(event.target.value) })} step="0.05" type="range" value={risk.earlyExitTakeProfitPct} /></label>
+              <label className="range-control"><span><b>Stop-loss limit</b><em>{percent(risk.earlyExitStopLossPct)}</em></span><input disabled={!risk.earlyExitEnabled} max="0.5" min="0" onChange={(event) => onRiskChange({ earlyExitStopLossPct: Number(event.target.value) })} step="0.01" type="range" value={risk.earlyExitStopLossPct} /></label>
               <label className="range-control"><span><b>Bid above model by</b><em>{percent(risk.earlyExitModelGap)}</em></span><input disabled={!risk.earlyExitEnabled} max="0.15" min="0.03" onChange={(event) => onRiskChange({ earlyExitModelGap: Number(event.target.value) })} step="0.01" type="range" value={risk.earlyExitModelGap} /></label>
               <label className="range-control"><span><b>Confirmations</b><em>{risk.earlyExitConfirmations} ticks</em></span><input disabled={!risk.earlyExitEnabled} max="4" min="2" onChange={(event) => onRiskChange({ earlyExitConfirmations: Number(event.target.value) })} step="1" type="range" value={risk.earlyExitConfirmations} /></label>
               <label className="range-control"><span><b>Minimum time left</b><em>{risk.earlyExitMinRemainingSeconds}s</em></span><input disabled={!risk.earlyExitEnabled} max="300" min="30" onChange={(event) => onRiskChange({ earlyExitMinRemainingSeconds: Number(event.target.value) })} step="15" type="range" value={risk.earlyExitMinRemainingSeconds} /></label>

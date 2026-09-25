@@ -6,8 +6,13 @@ export const LOCAL_LIVE_USER_ID = "local-owner";
 
 const truthy = (value: string | undefined) => ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
 
-/** Local live mode is an explicit opt-in for a trusted development machine. */
-export const localLiveEnabled = () => truthy(env.POLYMARKET_LIVE_ALLOW_LOCALHOST);
+/**
+ * Local live mode is an explicit opt-in for a trusted development machine. The
+ * Fetch API cannot see the socket peer, so a deployment reachable from the
+ * network must set POLYMARKET_HOSTED=true, which disables the local-owner
+ * bypass whatever else is configured.
+ */
+export const localLiveEnabled = () => truthy(env.POLYMARKET_LIVE_ALLOW_LOCALHOST) && !truthy(env.POLYMARKET_HOSTED);
 
 export const isLoopbackRequest = (request: Request) => {
   try {
@@ -23,7 +28,7 @@ export const isLoopbackRequest = (request: Request) => {
     // owner bypass when any proxy/forwarding header is present, and require a
     // matching Host/Origin so a forwarded external request cannot opt in by
     // supplying only a localhost Host header.
-    if (["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "cf-connecting-ip"]
+    if (["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "cf-connecting-ip", "cf-ray", "true-client-ip", "x-client-ip", "via"]
       .some((header) => Boolean(request.headers.get(header)?.trim()))) return false;
     const hostHeader = request.headers.get("host");
     if (!hostHeader) return false;

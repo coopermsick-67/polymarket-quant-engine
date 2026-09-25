@@ -1,6 +1,8 @@
 import { privateKeyToAccount } from "viem/accounts";
 import { getChatGPTUser } from "../../../chatgpt-auth";
 import { isLoopbackRequest, LOCAL_LIVE_USER_ID, localLiveEnabled, readLiveSession, type LiveSession } from "../../../lib/polymarket-session";
+import { collateralUsdFromRaw } from "../../../lib/collateral";
+import { ConcurrencyGate, SlidingWindowLimiter, TtlCache, clientKey, readJsonBody, sameOriginFailure } from "../../../lib/request-guards";
 
 const DATA_API = "https://data-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
@@ -202,7 +204,8 @@ const readCollateralBalance = async (credentials: ClobCredentials, preferredType
     try {
       const payload = await authenticatedGet("/balance-allowance", credentials, `?asset_type=COLLATERAL&signature_type=${signatureType}`);
       const source = record(dataFrom(payload));
-      const balance = number(source.balance ?? source.available ?? source.collateral ?? source.usdc ?? source.available_balance);
+      // The CLOB reports collateral in raw six-decimal units.
+      const balance = collateralUsdFromRaw(source.balance ?? source.available ?? source.collateral ?? source.usdc ?? source.available_balance);
       if (balance !== null) return balance;
     } catch (error) {
       lastError = error;
@@ -244,9 +247,22 @@ const publicTrade = (source: JsonRecord) => ({
 
 const dedupe = <T extends { id: string }>(items: T[]) => [...new Map(items.map((item) => [item.id, item])).values()];
 
+// Public wallet reads fan out to five upstream endpoints, so bound them per
+// isolate: body size, request rate per client and per wallet, concurrent
+// fan-outs, and a short cache that coalesces repeated reads of one wallet.
+const MAX_ACCOUNT_BODY_BYTES = 4_096;
+const clientLimiter = new SlidingWindowLimiter(12, 60_000);
+const walletLimiter = new SlidingWindowLimiter(30, 60_000);
+const publicReadCache = new TtlCache<PromiseSettledResult<unknown>[]>(15_000);
+const upstreamGate = new ConcurrencyGate(8);
+
 export async function POST(request: Request) {
-  let input: AccountRequest;
-  try { input = await request.json() as AccountRequest; } catch { return json({ ok: false, error: "Invalid JSON request." }, 400); }
+  const crossOrigin = sameOriginFailure(request);
+  if (crossOrigin) return json({ ok: false, error: crossOrigin.error }, crossOrigin.status);
+  if (!clientLimiter.allow(clientKey(request))) return json({ ok: false, error: "Too many account requests; wait a minute and retry." }, 429);
+  const body = await readJsonBody<AccountRequest>(request, MAX_ACCOUNT_BODY_BYTES);
+  if ("failure" in body) return json({ ok: false, error: body.failure.error }, body.failure.status);
+  const input = body.value && typeof body.value === "object" ? body.value : {} as AccountRequest;
 
   const walletAddress = text(input.walletAddress);
   const privateKey = text(input.privateKey);
@@ -257,11 +273,17 @@ export async function POST(request: Request) {
   let signatureType = text(input.signatureType) || "3";
 
   if (!validAddress(walletAddress)) return json({ ok: false, error: "Enter the Polymarket account wallet address (0x followed by 40 hex characters)." }, 400);
+  if (!walletLimiter.allow(walletAddress.toLowerCase())) return json({ ok: false, error: "This wallet was read too often; wait a minute and retry." }, 429);
   const suppliedPrivateFields = [signerAddress, apiKey, secret, passphrase].filter(Boolean).length;
   if (privateKey && suppliedPrivateFields > 0) return json({ ok: false, error: "Use the wallet address and signer private key, or use a complete CLOB credential set, not both." }, 400);
   if (suppliedPrivateFields > 0 && (suppliedPrivateFields < 4 || !validAddress(signerAddress))) return json({ ok: false, error: "Provide signer address, API key, secret, and passphrase together, or leave all private fields blank." }, 400);
   if (privateKey && !validPrivateKey(privateKey)) return json({ ok: false, error: "Enter a 64-character hex signer private key, with or without the 0x prefix." }, 400);
   if (!/^[0-3]$/.test(signatureType)) return json({ ok: false, error: "Signature type must be 0, 1, 2, or 3." }, 400);
+  // A raw signer key may only be handed to a server on this machine; a hosted
+  // deployment accepts read-only CLOB API credentials instead.
+  if (privateKey && !(isLoopbackRequest(request) && localLiveEnabled())) {
+    return json({ ok: false, error: "Private keys are only accepted by a local server bound to loopback with POLYMARKET_LIVE_ALLOW_LOCALHOST=true. On a hosted deployment, provide the signer address and CLOB API key, secret, and passphrase instead." }, 403);
+  }
 
   const sessionUserId = !privateKey && suppliedPrivateFields === 0
     ? isLoopbackRequest(request) && localLiveEnabled()
@@ -275,13 +297,15 @@ export async function POST(request: Request) {
   if (liveSession) signatureType = String(liveSession.signatureType);
 
   const publicWarnings: string[] = [];
-  const [valueResult, positionsResult, activityResult, pnlResult, statsResult] = await Promise.allSettled([
+  const publicResults = await upstreamGate.run(() => publicReadCache.get(walletAddress.toLowerCase(), () => Promise.allSettled([
     fetchJson(`${DATA_API}/v2/value?user=${encodeURIComponent(walletAddress)}`),
-    fetchJson(`${DATA_API}/v2/positions?user=${encodeURIComponent(walletAddress)}&limit=100`),
+    fetchJson(`${DATA_API}/v2/positions?user=${encodeURIComponent(walletAddress)}&limit=100&filter_amount=0&include_archived=true`),
     fetchJson(`${DATA_API}/v2/activity?user=${encodeURIComponent(walletAddress)}&limit=100`),
     fetchJson(`${DATA_API}/v2/user-pnl?user=${encodeURIComponent(walletAddress)}&interval=1d&fidelity=1h`),
     fetchJson(`${DATA_API}/v2/user-stats?user=${encodeURIComponent(walletAddress)}`),
-  ]);
+  ])));
+  if (!publicResults) return json({ ok: false, error: "The account service is busy; retry in a moment." }, 503);
+  const [valueResult, positionsResult, activityResult, pnlResult, statsResult] = publicResults;
 
   const valuePayload = valueResult.status === "fulfilled" ? record(dataFrom(valueResult.value)) : null;
   if (!valuePayload) publicWarnings.push("Portfolio value could not be loaded.");

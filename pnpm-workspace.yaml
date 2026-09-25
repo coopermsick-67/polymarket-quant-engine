@@ -19,3 +19,18 @@ verifyDepsBeforeRun: false
 optimisticRepeatInstall: false
 overrides:
   miniflare>sharp: 0.35.4
+  # Security advisories in the production tree (pnpm audit --prod, Sep 2026).
+  # ws is pulled in by the CLOB SDK's ethers providers; the engine's own
+  # sockets use the global WebSocket, but patch the transitive copy anyway.
+  "ws@<8.21.0": "^8.21.0"
+  "browserslist@<4.28.7": "^4.28.7"
+  "baseline-browser-mapping@<2.11.0": "^2.11.0"
+  "@babel/core@<7.29.6": "^7.29.6"
+  # Development and build tooling advisories (pnpm audit, Sep 2026).
+  "brace-expansion@>=1 <1.1.18": "^1.1.18"
+  "brace-expansion@>=5 <5.0.9": "^5.0.9"
+  "js-yaml@>=4 <4.3.2": "^4.3.2"
+  "undici@>=7 <7.29.0": "^7.29.0"
+  "image-size@>=2 <2.0.3": "^2.0.3"
+  "fflate@<0.7.5": "^0.7.5"
+  "esbuild@>=0.28 <0.28.1": "^0.28.1"

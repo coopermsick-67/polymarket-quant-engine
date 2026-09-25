@@ -1,4 +1,4 @@
-import type { BacktestRow, PaperSide } from "./engines";
+import { parseHorizon, type BacktestRow, type PaperSide } from "./engines";
 import { ACTIVE_MODEL_VERSION, type RecordedAskLevel } from "./decision-ledger";
 import { bankrollProfile, sizeBankrollTrade, type BankrollPosition, type BankrollTier } from "./bankroll-policy";
 import { walkForwardCalibration, type WalkForwardCalibration } from "./bankroll-calibration";
@@ -128,6 +128,9 @@ const durationSeconds = (row: BankrollBacktestRow) => row.duration === "5m" ? 30
 const resolutionTime = (row: BankrollBacktestRow) => finite(row.outcomeAt) ? row.outcomeAt :
   positive(row.remainingSeconds) ? row.timestamp + row.remainingSeconds * 1000 : null;
 
+/** Polymarket taker fee per share: rate * p * (1 - p); no fee on redemption. */
+const curveFee = (price: number, rate: number) => rate * price * (1 - price);
+
 type ReplayFill = { costUsd: number; shares: number; feeUsd: number; slippageUsd: number; entryCostPerShare: number };
 
 /** Spend an all-in budget against a recorded ask ladder (fees included). */
@@ -141,11 +144,11 @@ const estimateAskFill = (budgetUsd: number, levels: RecordedAskLevel[], feeRate:
   let slippageUsd = 0;
   for (const level of levels) {
     if (!positive(level.price) || level.price >= 1 || !positive(level.size)) continue;
-    const allInPerShare = level.price * (1 + feeRate);
+    const allInPerShare = level.price + curveFee(level.price, feeRate);
     const levelShares = Math.min(level.size, remaining / allInPerShare);
     if (!positive(levelShares)) continue;
     const levelNotional = levelShares * level.price;
-    const levelFee = levelNotional * feeRate;
+    const levelFee = levelShares * curveFee(level.price, feeRate);
     const levelCost = levelNotional + levelFee;
     shares += levelShares;
     costUsd += levelCost;
@@ -208,7 +211,9 @@ export const runMultiBankrollBacktest = (
   const rows = inputRows.filter((row) => finite(row.timestamp) && row.timestamp > 0 && Boolean(row.asset) && (row.duration === "5m" || row.duration === "15m"))
     .slice().sort((left, right) => left.timestamp - right.timestamp || marketKeyFor(left).localeCompare(marketKeyFor(right)));
   const modelVersion = options.modelVersion ?? ACTIVE_MODEL_VERSION;
-  const feeRate = finite(options.feeRate) && options.feeRate >= 0 ? options.feeRate : 0.02;
+  // Default: Polymarket's crypto taker coefficient. A row's recorded fee_rate overrides it.
+  const feeRate = finite(options.feeRate) && options.feeRate >= 0 ? options.feeRate : 0.07;
+  const rowFeeRate = (row: BankrollBacktestRow | undefined) => row && finite(row.feeRate) && row.feeRate >= 0 ? row.feeRate : feeRate;
   const slippageBps = finite(options.slippageBps) && options.slippageBps >= 0 ? options.slippageBps : 25;
   // Paper execution enforces a $1 minimum even when a source row or option
   // records a smaller nominal amount.
@@ -227,16 +232,16 @@ export const runMultiBankrollBacktest = (
       fairUp: row.modelFairUp!, outcome: result.outcome, modelVersion: row.modelVersion ?? modelVersion }] : [];
   }), { modelVersion });
   const calibratedByMarket = new Map(calibration.points.map((point) => [point.marketId, point]));
-  const assumptions = [`Flat entry and estimated exit fee ${(feeRate * 100).toFixed(2)}% of notional.`, `Ask slippage ${slippageBps} bps when no recorded fill is supplied.`];
+  const assumptions = [`Taker fee curve rate x p x (1 - p) per share, from each row's recorded fee_rate or coefficient ${feeRate} (Polymarket crypto: 0.07); no fee on redemption.`, `Ask slippage ${slippageBps} bps when no recorded fill is supplied.`];
   assumptions.push(`Paper execution minimum is $${minimumOrderUsd.toFixed(2)}; recorded venue minimums and share sizes can raise it.`);
   if (positive(options.assumedDepthUsd)) assumptions.push(`Unrecorded ask depth assumed to be $${options.assumedDepthUsd.toFixed(2)} (research-only).`);
   if (finite(options.assumedSpreadPct) && options.assumedSpreadPct >= 0) assumptions.push(`Unrecorded spread assumed to be ${(options.assumedSpreadPct * 100).toFixed(2)}% (research-only).`);
   const limitations = [
-    "Replay liquidation marks use each recorded top bid and bid depth, apply the flat exit-fee approximation, and value unrecorded executable bid depth at zero.",
+    "Replay liquidation marks use each recorded top bid and bid depth, apply the taker fee curve, and value unrecorded executable bid depth at zero.",
     "The supplied rows may be sparse; available bid marks cannot reproduce a full order-book liquidation or continuous intramarket drawdown.",
     "A single historical path cannot estimate the probability of severe drawdown.",
     "Recorded ask ladders are consumed by stake at each bankroll size; sparse or truncated ladders can still understate execution cost and cannot reproduce queue priority.",
-    "Flat fee/slippage inputs are approximations; full order-book snapshots are needed for high-fidelity fills and early exits.",
+    "Rows without a recorded fee_rate use the default coefficient; slippage inputs are approximations, and full order-book snapshots are needed for high-fidelity fills and early exits.",
     "Recorded model decisions are required; a spot/reference baseline is not substituted for the live candle model.",
   ];
   if (rows.some((row) => !positive(row.upDepthUsd) && !positive(row.downDepthUsd))) limitations.push("Some rows lack ask depth; those entries PASS unless an explicit depth assumption is supplied.");
@@ -282,7 +287,8 @@ export const runMultiBankrollBacktest = (
       const bid = item.trade.side === "UP" ? mark.upBid : mark.downBid;
       const depthUsd = item.trade.side === "UP" ? mark.upBidDepthUsd : mark.downBidDepthUsd;
       if (!positive(bid) || bid >= 1 || !positive(depthUsd)) return 0;
-      return Math.min(item.trade.shares * bid, depthUsd) * (1 - feeRate);
+      const sellable = Math.min(item.trade.shares, depthUsd / bid);
+      return sellable * Math.max(0, bid - curveFee(bid, rowFeeRate(mark)));
     };
     const liquidationValue = () => [...open].reduce((sum, [id, item]) => sum + markedProceeds(id, item), 0);
     const openPositionRiskReserve = () => [...open].reduce((riskUsd, [id, item]) => {
@@ -291,7 +297,7 @@ export const runMultiBankrollBacktest = (
       const depthUsd = item.trade.side === "UP" ? mark?.upBidDepthUsd : mark?.downBidDepthUsd;
       const fullyExecutable = positive(bid) && bid < 1 && positive(depthUsd)
         && depthUsd + 1e-8 >= item.trade.shares * bid;
-      return riskUsd + (fullyExecutable ? item.trade.shares * bid * (1 - feeRate) : item.costUsd);
+      return riskUsd + (fullyExecutable ? item.trade.shares * Math.max(0, bid - curveFee(bid, rowFeeRate(mark))) : item.costUsd);
     }, 0);
     const bookEquity = () => cash + liquidationValue();
     const exposurePct = () => bookEquity() > 0 ? openCost() / bookEquity() : 0;
@@ -371,7 +377,8 @@ export const runMultiBankrollBacktest = (
       // a legacy modeled VWAP must not gate a smaller account before repricing.
       const slippedPrice = askLevels.length ? askLevels[0].price
         : positive(recordedEntry) && recordedEntry < 1 ? recordedEntry : ask * (1 + slippageBps / 10_000);
-      const entryCostPerShare = slippedPrice * (1 + feeRate);
+      const entryFeeRate = rowFeeRate(row);
+      const entryCostPerShare = slippedPrice + curveFee(slippedPrice, entryFeeRate);
       if (!positive(entryCostPerShare) || entryCostPerShare >= 1) { pass("COST_EXCEEDS_PAYOUT"); continue; }
       const rawProbability = side === "UP" ? row.modelFairUp : 1 - row.modelFairUp;
       const point = calibratedByMarket.get(marketId);
@@ -404,7 +411,7 @@ export const runMultiBankrollBacktest = (
         // lower the spend cap, so book impact can never increase a trade's stake.
         let spendCap = decision.stakeUsd;
         for (let attempt = 0; attempt < 5; attempt += 1) {
-          replayFill = estimateAskFill(spendCap, askLevels, feeRate);
+          replayFill = estimateAskFill(spendCap, askLevels, entryFeeRate);
           if (!replayFill || replayFill.costUsd + 0.01 < minimumExecutableOrderUsd) break;
           const repriced = sizeBankrollTrade({
             ...sizingInput,
@@ -437,7 +444,7 @@ export const runMultiBankrollBacktest = (
         replayFill = {
           costUsd: decision.stakeUsd,
           shares: decision.stakeUsd / entryCostPerShare,
-          feeUsd: (decision.stakeUsd / entryCostPerShare) * slippedPrice * feeRate,
+          feeUsd: (decision.stakeUsd / entryCostPerShare) * curveFee(slippedPrice, entryFeeRate),
           slippageUsd: (decision.stakeUsd / entryCostPerShare) * impact,
           entryCostPerShare,
         };
@@ -555,8 +562,8 @@ export const parseBankrollBacktestCsv = (text: string): { rows: BankrollBacktest
     const timeNumber = Number(timeText);
     const timestamp = timeText && Number.isFinite(timeNumber) ? timeNumber < 10_000_000_000 ? timeNumber * 1000 : timeNumber : Date.parse(timeText);
     const asset = cell(values, "asset", "symbol").toUpperCase();
-    const durationText = cell(values, "duration", "horizon").toLowerCase();
-    const duration = durationText.includes("15") ? "15m" : "5m";
+    const duration = parseHorizon(cell(values, "duration", "horizon"));
+    if (duration === null) { rejected += 1; continue; }
     // Decision-ledger exports have a mutable latest spot/reference plus frozen
     // validation columns. If the frozen fields are absent (legacy rows), keep
     // them missing rather than silently pairing later prices with old decisions.
@@ -597,6 +604,7 @@ export const parseBankrollBacktestCsv = (text: string): { rows: BankrollBacktest
       outcomeAt: finite(outcomeAt) ? outcomeAt : null,
       modelVersion: cell(values, "model_version") || null,
       probabilityUncertainty: num(values, "probability_uncertainty"),
+      feeRate: num(values, "fee_rate", "validation_fee_rate", "taker_fee_rate"),
     });
   }
   return { rows, rejected };

@@ -9,6 +9,7 @@ import {
   type TelegramSession,
 } from "../../lib/telegram-session";
 import { env } from "cloudflare:workers";
+import { readJsonBody, sameOriginFailure, SlidingWindowLimiter } from "../../lib/request-guards";
 
 const responseHeaders = {
   "Cache-Control": "no-store, max-age=0",
@@ -67,12 +68,20 @@ const publicSession = (session: TelegramSession) => ({
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message.replace(/\d{6,12}:[A-Za-z0-9_-]{20,}/g, "[redacted]").slice(0, 220) : "Telegram request failed.";
 
+const MAX_TELEGRAM_BODY_BYTES = 8_192;
+const sendLimiter = new SlidingWindowLimiter(6, 60_000);
+
 export async function POST(request: Request) {
+  // Sends act on an authenticated cookie, so require a same-origin JSON request:
+  // a text/plain form post from another site (a simple request) is refused.
+  const crossOrigin = sameOriginFailure(request);
+  if (crossOrigin) return json({ ok: false, error: crossOrigin.error }, crossOrigin.status);
   const gate = await ownerGate(request);
   if (gate.response || !gate.user) return gate.response ?? json({ ok: false, error: "Telegram authorization failed." }, 401);
   const secureCookie = !isLoopbackRequest(request);
-  let input: { action?: unknown; botToken?: unknown; chatId?: unknown; text?: unknown };
-  try { input = await request.json() as typeof input; } catch { return json({ ok: false, error: "Invalid JSON request." }, 400); }
+  const body = await readJsonBody<{ action?: unknown; botToken?: unknown; chatId?: unknown; text?: unknown }>(request, MAX_TELEGRAM_BODY_BYTES);
+  if ("failure" in body) return json({ ok: false, error: body.failure.error }, body.failure.status);
+  const input = body.value && typeof body.value === "object" ? body.value : {};
   const action = text(input.action);
   if (!["connect", "status", "send-test", "send-report", "disconnect"].includes(action)) return json({ ok: false, error: "Unsupported Telegram action." }, 400);
   if (action === "disconnect") return json({ ok: true, status: "DISCONNECTED" }, 200, { "Set-Cookie": clearTelegramSessionCookie(secureCookie) });
@@ -108,6 +117,7 @@ export async function POST(request: Request) {
   if (!session) return json({ ok: false, error: "Telegram link expired. Link the bot again." }, 401, { "Set-Cookie": clearTelegramSessionCookie(secureCookie) });
   if (action === "status") return json({ ok: true, status: "READY", telegram: publicSession(session) });
 
+  if (!sendLimiter.allow(gate.user.userId)) return json({ ok: false, error: "Too many Telegram messages; wait a minute and retry." }, 429);
   const reportText = text(input.text);
   if (!reportText) return json({ ok: false, error: "A report message is required." }, 400);
   if (reportText.length > 3900) return json({ ok: false, error: "The report is too long for one Telegram message." }, 400);

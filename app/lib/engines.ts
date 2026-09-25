@@ -3,7 +3,6 @@ import {
   bestAskFor,
   bestBidFor,
   CONSERVATIVE_CRYPTO_FEE_SCHEDULE,
-  estimateFairProbability,
   marketImpliedProbabilityUp,
   orderBookFor,
   sideFairProbability,
@@ -165,7 +164,12 @@ export type BacktestRow = {
   modelEdge?: number | null;
   modelEntryPrice?: number | null;
   modelStakeUsd?: number | null;
+  /** The market's taker fee coefficient recorded at observation time (rate in rate*p*(1-p)). */
+  feeRate?: number | null;
 };
+
+/** Polymarket's crypto taker fee coefficient: fee per share = rate * p * (1 - p). */
+export const POLYMARKET_CRYPTO_TAKER_FEE_RATE = 0.07;
 
 export type BacktestTrade = {
   timestamp: number;
@@ -182,6 +186,14 @@ export type BacktestTrade = {
 
 export type BacktestResult = {
   signals: number;
+  /** Rows skipped because no explicit decision and valid model probability were recorded for them. */
+  skippedWithoutModel: number;
+  /** Decision rows that could not be replayed consistently (no expiry, bad prices, conflicting outcomes). */
+  rejectedRows: number;
+  /** Drawdown is measured on cash plus the cost of open positions, i.e. at settlement, not intramarket liquidation. */
+  drawdownBasis: "SETTLEMENT";
+  /** Net P&L with every fee scaled, to show how much of the result depends on the fee assumption. */
+  feeSensitivity: Array<{ feeMultiplier: number; netPnl: number | null }>;
   settled: number;
   unsettled: number;
   wins: number;
@@ -198,9 +210,14 @@ export type BacktestResult = {
 
 const round = (value: number, digits = 8) => Number(value.toFixed(digits));
 const roundFee = (value: number) => Number((Math.round(Math.max(0, value) * 100_000) / 100_000).toFixed(5));
-const MAX_ORDER_BOOK_AGE_MS = 60_000;
+/**
+ * A book older than this cannot price a decision on a 5-minute market. Books
+ * are stamped in Polymarket server time; a healthy stream re-confirms quiet
+ * books, so this only trips when data has genuinely stopped arriving.
+ */
+export const MAX_ORDER_BOOK_AGE_MS = 10_000;
 
-const feeScheduleFor = (market: LiveMarket) => {
+const feeScheduleFor = (market: Pick<LiveMarket, "feeSchedule">) => {
   const schedule = market.feeSchedule;
   if (schedule && Number.isFinite(schedule.rate) && schedule.rate >= 0 && schedule.rate <= 1
     && Number.isFinite(schedule.exponent) && schedule.exponent >= 0 && schedule.exponent <= 8) return schedule;
@@ -209,13 +226,17 @@ const feeScheduleFor = (market: LiveMarket) => {
 
 /**
  * Polymarket's taker fee curve is shares * rate * (price * (1-price)) ** exponent.
- * Keep the configured legacy notional fee as a conservative floor for manual paper settings.
+ * When the market's own schedule was read from the CLOB it is exact and is
+ * used as is. The configured notional rate is only a conservative stand-in
+ * when that schedule could not be read; applying it on top of a known
+ * schedule overstated fees several times over near the price extremes.
  */
-const feePerShareAt = (market: LiveMarket, price: number, costs: CostConfig): number => {
+export const feePerShareAt = (market: Pick<LiveMarket, "feeSchedule">, price: number, costs: CostConfig): number => {
   const schedule = feeScheduleFor(market);
   const boundedPrice = Math.min(1, Math.max(0, price));
   const curve = Math.pow(boundedPrice * (1 - boundedPrice), schedule.exponent);
   const marketFee = schedule.feesEnabled ? schedule.rate * curve : 0;
+  if (schedule.source === "CLOB") return marketFee;
   const configuredRate = Number.isFinite(costs.feeRate) ? Math.max(0, costs.feeRate) : 0;
   return Math.max(marketFee, boundedPrice * configuredRate);
 };
@@ -324,7 +345,13 @@ export const markAccount = (account: PaperAccount, markets: Map<string, LiveMark
   return shouldAppend ? { ...withRiskBaselines, equityHistory: [...withRiskBaselines.equityHistory, { timestamp, equity }].slice(-5000) } : withRiskBaselines;
 };
 
-const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: CostConfig): FillResult | null => {
+/**
+ * Walk the ask ladder with a cash budget. With `fak`, the venue minimum is
+ * checked against the order as submitted (budget at the limit price) and any
+ * positive matched quantity is returned, as a real FAK order can partially
+ * fill below the minimum; otherwise the fill itself must meet the minimum.
+ */
+const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: CostConfig, maxPrice = 1, fak = false): FillResult | null => {
   const book = orderBookFor(market, side);
   if (!isBookFreshForExecution(book) || !book.asks.length || budget <= 0) return null;
   const slippageBps = Number.isFinite(costs.slippageBps) ? Math.max(0, costs.slippageBps) : 0;
@@ -335,6 +362,8 @@ const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: Co
   let fee = 0;
   let levels = 0;
   for (const level of [...book.asks].sort((left, right) => left.price - right.price)) {
+    // A limit order never takes liquidity above its limit price.
+    if (level.price > maxPrice + 1e-9) break;
     const effectivePrice = level.price * slippageMultiplier;
     if (!Number.isFinite(effectivePrice) || effectivePrice <= 0 || effectivePrice >= 1) continue;
     const feePerShare = feePerShareAt(market, effectivePrice, costs);
@@ -352,12 +381,21 @@ const walkAsks = (market: LiveMarket, side: PaperSide, budget: number, costs: Co
     if (remainingBudget <= 0.00000001) break;
   }
   const minOrderSize = book.minOrderSize ?? 0;
-  if (shares <= 0 || shares + 0.00000001 < minOrderSize) return null;
+  if (shares <= 0) return null;
+  if (fak) {
+    const limit = Math.min(maxPrice, 1 - 1e-9) * slippageMultiplier;
+    const submittedShares = budget / (limit + feePerShareAt(market, limit, costs));
+    if (submittedShares + 0.00000001 < minOrderSize) return null;
+  } else if (shares + 0.00000001 < minOrderSize) return null;
   return { shares: round(shares), price: round(notional / shares), notional: round(notional), fee: round(fee, 5), totalCost: round(notional + fee, 5), levels };
 };
 
-const isBookFreshForExecution = (book: OrderBook | null, now = Date.now()): book is OrderBook =>
-  Boolean(book && book.timestamp !== null && book.timestamp <= now + 30_000 && now - book.timestamp <= MAX_ORDER_BOOK_AGE_MS);
+/** Book timestamps are server time, so compare them with the synchronized clock, not the local one. */
+export const isBookFreshForExecution = (book: OrderBook | null, now = Date.now()): book is OrderBook => {
+  if (!book || book.timestamp === null) return false;
+  const serverNow = synchronizedPolymarketTime(now);
+  return book.timestamp <= serverNow + 2_000 && serverNow - book.timestamp <= MAX_ORDER_BOOK_AGE_MS;
+};
 
 /**
  * Quote one side at the requested cash size. `netEdge` compares blended fair
@@ -481,9 +519,11 @@ export const buyPaper = (
   costs: CostConfig,
   reason: string,
   timestamp = Date.now(),
+  maxPrice = 1,
+  fak = false,
 ): TradeResult => {
   const boundedBudget = Math.min(Math.max(0, budget), account.cash);
-  const fill = walkAsks(market, side, boundedBudget, costs);
+  const fill = walkAsks(market, side, boundedBudget, costs, maxPrice, fak);
   if (!fill) return { account, fill: null, error: "No executable ask depth or the order is below the market minimum." };
   const marketLabel = `${market.asset} ${market.duration}`;
   const existing = account.positions.find((position) => position.marketId === market.id && position.side === side);
@@ -650,7 +690,13 @@ export const settleResolvedPaperPositions = (
   for (const position of account.positions) {
     const market = markets.get(position.marketId);
     const isExpired = market ? market.endTime <= timestamp : position.endTime <= timestamp;
-    const outcome = market && market.reference !== null && market.spot !== null && isExpired ? market.spot >= market.reference ? "UP" : "DOWN" : null;
+    // Settle on the feed named by the market rules (the TWAP for TWAP markets),
+    // and only from an observation taken at or after expiry.
+    const settlement = market?.settlementPrice ?? null;
+    const settledAtExpiry = market && market.settlementUpdatedAt !== null && market.settlementUpdatedAt !== undefined
+      && market.settlementUpdatedAt >= market.endTime - 1_000;
+    const outcome = market && market.reference !== null && settlement !== null && isExpired && settledAtExpiry
+      ? settlement >= market.reference ? "UP" : "DOWN" : null;
     if (!isExpired || !outcome) {
       remaining.push(position);
       if (isExpired) skipped += 1;
@@ -865,7 +911,7 @@ export const marketStreamingDataFreshnessIssue = (market: LiveMarket, now = Date
   if (marketNow - market.spotUpdatedAt > 10_000) return "Polymarket oracle data is stale; waiting for a fresh tick.";
   if (market.chartUpdatedAt === null || marketNow - market.chartUpdatedAt > 120_000) return "Chart feed is stale; waiting for a fresh candle snapshot.";
   for (const orderBook of [market.upBook, market.downBook]) {
-    if (!orderBook || orderBook.timestamp === null || marketNow - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - marketNow > 30_000) {
+    if (!orderBook || orderBook.timestamp === null || marketNow - orderBook.timestamp > MAX_ORDER_BOOK_AGE_MS || orderBook.timestamp - marketNow > 2_000) {
       return "An order-book snapshot is stale or has no usable timestamp.";
     }
   }
@@ -1152,139 +1198,169 @@ export const bestCandidateFor = (market: LiveMarket, costs: CostConfig, budget =
   return { side: signal.action, fair, ask: signal.entryPrice, edge: signal.edge, estimatedFill: signal.estimatedFill };
 };
 
-export const runBacktest = (
-  inputRows: BacktestRow[],
-  params: { startingCash: number; minEdge: number; maxTrade: number; feeRate: number; slippageBps: number },
-): BacktestResult => {
+type BacktestParams = { startingCash: number; minEdge: number; maxTrade: number; feeRate?: number; slippageBps: number };
+
+/**
+ * Replay recorded decisions as an event-ordered simulation.
+ *
+ * - A row trades only with an explicit captured UP/DOWN decision and a valid
+ *   recorded probability; nothing is inferred for rows without one.
+ * - The edge is recomputed from the simulated fill (side ask plus slippage
+ *   plus the fee curve) under the current settings; recorded edges are ignored.
+ * - A position settles at its market's expiry (decision time plus remaining
+ *   seconds), never on the decision row, so cash committed to an unresolved
+ *   market cannot be reused before it resolves.
+ * - Fees follow each row's recorded fee coefficient, else `feeRate`
+ *   (default: Polymarket's crypto coefficient). Redemption carries no fee.
+ */
+const replayBacktest = (inputRows: BacktestRow[], params: BacktestParams, feeMultiplier: number) => {
   const rows = [...inputRows].sort((left, right) => left.timestamp - right.timestamp);
   const startingCash = Math.max(1, Number.isFinite(params.startingCash) ? params.startingCash : 1000);
   const minEdge = Math.max(0, Number.isFinite(params.minEdge) ? params.minEdge : 0);
   const maxTrade = Math.max(0, Number.isFinite(params.maxTrade) ? params.maxTrade : 0);
-  const feeRate = Math.max(0, Number.isFinite(params.feeRate) ? params.feeRate : 0);
+  const defaultFeeRate = Math.max(0, Number.isFinite(params.feeRate) ? params.feeRate! : POLYMARKET_CRYPTO_TAKER_FEE_RATE);
   const slippageMultiplier = 1 + Math.max(0, Number.isFinite(params.slippageBps) ? params.slippageBps : 0) / 10_000;
-  const feeMultiplier = 1 + feeRate;
+  const feePerShare = (price: number, rate: number) => rate * feeMultiplier * price * (1 - price);
+  const marketKeyFor = (row: BacktestRow) => row.marketId?.trim() || `${row.asset}:${row.duration}:${Math.floor(row.timestamp / (row.duration === "5m" ? 300_000 : 900_000))}`;
+
+  // Final labels are only read at each market's expiry; conflicting labels void the market.
+  const outcomes = new Map<string, PaperSide | "CONFLICT">();
+  for (const row of rows) {
+    if (row.outcome !== "UP" && row.outcome !== "DOWN") continue;
+    const key = marketKeyFor(row);
+    const previous = outcomes.get(key);
+    outcomes.set(key, previous && previous !== row.outcome ? "CONFLICT" : row.outcome);
+  }
+
+  type OpenTrade = { tradeIndex: number; shares: number; entryCost: number; fair: number; side: PaperSide; expiresAt: number; marketKey: string };
   let cash = startingCash;
   let committed = 0;
   let realized = 0;
   let peak = startingCash;
   let maxDrawdown = 0;
   let signals = 0;
+  let skippedWithoutModel = 0;
+  let rejectedRows = 0;
   let settled = 0;
   let wins = 0;
   let losses = 0;
   let edgeSum = 0;
   let brierSum = 0;
-  let brierSettled = 0;
   const trades: BacktestTrade[] = [];
   const equityCurve = [startingCash];
-
-  type OpenBacktestTrade = {
-    tradeIndex: number;
-    shares: number;
-    entryCost: number;
-    fair: number;
-    hasRecordedProbability: boolean;
-    side: PaperSide;
-  };
-
-  const openTrades = new Map<string, OpenBacktestTrade>();
-  const completedMarkets = new Set<string>();
-  const marketKeyFor = (row: BacktestRow) => row.marketId?.trim() || `${row.asset}:${row.duration}:${Math.floor(row.timestamp / (row.duration === "5m" ? 300_000 : 900_000))}`;
+  const open: OpenTrade[] = [];
+  const traded = new Set<string>();
   const updateEquity = () => {
     const equity = round(cash + committed);
     peak = Math.max(peak, equity);
     maxDrawdown = Math.max(maxDrawdown, peak > 0 ? (peak - equity) / peak : 0);
     equityCurve.push(equity);
   };
-  const settle = (marketKey: string, outcome: PaperSide) => {
-    const open = openTrades.get(marketKey);
-    if (!open) return;
-    const won = outcome === open.side;
-    const payout = won ? open.shares : 0;
-    const exitFee = payout * feeRate;
-    const pnl = round(payout - open.entryCost - exitFee);
-    cash = round(cash + payout - exitFee);
-    committed = Math.max(0, round(committed - open.entryCost));
-    realized = round(realized + pnl);
-    settled += 1;
-    if (won) wins += 1;
-    else losses += 1;
-    if (open.hasRecordedProbability) {
-      brierSum += (open.fair - (won ? 1 : 0)) ** 2;
-      brierSettled += 1;
+  const settleDue = (time: number) => {
+    open.sort((left, right) => left.expiresAt - right.expiresAt);
+    while (open.length && open[0].expiresAt <= time) {
+      const trade = open[0];
+      const outcome = outcomes.get(trade.marketKey);
+      if (outcome !== "UP" && outcome !== "DOWN") break;
+      open.shift();
+      const won = outcome === trade.side;
+      const payout = won ? trade.shares : 0;
+      const pnl = round(payout - trade.entryCost);
+      cash = round(cash + payout);
+      committed = Math.max(0, round(committed - trade.entryCost));
+      realized = round(realized + pnl);
+      settled += 1;
+      if (won) wins += 1; else losses += 1;
+      brierSum += (trade.fair - (won ? 1 : 0)) ** 2;
+      trades[trade.tradeIndex] = { ...trades[trade.tradeIndex], status: won ? "SETTLED WIN" : "SETTLED LOSS", pnl };
+      updateEquity();
     }
-    const trade = trades[open.tradeIndex];
-    if (trade) trades[open.tradeIndex] = { ...trade, status: won ? "SETTLED WIN" : "SETTLED LOSS", pnl };
-    openTrades.delete(marketKey);
-    completedMarkets.add(marketKey);
-    updateEquity();
   };
 
   for (const row of rows) {
+    settleDue(row.timestamp);
     const marketKey = marketKeyFor(row);
-    if (openTrades.has(marketKey)) {
-      if (row.outcome !== null) settle(marketKey, row.outcome);
+    if (traded.has(marketKey)) continue;
+    if (row.modelAction !== "UP" && row.modelAction !== "DOWN") {
+      if (row.modelAction !== "PASS") skippedWithoutModel += 1;
       continue;
     }
-    if (completedMarkets.has(marketKey)) continue;
-    if (!Number.isFinite(row.reference) || !Number.isFinite(row.spot) || row.reference <= 0 || row.spot <= 0) continue;
-    const remainingValue = row.remainingSeconds ?? (row.duration === "5m" ? 300 : 900);
-    const remaining = Number.isFinite(remainingValue) ? Math.max(0, remainingValue) : row.duration === "5m" ? 300 : 900;
-    if (remaining < 30) continue;
-    const fairUp = row.modelFairUp !== null && row.modelFairUp !== undefined && Number.isFinite(row.modelFairUp)
-      ? Math.min(0.99, Math.max(0.01, row.modelFairUp))
-      : estimateFairProbability(row.reference, row.spot, remaining);
-    if (fairUp === null) continue;
-    const upCost = row.upAsk * slippageMultiplier * feeMultiplier;
-    const downCost = row.downAsk * slippageMultiplier * feeMultiplier;
-    const upEdge = fairUp - upCost;
-    const downEdge = 1 - fairUp - downCost;
-    if (row.modelAction === "PASS") continue;
-    const side: PaperSide = row.modelAction === "UP" || row.modelAction === "DOWN"
-      ? row.modelAction
-      : upEdge >= downEdge ? "UP" : "DOWN";
-    const fair = side === "UP" ? fairUp : 1 - fairUp;
-    const recordedEntry = row.modelEntryPrice;
-    const entry = recordedEntry !== null && recordedEntry !== undefined && Number.isFinite(recordedEntry) && recordedEntry > 0
-      ? recordedEntry
-      : (side === "UP" ? row.upAsk : row.downAsk) * slippageMultiplier;
-    const edge = row.modelEdge !== null && row.modelEdge !== undefined && Number.isFinite(row.modelEdge)
-      ? row.modelEdge
-      : side === "UP" ? upEdge : downEdge;
-    if (!Number.isFinite(entry) || entry <= 0 || entry >= 1 || !Number.isFinite(edge) || edge < minEdge) continue;
+    if (row.modelFairUp === null || row.modelFairUp === undefined || !Number.isFinite(row.modelFairUp) || row.modelFairUp <= 0 || row.modelFairUp >= 1) {
+      skippedWithoutModel += 1;
+      continue;
+    }
+    const remaining = row.remainingSeconds;
+    if (remaining === undefined || !Number.isFinite(remaining) || remaining < 30 || remaining > (row.duration === "5m" ? 300 : 900)
+      || outcomes.get(marketKey) === "CONFLICT") {
+      rejectedRows += 1;
+      continue;
+    }
+    const side = row.modelAction;
+    const ask = side === "UP" ? row.upAsk : row.downAsk;
+    if (!Number.isFinite(ask) || ask <= 0 || ask >= 1) { rejectedRows += 1; continue; }
+    const fair = side === "UP" ? row.modelFairUp : 1 - row.modelFairUp;
+    const rate = row.feeRate !== null && row.feeRate !== undefined && Number.isFinite(row.feeRate) && row.feeRate >= 0 ? row.feeRate : defaultFeeRate;
+    const price = ask * slippageMultiplier;
+    if (price >= 1) { rejectedRows += 1; continue; }
+    const costPerShare = price + feePerShare(price, rate);
+    const edge = fair - costPerShare;
+    if (edge < minEdge) continue;
     const requestedBudget = row.modelStakeUsd !== null && row.modelStakeUsd !== undefined && Number.isFinite(row.modelStakeUsd) && row.modelStakeUsd > 0
-      ? row.modelStakeUsd
-      : maxTrade;
+      ? row.modelStakeUsd : maxTrade;
     const entryBudget = Math.min(requestedBudget, maxTrade, cash);
-    const shares = entryBudget / (entry * feeMultiplier);
-    if (!Number.isFinite(shares) || shares <= 0 || entryBudget <= 0) continue;
-    const notional = shares * entry;
-    const entryFee = notional * feeRate;
-    const entryCost = round(notional + entryFee);
+    if (!(entryBudget > 0)) continue;
+    const shares = entryBudget / costPerShare;
+    const entryCost = round(entryBudget);
     signals += 1;
     edgeSum += edge;
     cash = round(cash - entryCost);
     committed = round(committed + entryCost);
-    const tradeIndex = trades.push({ timestamp: row.timestamp, asset: row.asset, duration: row.duration, side, fair, entry, edge, notional: round(notional), status: "UNSETTLED", pnl: null }) - 1;
-    openTrades.set(marketKey, { tradeIndex, shares, entryCost, fair, hasRecordedProbability: row.modelFairUp !== null && row.modelFairUp !== undefined, side });
-    if (row.outcome !== null) settle(marketKey, row.outcome);
+    traded.add(marketKey);
+    const tradeIndex = trades.push({ timestamp: row.timestamp, asset: row.asset, duration: row.duration, side, fair, entry: price, edge,
+      notional: round(shares * price), status: "UNSETTLED", pnl: null }) - 1;
+    open.push({ tradeIndex, shares, entryCost, fair, side, expiresAt: row.timestamp + remaining * 1000, marketKey });
+    updateEquity();
   }
-  const unsettled = openTrades.size;
+  // The replay has ended: every remaining market has expired by now, so settle
+  // those with a known outcome; the rest stay unsettled.
+  settleDue(Number.POSITIVE_INFINITY);
+  return { signals, skippedWithoutModel, rejectedRows, settled, unsettled: open.length, wins, losses, realized, startingCash,
+    maxDrawdown, edgeSum, brierSum, trades, equityCurve };
+};
+
+export const runBacktest = (inputRows: BacktestRow[], params: BacktestParams): BacktestResult => {
+  const base = replayBacktest(inputRows, params, 1);
+  const feeSensitivity = [0.5, 1.5].map((feeMultiplier) => {
+    const scenario = replayBacktest(inputRows, params, feeMultiplier);
+    return { feeMultiplier, netPnl: scenario.settled ? scenario.realized : null };
+  });
   return {
-    signals,
-    settled,
-    unsettled,
-    wins,
-    losses,
-    netPnl: settled ? realized : null,
-    roi: settled ? realized / startingCash : null,
-    maxDrawdown: settled ? maxDrawdown : null,
-    winRate: settled ? wins / settled : null,
-    averageEdge: signals ? edgeSum / signals : null,
-    brierScore: brierSettled ? brierSum / brierSettled : null,
-    trades: trades.slice(-250),
-    equityCurve,
+    signals: base.signals,
+    skippedWithoutModel: base.skippedWithoutModel,
+    rejectedRows: base.rejectedRows,
+    drawdownBasis: "SETTLEMENT",
+    feeSensitivity,
+    settled: base.settled,
+    unsettled: base.unsettled,
+    wins: base.wins,
+    losses: base.losses,
+    netPnl: base.settled ? base.realized : null,
+    roi: base.settled ? base.realized / base.startingCash : null,
+    maxDrawdown: base.settled ? base.maxDrawdown : null,
+    winRate: base.settled ? base.wins / base.settled : null,
+    averageEdge: base.signals ? base.edgeSum / base.signals : null,
+    brierScore: base.settled ? base.brierSum / base.settled : null,
+    trades: base.trades.slice(-250),
+    equityCurve: base.equityCurve,
   };
+};
+
+/** Only explicit 5m / 15m horizons are supported; anything else is rejected, not guessed. */
+export const parseHorizon = (value: string): Horizon | null => {
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, "");
+  if (["5m", "5min", "5minute", "5minutes", "300", "300s"].includes(normalized)) return "5m";
+  if (["15m", "15min", "15minute", "15minutes", "900", "900s"].includes(normalized)) return "15m";
+  return null;
 };
 
 export const parseBacktestCsv = (text: string): { rows: BacktestRow[]; rejected: number } => {
@@ -1308,10 +1384,12 @@ export const parseBacktestCsv = (text: string): { rows: BacktestRow[]; rejected:
   const headers = split(lines[0]).map((header) => header.toLowerCase().replace(/[^a-z0-9]+/g, "_"));
   const valueFor = (values: string[], names: string[]) => {
     const index = headers.findIndex((header) => names.includes(header));
-    return index >= 0 ? values[index] : "";
+    return index >= 0 ? values[index] ?? "" : "";
   };
+  // A blank cell is missing data, never zero.
   const numberFor = (values: string[], names: string[]) => {
-    const raw = valueFor(values, names).replace(/[$,%]/g, "").replace(/,/g, "");
+    const raw = valueFor(values, names).replace(/[$%]/g, "").replace(/,/g, "").trim();
+    if (!raw) return null;
     const parsed = Number(raw);
     return Number.isFinite(parsed) ? parsed : null;
   };
@@ -1325,18 +1403,17 @@ export const parseBacktestCsv = (text: string): { rows: BacktestRow[]; rejected:
   let rejected = 0;
   for (const line of lines.slice(1)) {
     const values = split(line);
-    const timestampRaw = valueFor(values, ["validation_at_utc", "timestamp", "time", "datetime", "date", "observed_at_utc"]);
-    const timestampNumber = Number(timestampRaw);
+    const timestampRaw = valueFor(values, ["validation_at_utc", "timestamp", "time", "datetime", "date", "observed_at_utc"]).trim();
+    const timestampNumber = timestampRaw ? Number(timestampRaw) : Number.NaN;
     const timestamp = Number.isFinite(timestampNumber) ? (timestampNumber < 10_000_000_000 ? timestampNumber * 1000 : timestampNumber) : Date.parse(timestampRaw);
     const asset = valueFor(values, ["asset", "symbol"]).toUpperCase();
-    const durationRaw = valueFor(values, ["duration", "horizon"]).toLowerCase();
-    const duration: Horizon = durationRaw.includes("15") ? "15m" : "5m";
+    const duration = parseHorizon(valueFor(values, ["duration", "horizon"]));
     const reference = numberFor(values, ["reference", "reference_price", "strike", "threshold"]);
     const spot = numberFor(values, ["spot", "spot_price", "underlying"]);
     const upAsk = numberFor(values, ["up_ask", "yes_ask", "higher_ask"]);
     const downAsk = numberFor(values, ["down_ask", "no_ask", "lower_ask"]);
-    if (!Number.isFinite(timestamp) || !asset || reference === null || spot === null || upAsk === null || downAsk === null) { rejected += 1; continue; }
-    const rawAction = valueFor(values, ["validation_decision", "model_action", "initial_decision"]).toUpperCase();
+    if (!Number.isFinite(timestamp) || !asset || duration === null || reference === null || spot === null || upAsk === null || downAsk === null) { rejected += 1; continue; }
+    const rawAction = valueFor(values, ["validation_decision", "model_action", "initial_decision"]).toUpperCase().trim();
     const modelAction: PaperSide | "PASS" | null = rawAction === "UP" || rawAction === "DOWN" || rawAction === "PASS" ? rawAction : null;
     rows.push({
       timestamp,
@@ -1354,9 +1431,10 @@ export const parseBacktestCsv = (text: string): { rows: BacktestRow[]; rejected:
       modelEdge: numberFor(values, ["validation_edge", "model_edge", "selected_edge"]),
       modelEntryPrice: numberFor(values, ["validation_entry_price", "model_entry_price", "entry_price"]),
       modelStakeUsd: numberFor(values, ["validation_stake_usd", "model_stake_usd", "simulated_stake_usd"]),
+      feeRate: numberFor(values, ["fee_rate", "validation_fee_rate", "taker_fee_rate"]),
     });
   }
   return { rows, rejected };
 };
 
-export const backtestCsvTemplate = "timestamp,asset,duration,market_id,reference,spot,up_ask,down_ask,outcome,remaining_seconds,validation_probability_up,validation_decision,validation_edge,validation_entry_price,validation_stake_usd\n";
+export const backtestCsvTemplate = "timestamp,asset,duration,market_id,reference,spot,up_ask,down_ask,outcome,remaining_seconds,validation_probability_up,validation_decision,validation_edge,validation_entry_price,validation_stake_usd,fee_rate\n";

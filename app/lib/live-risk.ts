@@ -56,7 +56,7 @@ export const DEFAULT_LIVE_RISK: LiveRiskConfig = {
   feeRate: 0.02,
   slippageBps: 15,
   allowedDurations: ["5m", "15m"],
-  requireLock: true,
+  requireLock: false,
 };
 
 const finite = (value: unknown, fallback: number) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -137,14 +137,17 @@ export const enforceLiveExecutionRisk = (input: Partial<LiveRiskConfig> | null |
     minEdge: Math.max(risk.minEdge, 0.04),
     feeRate: Math.max(risk.feeRate, 0.05),
     slippageBps: Math.min(risk.slippageBps, 25),
-    requireLock: true,
+    // The terminal trader and the web route apply the same edge floor; LOCK is
+    // an optional extra filter the operator can require, not a hidden override.
+    requireLock: risk.requireLock,
     earlyExitMinProfitUsd: Math.max(risk.earlyExitMinProfitUsd, DEFAULT_LIVE_RISK.earlyExitMinProfitUsd),
     earlyExitMinProfitPct: Math.max(risk.earlyExitMinProfitPct, DEFAULT_LIVE_RISK.earlyExitMinProfitPct),
     earlyExitModelGap: Math.max(risk.earlyExitModelGap, DEFAULT_LIVE_RISK.earlyExitModelGap),
     earlyExitMinRemainingSeconds: Math.max(risk.earlyExitMinRemainingSeconds, DEFAULT_LIVE_RISK.earlyExitMinRemainingSeconds),
     earlyExitConfirmations: Math.max(risk.earlyExitConfirmations, DEFAULT_LIVE_RISK.earlyExitConfirmations),
     earlyExitTakeProfitPct: risk.earlyExitTakeProfitPct,
-    earlyExitStopLossPct: Math.min(Math.max(risk.earlyExitStopLossPct, 0.05), DEFAULT_LIVE_RISK.earlyExitStopLossPct),
+    // Zero keeps the fixed stop-loss off; a configured stop-loss is kept between 5% and 50%.
+    earlyExitStopLossPct: risk.earlyExitStopLossPct <= 0 ? 0 : Math.min(Math.max(risk.earlyExitStopLossPct, 0.05), 0.5),
     earlyExitStopLossMinRemainingSeconds: Math.max(5,
       Math.min(risk.earlyExitStopLossMinRemainingSeconds, 30)),
   };

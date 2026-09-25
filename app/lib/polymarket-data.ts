@@ -14,7 +14,15 @@ export type OrderBook = {
   tokenId: string;
   bids: BookLevel[];
   asks: BookLevel[];
+  /**
+   * Server time at which this book was last known to be current. A healthy
+   * stream re-confirms it; null means the book is invalid until a snapshot.
+   */
   timestamp: number | null;
+  /** Server time of the last change to the book's contents; orders stream updates. */
+  updatedAt?: number | null;
+  /** Venue price increment for this token, when the source reported it. */
+  tickSize?: number | null;
   minOrderSize: number | null;
   hash: string | null;
 };
@@ -82,9 +90,13 @@ export type MarketDefinition = {
 export type LiveMarket = MarketDefinition & {
   remaining: number;
   countdownEndsAt: number;
+  /** Latest Chainlink spot observation. TWAP markets forecast their settlement from this, not from the lagging TWAP. */
   spot: number | null;
   spotSource: "POLYMARKET" | "MISSING";
   spotUpdatedAt: number | null;
+  /** Latest value of the feed the market settles on (the 60-second TWAP for TWAP markets). */
+  settlementPrice?: number | null;
+  settlementUpdatedAt?: number | null;
   referenceUpdatedAt: number | null;
   referenceVerified: boolean;
   upBook: OrderBook | null;
@@ -554,21 +566,43 @@ const polymarketNow = () => Date.now() + polymarketClockOffsetMs;
 /** Convert a local clock reading to Polymarket's synchronized event time. */
 export const synchronizedPolymarketTime = (localTime = Date.now()): number => localTime + polymarketClockOffsetMs;
 
+/**
+ * Local-to-server clock offset from one /time round trip. The endpoint returns
+ * whole seconds, so the server instant is taken as the middle of that second,
+ * and the local instant as the middle of the request.
+ */
+export const clockOffsetFromTimeResponse = (serverTimeMs: number, requestStartedAt: number, responseReceivedAt: number): number => {
+  const truncatedToSecond = serverTimeMs % 1000 === 0;
+  const serverInstant = truncatedToSecond ? serverTimeMs + 500 : serverTimeMs;
+  return Math.round(serverInstant - (requestStartedAt + responseReceivedAt) / 2);
+};
+
+/** Test and tooling hook: pin the offset without a network round trip. */
+export const setPolymarketClockOffsetForTesting = (offsetMs: number) => {
+  polymarketClockOffsetMs = offsetMs;
+  polymarketClockSyncedAt = Date.now();
+};
+
 const fetchPolymarketNow = async (signal?: AbortSignal): Promise<number> => {
   if (Date.now() - polymarketClockSyncedAt < POLYMARKET_TIME_CACHE_MS) return polymarketNow();
   try {
+    const requestStartedAt = Date.now();
     const payload = await fetchJson<unknown>(`${CLOB_API}/time`, { signal });
+    const responseReceivedAt = Date.now();
     const serverTime = epochMs(payload);
     if (serverTime !== null) {
-      polymarketClockOffsetMs = serverTime - Date.now();
-      polymarketClockSyncedAt = Date.now();
-      return serverTime;
+      polymarketClockOffsetMs = clockOffsetFromTimeResponse(serverTime, requestStartedAt, responseReceivedAt);
+      polymarketClockSyncedAt = responseReceivedAt;
+      return polymarketNow();
     }
   } catch (error) {
     if (signal?.aborted) throw error;
   }
   return polymarketNow();
 };
+
+/** Refresh the server clock offset; long-running processes call this periodically. */
+export const syncPolymarketClock = (signal?: AbortSignal): Promise<number> => fetchPolymarketNow(signal);
 
 const nextCursorFor = (payload: unknown): string | null => {
   if (!payload || typeof payload !== "object") return null;
@@ -707,9 +741,13 @@ const parseBook = (raw: Record<string, unknown>, tokenId: string): OrderBook => 
   };
   return {
     tokenId,
-    bids: levels(raw.bids).sort((left, right) => left.price - right.price),
+    // Every book in the engine keeps bids best-first (descending) and asks
+    // best-first (ascending), whether it came from REST or the stream.
+    bids: levels(raw.bids).sort((left, right) => right.price - left.price),
     asks: levels(raw.asks).sort((left, right) => left.price - right.price),
     timestamp: epochMs(raw.timestamp),
+    updatedAt: epochMs(raw.timestamp),
+    tickSize: finiteNumber(raw.tick_size ?? raw.tickSize),
     minOrderSize: finiteNumber(raw.min_order_size || raw.minOrderSize),
     hash: normalizeText(raw.hash) || null,
   };
@@ -848,7 +886,7 @@ export async function fetchCandleHistories(assets: Asset[], signal?: AbortSignal
 const bestBid = (book: OrderBook | null): number | null => book?.bids.length ? Math.max(...book.bids.map((level) => level.price)) : null;
 const bestAsk = (book: OrderBook | null): number | null => book?.asks.length ? Math.min(...book.asks.map((level) => level.price)) : null;
 const depthNotional = (book: OrderBook | null): number => book?.asks.slice(0, 8).reduce((sum, level) => sum + level.price * level.size, 0) ?? 0;
-const topSize = (book: OrderBook | null): number => (book?.asks[0]?.size ?? 0) + (book?.bids[book.bids.length - 1]?.size ?? 0);
+const topSize = (book: OrderBook | null): number => (book?.asks[0]?.size ?? 0) + (book?.bids[0]?.size ?? 0);
 
 const withUpdatedBooks = (market: LiveMarket, upBook: OrderBook | null, downBook: OrderBook | null, now: number): LiveMarket => {
   const upBid = bestBid(upBook); const upAsk = bestAsk(upBook);
@@ -862,17 +900,19 @@ const withUpdatedBooks = (market: LiveMarket, upBook: OrderBook | null, downBook
 export const replaceLiveMarketBook = (market: LiveMarket, tokenId: string, bids: BookLevel[], asks: BookLevel[], timestamp: number | null, hash: string | null, now = Date.now()): LiveMarket => {
   const existing = tokenId === market.upTokenId ? market.upBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : tokenId === market.downTokenId ? market.downBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : null;
   if (!existing) return market;
-  const book: OrderBook = { ...existing, bids: bids.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => right.price - left.price), asks: asks.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => left.price - right.price), timestamp, hash };
+  const book: OrderBook = { ...existing, bids: bids.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => right.price - left.price), asks: asks.filter((level) => level.price > 0 && level.size > 0).sort((left, right) => left.price - right.price), timestamp, updatedAt: timestamp, hash };
   return tokenId === market.upTokenId ? withUpdatedBooks(market, book, market.downBook, now) : withUpdatedBooks(market, market.upBook, book, now);
 };
 
-export const updateLiveMarketBookLevel = (market: LiveMarket, tokenId: string, side: "BUY" | "SELL", price: number, size: number, now = Date.now()): LiveMarket => {
+export const updateLiveMarketBookLevel = (market: LiveMarket, tokenId: string, side: "BUY" | "SELL", price: number, size: number, now = Date.now(), serverTimestamp?: number | null): LiveMarket => {
   const existing = tokenId === market.upTokenId ? market.upBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : tokenId === market.downTokenId ? market.downBook ?? { tokenId, bids: [], asks: [], timestamp: null, minOrderSize: null, hash: null } : null;
   if (!existing || price <= 0 || !Number.isFinite(price) || !Number.isFinite(size)) return market;
   const sideKey = side === "BUY" ? "bids" : "asks";
   const levels = existing[sideKey].filter((level) => level.price !== price);
   if (size > 0) levels.push({ price, size });
-  const book = { ...existing, [sideKey]: levels.sort((left, right) => side === "BUY" ? right.price - left.price : left.price - right.price), timestamp: now };
+  // Stream updates are stamped in Polymarket server time so freshness checks
+  // compare like with like even when the local clock is skewed.
+  const book = { ...existing, [sideKey]: levels.sort((left, right) => side === "BUY" ? right.price - left.price : left.price - right.price), timestamp: serverTimestamp ?? synchronizedPolymarketTime(now), updatedAt: serverTimestamp ?? synchronizedPolymarketTime(now) };
   return tokenId === market.upTokenId ? withUpdatedBooks(market, book, market.downBook, now) : withUpdatedBooks(market, market.upBook, book, now);
 };
 
@@ -948,11 +988,109 @@ export const chartFairProbability = (
   return clamp(normalCdf(zScore), 0.01, 0.99);
 };
 
-export const estimateFairProbability = (reference: number | null, spot: number | null, remainingSeconds: number): number | null => {
+/** Seconds averaged by a TWAP_60 settlement. */
+export const TWAP_WINDOW_SECONDS = 60;
+/** Share of the already-elapsed settlement window that needs spot coverage. */
+const MIN_TWAP_OBSERVED_COVERAGE = 0.8;
+/**
+ * Longest a spot tick is assumed to hold. Chainlink spot arrives about once a
+ * second; a longer silence is a feed gap, and counting it as observed would let
+ * a brief outage near expiry bias the forecast while the last tick still looks fresh.
+ */
+export const MAX_TICK_CARRY_MS = 3_000;
+
+/** Average of a step-interpolated tick series over [from, to]; each tick holds for at most MAX_TICK_CARRY_MS. Null without enough coverage. */
+export const averageObservedPrice = (ticks: readonly MarketPriceTick[], from: number, to: number): number | null => {
+  if (!(to > from)) return null;
+  const ordered = ticks.filter((tick) => Number.isFinite(tick.price) && tick.price > 0 && tick.timestamp <= to)
+    .sort((left, right) => left.timestamp - right.timestamp);
+  let startIndex = -1;
+  for (let index = 0; index < ordered.length; index += 1) if (ordered[index].timestamp <= from) startIndex = index;
+  const usable = startIndex >= 0 ? ordered.slice(startIndex) : ordered.filter((tick) => tick.timestamp >= from);
+  if (!usable.length) return null;
+  let weighted = 0;
+  let covered = 0;
+  for (let index = 0; index < usable.length; index += 1) {
+    const segmentStart = Math.max(from, usable[index].timestamp);
+    const segmentEnd = Math.min(to, usable[index + 1]?.timestamp ?? to, usable[index].timestamp + MAX_TICK_CARRY_MS);
+    if (segmentEnd <= segmentStart) continue;
+    weighted += usable[index].price * (segmentEnd - segmentStart);
+    covered += segmentEnd - segmentStart;
+  }
+  if (covered < (to - from) * MIN_TWAP_OBSERVED_COVERAGE) return null;
+  return weighted / covered;
+};
+
+/**
+ * P(TWAP_60 at expiry >= reference) with the underlying Chainlink spot as a
+ * Brownian motion (per-second log volatility `sigmaPerSecond`).
+ *
+ * - More than 60 s left: the whole averaging window is in the future. The
+ *   average of a Brownian path over [tau - 60, tau] has variance
+ *   sigma^2 * (tau - 40), centred on current spot.
+ * - 60 s or less left: part of the window is already observed. Settlement is
+ *   (observed-part sum + future-part sum) / 60; the future part is centred on
+ *   spot with variance sigma^2 * spot^2 * tau^3 / 3.
+ *
+ * The two branches agree at tau = 60. The lagging current TWAP is never used as
+ * the forecast's starting point.
+ */
+export const twapSettlementProbability = (input: {
+  reference: number | null;
+  spot: number | null;
+  spotHistory: readonly MarketPriceTick[];
+  endTime: number;
+  now: number;
+  sigmaPerSecond: number | null;
+  driftPerSecond?: number;
+}): number | null => {
+  const { reference, spot, sigmaPerSecond } = input;
   if (reference === null || spot === null || reference <= 0 || spot <= 0) return null;
-  const distance = (spot - reference) / reference;
-  const timeScale = Math.sqrt(900 / Math.max(30, remainingSeconds));
-  return clamp(0.5 + distance * 12 * timeScale, 0.04, 0.96);
+  if (sigmaPerSecond === null || !Number.isFinite(sigmaPerSecond) || sigmaPerSecond <= 0) return null;
+  const drift = Number.isFinite(input.driftPerSecond) ? input.driftPerSecond! : 0;
+  const tau = Math.max(0, (input.endTime - input.now) / 1000);
+  if (tau > TWAP_WINDOW_SECONDS) {
+    const sd = sigmaPerSecond * Math.sqrt(tau - TWAP_WINDOW_SECONDS / 3 * 2);
+    const expectedLogRatio = Math.log(spot / reference) + drift * (tau - TWAP_WINDOW_SECONDS / 2);
+    return clamp(normalCdf(expectedLogRatio / sd), 0.01, 0.99);
+  }
+  const observedSeconds = TWAP_WINDOW_SECONDS - tau;
+  const windowStart = input.endTime - TWAP_WINDOW_SECONDS * 1000;
+  const observedAverage = observedSeconds > 0.5
+    ? averageObservedPrice(input.spotHistory, windowStart, input.now)
+    : spot;
+  if (observedAverage === null) return null;
+  const futureMean = spot * (1 + drift * tau / 2);
+  const expected = (observedAverage * observedSeconds + futureMean * tau) / TWAP_WINDOW_SECONDS;
+  const sd = spot * sigmaPerSecond * Math.sqrt(tau ** 3 / 3) / TWAP_WINDOW_SECONDS;
+  if (sd <= 1e-12) return expected >= reference ? 0.99 : 0.01;
+  return clamp(normalCdf((expected - reference) / sd), 0.01, 0.99);
+};
+
+/** Per-second volatility and drift from the market's own horizon candles. */
+export const candleDynamicsPerSecond = (candles: MarketCandle[], duration: Horizon, now: number) => {
+  const barSeconds = duration === "5m" ? 300 : 900;
+  const perBar = candleVolatility(candles, barSeconds, now);
+  if (perBar === null) return null;
+  return {
+    sigmaPerSecond: perBar / Math.sqrt(barSeconds),
+    driftPerSecond: candleDriftPerBar(candles, barSeconds, now, perBar) / barSeconds,
+  };
+};
+
+/** Settlement-aware P(UP) for a market, from its oracle reference, Chainlink spot and candles. */
+export const marketFairProbability = (market: Pick<LiveMarket, "priceFeed" | "reference" | "spot" | "remaining" | "duration" | "endTime" | "chart5m" | "chart15m"> & { spotHistory?: MarketPriceTick[] }, now: number): number | null => {
+  const candles = market.duration === "5m" ? market.chart5m : market.chart15m;
+  if (market.priceFeed === "TWAP_60") {
+    const dynamics = candleDynamicsPerSecond(candles, market.duration, now);
+    if (!dynamics) return null;
+    return twapSettlementProbability({ reference: market.reference, spot: market.spot, spotHistory: market.spotHistory ?? [],
+      endTime: market.endTime, now, ...dynamics });
+  }
+  if (market.priceFeed === "CHAINLINK_SPOT") {
+    return chartFairProbability(market.reference, market.spot, Math.max(0, (market.endTime - now) / 1000), market.duration, candles, now);
+  }
+  return null;
 };
 
 export const buildLiveMarket = (
@@ -975,8 +1113,7 @@ export const buildLiveMarket = (
   const chart15m = candleHistory?.fifteenMinute ?? [];
   const reference = definition.priceFeed !== "UNSUPPORTED" ? definition.reference : null;
   const referenceSource = reference !== null ? definition.referenceSource : "MISSING";
-  const targetCandles = definition.duration === "5m" ? chart5m : chart15m;
-  const fairUp = chartFairProbability(reference, spot, remaining, definition.duration, targetCandles, marketNow);
+  const fairUp = marketFairProbability({ ...definition, reference, spot, remaining, chart5m, chart15m }, marketNow);
   const upBid = bestBid(upBook);
   const upAsk = bestAsk(upBook);
   const downBid = bestBid(downBook);
@@ -1025,7 +1162,12 @@ export const buildLiveMarket = (
   };
 };
 
-/** Apply observations only from the oracle feed specified by this market. */
+/**
+ * Apply oracle observations. The reference and settlement value come only from
+ * the feed named by the market's resolution rules; the forecast's starting
+ * point is the Chainlink spot feed, because a TWAP lags spot by about half its
+ * window and the market prices that lag in.
+ */
 export const applyPolymarketPriceTicks = (
   market: LiveMarket,
   ticks: readonly PolymarketPriceTick[],
@@ -1033,45 +1175,61 @@ export const applyPolymarketPriceTicks = (
 ): LiveMarket => {
   if (market.priceFeed === "UNSUPPORTED") return market;
   const marketNow = synchronizedPolymarketTime(now);
-  const matching = ticks.filter((tick) => tick.asset === market.asset && tick.priceFeed === market.priceFeed
+  const usable = (tick: PolymarketPriceTick) => tick.asset === market.asset
     && Number.isFinite(tick.price) && tick.price > 0 && Number.isFinite(tick.timestamp)
-    && tick.timestamp <= marketNow + 1000 && tick.timestamp <= market.endTime
+    && tick.timestamp <= marketNow + 1000 && tick.timestamp <= market.endTime;
+  const settlementTicks = ticks.filter((tick) => usable(tick) && tick.priceFeed === market.priceFeed
     && (market.startTime === null || tick.timestamp >= market.startTime));
+  // Spot history starts a little before the window so the opening micro read
+  // and the observed part of the settlement average both have coverage.
+  const historyFloor = (market.startTime ?? market.endTime - 900_000) - TWAP_WINDOW_SECONDS * 1000;
+  const spotTicks = ticks.filter((tick) => usable(tick) && tick.priceFeed === "CHAINLINK_SPOT" && tick.timestamp >= historyFloor);
+
   let reference = market.referenceVerified && market.referenceSource === "POLYMARKET" ? market.reference : null;
   let referenceUpdatedAt = reference !== null ? market.referenceUpdatedAt : null;
   if (reference === null && market.startTimeVerified && market.startTime !== null) {
     // The market rules compare the oracle reading at the beginning of the
     // named window. A nearby reading is not the published price to beat.
-    const opening = matching.find((tick) => tick.timestamp === market.startTime);
+    const opening = settlementTicks.find((tick) => tick.timestamp === market.startTime);
     if (opening) {
       reference = opening.price;
       referenceUpdatedAt = opening.timestamp;
     }
   }
-  const latest = matching.filter((tick) => tick.timestamp >= marketNow - 10_000)
+  const latestOf = (rows: readonly PolymarketPriceTick[]) => rows.filter((tick) => tick.timestamp >= marketNow - 10_000)
     .reduce<PolymarketPriceTick | null>((current, tick) => !current || tick.timestamp > current.timestamp ? tick : current, null);
+  const latestSpot = latestOf(spotTicks);
   const priorSpotFresh = market.spotSource === "POLYMARKET" && market.spotUpdatedAt !== null
     && market.spotUpdatedAt >= marketNow - 10_000 && market.spotUpdatedAt <= marketNow + 1000;
-  const useLatest = latest !== null && (!priorSpotFresh || latest.timestamp >= market.spotUpdatedAt!);
-  const spot = useLatest ? latest.price : priorSpotFresh ? market.spot : null;
-  const spotUpdatedAt = useLatest ? latest.timestamp : priorSpotFresh ? market.spotUpdatedAt : null;
+  const useLatest = latestSpot !== null && (!priorSpotFresh || latestSpot.timestamp >= market.spotUpdatedAt!);
+  const spot = useLatest ? latestSpot.price : priorSpotFresh ? market.spot : null;
+  const spotUpdatedAt = useLatest ? latestSpot.timestamp : priorSpotFresh ? market.spotUpdatedAt : null;
+
+  const latestSettlement = latestOf(settlementTicks);
+  const priorSettlementAt = market.settlementUpdatedAt ?? null;
+  const priorSettlementFresh = priorSettlementAt !== null && priorSettlementAt >= marketNow - 10_000;
+  const useSettlement = latestSettlement !== null && (!priorSettlementFresh || latestSettlement.timestamp >= priorSettlementAt!);
+  const settlementPrice = useSettlement ? latestSettlement.price : priorSettlementFresh ? market.settlementPrice ?? null : null;
+  const settlementUpdatedAt = useSettlement ? latestSettlement.timestamp : priorSettlementFresh ? priorSettlementAt : null;
+
   const remaining = Math.max(0, Math.ceil((market.endTime - marketNow) / 1000));
-  const fairUp = chartFairProbability(reference, spot, remaining, market.duration,
-    market.duration === "5m" ? market.chart5m : market.chart15m, marketNow);
-  const distance = reference !== null && spot !== null ? (spot - reference) / reference : null;
-  const momentum = spot !== null && market.spot !== null && market.spot > 0
-    ? Math.log(spot / market.spot) : null;
-  const spotHistory = [...(market.spotHistory ?? []), ...matching]
+  const spotHistory = [...(market.spotHistory ?? []), ...spotTicks.map(({ timestamp, price }) => ({ timestamp, price }))]
     .filter((tick) => tick.timestamp >= marketNow - 120_000 && tick.timestamp <= marketNow + 1000)
     .sort((left, right) => left.timestamp - right.timestamp)
     .filter((tick, index, points) => index === points.length - 1 || tick.timestamp !== points[index + 1].timestamp)
-    .slice(-180);
+    .slice(-240);
+  const fairUp = marketFairProbability({ ...market, reference, spot, remaining, spotHistory }, marketNow);
+  const distance = reference !== null && spot !== null ? (spot - reference) / reference : null;
+  const momentum = spot !== null && market.spot !== null && market.spot > 0
+    ? Math.log(spot / market.spot) : null;
   const regime = reference === null ? "REFERENCE MISSING" : spot === null ? "SPOT MISSING" :
     Math.abs(distance!) < 0.0002 ? "NEUTRAL" : distance! > 0 ? "UP MOMENTUM" : "DOWN MOMENTUM";
+  const lastTimestamp = (points: readonly MarketPriceTick[] | undefined) => points?.length ? points[points.length - 1].timestamp : undefined;
   if (spot === market.spot && spotUpdatedAt === market.spotUpdatedAt && reference === market.reference
     && referenceUpdatedAt === market.referenceUpdatedAt && market.remaining === remaining
+    && settlementPrice === (market.settlementPrice ?? null) && settlementUpdatedAt === (market.settlementUpdatedAt ?? null)
     && spotHistory.length === (market.spotHistory ?? []).length
-    && spotHistory.at(-1)?.timestamp === market.spotHistory?.at(-1)?.timestamp) return market;
+    && lastTimestamp(spotHistory) === lastTimestamp(market.spotHistory)) return market;
   return {
     ...market,
     reference,
@@ -1081,6 +1239,8 @@ export const applyPolymarketPriceTicks = (
     spot,
     spotSource: spot !== null ? "POLYMARKET" : "MISSING",
     spotUpdatedAt,
+    settlementPrice,
+    settlementUpdatedAt,
     spotHistory,
     remaining,
     fairUp,
@@ -1149,14 +1309,79 @@ export const anchorProbability = (modelUp: number, marketUp: number, modelWeight
 };
 
 /**
+ * A stacking fit of settled outcomes on the model and the book:
+ * logit P(UP) = intercept + modelCoefficient * logit(model) + marketCoefficient * logit(mid).
+ * It replaces the fixed prior weight only when the fit shows the model adds
+ * information (see app/lib/model-calibration.ts for the activation rules).
+ */
+/**
+ * Identity of the raw forecast whose outputs are recorded and calibrated. Any
+ * change to the forecast (inputs, feed, formula) must change this string, so
+ * weights fitted on an older model can never arm a newer one.
+ */
+export const FORECAST_MODEL_VERSION = "twap60-spot-brownian-v1";
+
+export type StackingCalibration = {
+  version: 2;
+  /** FORECAST_MODEL_VERSION of every observation the fit used. */
+  modelVersion: string;
+  /** Market-weighted log loss on the chronological holdout: the fit, and the book mid alone. */
+  heldOutLogLoss: number;
+  heldOutMarketLogLoss: number;
+  heldOutMarkets: number;
+  intercept: number;
+  modelCoefficient: number;
+  marketCoefficient: number;
+  /** Lower bound of a market-clustered bootstrap interval for modelCoefficient. */
+  modelCoefficientLower: number;
+  markets: number;
+  observations: number;
+  fittedAt: number;
+};
+
+/** Settled markets required before a fitted stacking weight can be used. */
+export const MIN_CALIBRATION_MARKETS = 300;
+
+export const isUsableCalibration = (value: unknown): value is StackingCalibration => {
+  if (!value || typeof value !== "object") return false;
+  const calibration = value as Partial<StackingCalibration>;
+  const finite = [calibration.intercept, calibration.modelCoefficient, calibration.marketCoefficient,
+    calibration.modelCoefficientLower, calibration.markets, calibration.observations, calibration.fittedAt].every((entry) => typeof entry === "number" && Number.isFinite(entry));
+  const heldOut = [calibration.heldOutLogLoss, calibration.heldOutMarketLogLoss, calibration.heldOutMarkets]
+    .every((entry) => typeof entry === "number" && Number.isFinite(entry));
+  return calibration.version === 2 && finite && heldOut
+    && calibration.modelVersion === FORECAST_MODEL_VERSION
+    && calibration.heldOutLogLoss! < calibration.heldOutMarketLogLoss!
+    && calibration.markets! >= MIN_CALIBRATION_MARKETS
+    && calibration.modelCoefficientLower! > 0
+    && calibration.marketCoefficient! > 0
+    && Math.abs(calibration.intercept!) < 5 && calibration.modelCoefficient! < 5 && calibration.marketCoefficient! < 5;
+};
+
+let activeCalibration: StackingCalibration | null = null;
+
+/** Install (or clear) the fitted stacking weights used by every edge, entry and exit decision. */
+export const setActiveCalibration = (calibration: unknown): StackingCalibration | null => {
+  activeCalibration = isUsableCalibration(calibration) ? calibration : null;
+  return activeCalibration;
+};
+
+export const getActiveCalibration = (): StackingCalibration | null => activeCalibration;
+
+export const stackedProbability = (modelUp: number, marketUp: number, calibration: StackingCalibration): number =>
+  sigmoid(calibration.intercept + calibration.modelCoefficient * logit(modelUp) + calibration.marketCoefficient * logit(marketUp));
+
+/**
  * The probability every edge, entry, and exit decision should use: the raw
- * candle model pulled toward the live order book. Without a two-sided quote
- * there is nothing to anchor to, so no probability is claimed.
+ * model combined with the live order book, by fitted stacking weights when a
+ * usable fit exists and by the conservative prior weight otherwise. Without a
+ * two-sided quote there is nothing to anchor to, so no probability is claimed.
  */
 export const anchoredFairUp = (market: LiveMarket): number | null => {
   if (market.fairUp === null) return null;
   const marketUp = marketImpliedProbabilityUp(market);
-  return marketUp === null ? null : anchorProbability(market.fairUp, marketUp);
+  if (marketUp === null) return null;
+  return activeCalibration ? stackedProbability(market.fairUp, marketUp, activeCalibration) : anchorProbability(market.fairUp, marketUp);
 };
 
 export const sideFairProbability = (market: LiveMarket, side: "UP" | "DOWN"): number | null => {

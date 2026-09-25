@@ -22,6 +22,12 @@ export const DEFAULT_PAPER_EARLY_EXIT: EarlyExitPolicy = {
   earlyExitStopLossMinRemainingSeconds: 5,
 };
 
+/**
+ * Fixed take-profit and stop-loss are off by default: selling a binary share
+ * at the bid pays half the spread plus a taker fee, which only makes sense
+ * when the model values holding below the sale. When enabled they still
+ * defer to the model (see the hold-value check in the evaluators).
+ */
 export const DEFAULT_LIVE_EARLY_EXIT: EarlyExitPolicy = {
   earlyExitEnabled: false,
   earlyExitMinProfitUsd: 0.05,
@@ -29,8 +35,8 @@ export const DEFAULT_LIVE_EARLY_EXIT: EarlyExitPolicy = {
   earlyExitModelGap: 0.03,
   earlyExitMinRemainingSeconds: 30,
   earlyExitConfirmations: 2,
-  earlyExitTakeProfitPct: 0.2,
-  earlyExitStopLossPct: 0.2,
+  earlyExitTakeProfitPct: 0,
+  earlyExitStopLossPct: 0,
   earlyExitStopLossMinRemainingSeconds: 5,
 };
 
@@ -98,18 +104,25 @@ export const evaluateModelAwareExit = (input: {
 
   if (!input.policy.earlyExitEnabled) return { shouldExit: false, reason: "Model-aware early exits are disabled.", ...rounded };
   if (shares <= 0 || entryPrice <= 0 || currentPrice <= 0) return { shouldExit: false, reason: "Position pricing or size is unavailable.", ...rounded };
+  // A fixed threshold may only sell when the model does not value holding
+  // materially above the fee-adjusted sale; otherwise it locks in a cost.
+  const saleValuePerShare = currentPrice * (1 - feeRate);
+  const saleNotBelowHold = input.modelDataAvailable !== false && saleValuePerShare >= fairProbability - input.policy.earlyExitModelGap;
   const stopLossUsd = entryCost * input.policy.earlyExitStopLossPct;
   if (input.policy.earlyExitStopLossPct > 0 && netProfit <= -stopLossUsd) {
     if (input.remainingSeconds < input.policy.earlyExitStopLossMinRemainingSeconds) {
       return { shouldExit: false, reason: "Stop-loss threshold reached too close to settlement for an early exit order.", ...rounded };
     }
-    return { shouldExit: true, reason: `Stop-loss: fee-adjusted executable value is down ${round(-profitPct * 100, 1)}% (limit ${round(input.policy.earlyExitStopLossPct * 100, 1)}%).`, ...rounded };
+    if (!saleNotBelowHold) {
+      return { shouldExit: false, reason: "Stop-loss threshold reached, but the model values holding above the fee-adjusted sale (or model inputs are unavailable).", ...rounded };
+    }
+    return { shouldExit: true, reason: `Stop-loss: fee-adjusted executable value is down ${round(-profitPct * 100, 1)}% (limit ${round(input.policy.earlyExitStopLossPct * 100, 1)}%) and the model does not value holding above the sale.`, ...rounded };
   }
   if (input.remainingSeconds < input.policy.earlyExitMinRemainingSeconds) return { shouldExit: false, reason: "Too little time remains for an early exit decision.", ...rounded };
   const takeProfitUsd = Math.max(input.policy.earlyExitMinProfitUsd,
     entryCost * Math.max(input.policy.earlyExitMinProfitPct, input.policy.earlyExitTakeProfitPct));
-  if (input.policy.earlyExitTakeProfitPct > 0 && netProfit >= takeProfitUsd) {
-    return { shouldExit: true, reason: `Take-profit: fee-adjusted executable gain is ${round(profitPct * 100, 1)}% (target ${round(input.policy.earlyExitTakeProfitPct * 100, 1)}%).`, ...rounded };
+  if (input.policy.earlyExitTakeProfitPct > 0 && netProfit >= takeProfitUsd && saleNotBelowHold) {
+    return { shouldExit: true, reason: `Take-profit: fee-adjusted executable gain is ${round(profitPct * 100, 1)}% (target ${round(input.policy.earlyExitTakeProfitPct * 100, 1)}%) and the model does not value holding above the sale.`, ...rounded };
   }
   if (input.modelDataAvailable === false) return { shouldExit: false, reason: "Model inputs are unavailable for a model-based cashout.", ...rounded };
   if (modelGap < input.policy.earlyExitModelGap) return { shouldExit: false, reason: "The current bid is not sufficiently above the model fair probability.", ...rounded };
@@ -168,15 +181,22 @@ export const evaluatePaperHoldExit = (input: {
   if (!input.policy.earlyExitEnabled) return { shouldExit: false, reason: "Paper early exits are disabled.", ...result };
   if (shares <= 0 || basis <= 0) return { shouldExit: false, reason: "Executable bid pricing or position size is unavailable.", ...result };
   const fullyFillable = shares + 0.00000001 >= originalShares;
+  const modelMargin = shares * input.policy.earlyExitModelGap;
+  // A fixed threshold may only sell when the model does not value holding
+  // materially above the fee-adjusted sale; otherwise it locks in a cost.
+  const saleNotBelowHold = input.modelDataAvailable !== false && advantage >= -modelMargin;
   const stopLossUsd = basis * input.policy.earlyExitStopLossPct;
   if (input.policy.earlyExitStopLossPct > 0 && pnl <= -stopLossUsd) {
     if (input.remainingSeconds < input.policy.earlyExitStopLossMinRemainingSeconds) {
       return { shouldExit: false, reason: "Stop-loss threshold reached too close to settlement for an early exit order.", ...result };
     }
-    return { shouldExit: true, reason: `Stop-loss: fee-adjusted executable value is down ${(-pnl / basis * 100).toFixed(1)}% (limit ${(input.policy.earlyExitStopLossPct * 100).toFixed(1)}%); sellable quantity ${shares.toFixed(2)} shares.`, ...result };
+    if (!saleNotBelowHold) {
+      return { shouldExit: false, reason: "Stop-loss threshold reached, but the model values holding above the fee-adjusted sale (or model inputs are unavailable).", ...result };
+    }
+    return { shouldExit: true, reason: `Stop-loss: fee-adjusted executable value is down ${(-pnl / basis * 100).toFixed(1)}% (limit ${(input.policy.earlyExitStopLossPct * 100).toFixed(1)}%) and the model does not value holding above the sale; sellable quantity ${shares.toFixed(2)} shares.`, ...result };
   }
   if (input.remainingSeconds < input.policy.earlyExitMinRemainingSeconds) return { shouldExit: false, reason: "Too little time remains for an early exit decision.", ...result };
-  if (input.policy.earlyExitTakeProfitPct > 0) {
+  if (input.policy.earlyExitTakeProfitPct > 0 && saleNotBelowHold) {
     const takeProfitUsd = Math.max(input.policy.earlyExitMinProfitUsd,
       basis * Math.max(input.policy.earlyExitMinProfitPct, input.policy.earlyExitTakeProfitPct));
     if (pnl >= takeProfitUsd) {
@@ -185,7 +205,6 @@ export const evaluatePaperHoldExit = (input: {
   }
   if (!fullyFillable) return { shouldExit: false, reason: "Full executable bid depth is unavailable for a model-based cashout.", ...result };
   if (input.modelDataAvailable === false) return { shouldExit: false, reason: "Model inputs are unavailable for a model-based cashout.", ...result };
-  const modelMargin = shares * input.policy.earlyExitModelGap;
   const minProfit = Math.max(input.policy.earlyExitMinProfitUsd, basis * input.policy.earlyExitMinProfitPct);
   if (advantage >= modelMargin && pnl >= minProfit) {
     return { shouldExit: true, reason: `Executable sale exceeds estimated hold value by $${advantage.toFixed(2)} after exit costs; realizable gain $${pnl.toFixed(2)}.`, ...result };

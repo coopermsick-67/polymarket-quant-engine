@@ -11,27 +11,32 @@ import { polygon } from "viem/chains";
 import {
   applyPolymarketPriceTicks,
   buildLiveMarket,
-  CONSERVATIVE_CRYPTO_FEE_SCHEDULE,
   discoverCryptoMarkets,
   fetchCandleHistories,
   fetchOrderBooks,
   anchoredFairUp,
   synchronizedPolymarketTime,
+  syncPolymarketClock,
   type Asset,
   type CandleHistory,
   type LiveMarket,
   type OrderBook,
+  type MarketFeeSchedule,
   type PolymarketPriceTick,
 } from "../app/lib/polymarket-data";
 import { subscribePolymarketPrices, type PolymarketPriceStreamStatus } from "../app/lib/polymarket-price-stream";
-import { analyzeMarketSignal, estimatePaperExitFill, marketDataFreshnessIssue, type ClosedPaperTrade, type PaperAccount, type PaperPosition } from "../app/lib/engines";
+import { analyzeMarketSignal, estimatePaperExitFill, marketDataFreshnessIssue, MAX_ORDER_BOOK_AGE_MS, type ClosedPaperTrade, type PaperAccount, type PaperPosition } from "../app/lib/engines";
 import { enforceLiveExecutionRisk } from "../app/lib/live-risk";
 import { DEFAULT_LIVE_EARLY_EXIT, evaluatePaperHoldExit } from "../app/lib/early-exit";
 import { bankrollProfile } from "../app/lib/bankroll-policy";
 import { liveBankrollProfile, type LiveBankrollProfile } from "../app/lib/live-bankroll-policy";
-import { reconcileFakBuyFill, reconcileFakSellFill } from "../app/lib/fak-fill-reconciliation";
+import { decideSettlement, isValidJournalOrder, settlementTimedOut, type JournalOrder, type SettlementDecision, type TradeObservation } from "../app/lib/live-order-journal";
 import { evaluatePaperMarket, type PaperOpportunity } from "../app/lib/paper-bankroll";
-import { sdkMarketBuyShares } from "../app/lib/live-order-sizing";
+import { bidLiquidationValue, quoteMinimumShareBuy, quoteSell, takerFeePerShare } from "../app/lib/live-order-pricing";
+import { assertNoComboPositions, comboPositionsUrl, fetchAllWalletPositions, openPositions, positionsUrl, settledPositions, type WalletPosition } from "../app/lib/wallet-positions";
+import { loadCalibrationFile } from "./calibration-file";
+import { collateralUsdFromRaw } from "../app/lib/collateral";
+import { updateRiskBaselines } from "../app/lib/live-risk-baselines";
 
 const CLOB_HOST = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
@@ -47,10 +52,17 @@ const LIVE_MINIMUM_ORDER_USD = 1;
 const RETRY_NO_FILL_MS = 20_000;
 const CLOSED_HISTORY_REFRESH_MS = 60_000;
 const CLOSED_HISTORY_MAX_AGE_MS = 90_000;
-const RISK = enforceLiveExecutionRisk({ feeRate: 0.05, slippageBps: 25, minEdge: 0.04, requireLock: true });
+/** Ticks a FAK limit may sit beyond the observed price, so a one-tick move before arrival does not cancel it. */
+const LIVE_LIMIT_TOLERANCE_TICKS = 2;
+const CLOCK_RESYNC_MS = 5 * 60_000;
+/** Fast-path settlement polling right after an order; afterwards the main loop keeps checking every 2 s. */
+const RECONCILE_WAIT_MS = 10_000;
+const PORTFOLIO_REFRESH_MS = 3_000;
+// feeRate here is only the stand-in when a market's CLOB fee schedule is unreadable.
+const RISK = enforceLiveExecutionRisk({ feeRate: 0.05, slippageBps: 25, minEdge: 0.04, requireLock: process.env.POLYMARKET_LIVE_REQUIRE_LOCK?.trim().toLowerCase() === "true" });
 const LIVE_MINIMUM_ALL_IN_USD = Math.ceil((LIVE_MINIMUM_ORDER_USD * (1 + RISK.feeRate) - 1e-9) * 100) / 100;
 
-type PositionRow = { tokenID: string | null; conditionId: string | null; slug: string | null; outcome: "UP" | "DOWN" | null; size: number; averagePrice: number | null; exposureUsd: number; currentValueUsd: number };
+type PositionRow = WalletPosition;
 type TraderState = {
   version: 3;
   attemptedMarkets: string[];
@@ -63,7 +75,8 @@ type TraderState = {
   managedPositionTokens: string[];
   managedPositionSince: Record<string, number>;
   exitConfirmations: Record<string, { count: number; lastSeen: number }>;
-  pending: { requestId: string; marketId: string; at: number; action: "BUY" | "SELL"; tokenID: string; shares: number } | null;
+  /** The one in-flight order; see app/lib/live-order-journal.ts for its phases. */
+  pending: JournalOrder | null;
 };
 
 const emptyState = (): TraderState => ({ version: 3, attemptedMarkets: [], retryAfter: {}, riskDayKey: null,
@@ -136,8 +149,13 @@ const askSecret = async (prompt: string) => {
 const readState = async (): Promise<TraderState> => {
   try {
     const state = JSON.parse(await readFile(STATE_PATH, "utf8")) as Omit<Partial<TraderState>, "version"> & { version?: number };
-    if (![1, 2, 3].includes(state.version ?? -1) || !Array.isArray(state.attemptedMarkets) || (state.pending !== null && state.pending !== undefined)) {
-      if (state.pending) throw new Error("A prior order request has an uncertain outcome. Check wallet positions, open orders, and activity before restarting. The pending marker is in the local trader state file.");
+    const pending = state.pending ?? null;
+    if (pending !== null && !(isValidJournalOrder(pending) && pending.phase === "SETTLING")) {
+      // SUBMITTING (or an older marker) means the process stopped between
+      // posting and recording the CLOB response: the outcome is unknown.
+      throw new Error("A prior order request has an uncertain outcome. Check wallet positions, open orders, and activity before restarting. The pending marker is in the local trader state file.");
+    }
+    if (![1, 2, 3].includes(state.version ?? -1) || !Array.isArray(state.attemptedMarkets)) {
       throw new Error("The saved trader state is invalid; it will not be overwritten.");
     }
     if (state.version === 1) {
@@ -171,7 +189,8 @@ const readState = async (): Promise<TraderState> => {
       managedPositionTokens: Array.isArray(state.managedPositionTokens) ? state.managedPositionTokens.filter((token): token is string => typeof token === "string").slice(-100) : [],
       managedPositionSince,
       exitConfirmations,
-      pending: null,
+      // A SETTLING order has a known CLOB order ID; reconciliation resumes.
+      pending,
     };
   } catch (error) {
     if (error instanceof Error && !("code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error;
@@ -197,13 +216,13 @@ const acquireLock = async () => {
   }
 };
 
-const readPositions = async (wallet: string): Promise<PositionRow[]> => {
+const fetchWithRetry = async (url: string): Promise<unknown> => {
   let response: Response | null = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
     try {
-      response = await fetch(`${DATA_API}/v2/positions?user=${encodeURIComponent(wallet)}&limit=100`, { cache: "no-store", signal: controller.signal });
+      response = await fetch(url, { cache: "no-store", signal: controller.signal });
     } finally { clearTimeout(timer); }
     if (response.ok || ![429, 500, 502, 503, 504].includes(response.status) || attempt === 2) break;
     // This endpoint is read-only, so retry temporary upstream failures before
@@ -216,28 +235,14 @@ const readPositions = async (wallet: string): Promise<PositionRow[]> => {
     await sleep(delay);
   }
   if (!response?.ok) throw new Error(`Polymarket position lookup returned ${response?.status ?? "no response"} after up to 3 attempts.`);
-  const payload = await response.json() as unknown;
-  const rows = Array.isArray(payload) ? payload : payload && typeof payload === "object" && Array.isArray((payload as Record<string, unknown>).data) ? (payload as { data: unknown[] }).data : null;
-  if (!rows || rows.length >= 100) throw new Error("The complete position list could not be established; live orders are blocked.");
-  return rows.map((row): PositionRow => {
-    if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("A position row was unreadable; live orders are blocked.");
-    const source = row as Record<string, unknown>;
-    const tokenID = typeof (source.asset ?? source.asset_id ?? source.token_id) === "string" ? String(source.asset ?? source.asset_id ?? source.token_id) : null;
-    const conditionId = typeof (source.conditionId ?? source.condition_id ?? source.market) === "string" ? String(source.conditionId ?? source.condition_id ?? source.market) : null;
-    const slug = typeof (source.slug ?? source.eventSlug ?? source.event_slug) === "string" ? String(source.slug ?? source.eventSlug ?? source.event_slug) : null;
-    const rawOutcome = typeof source.outcome === "string" ? source.outcome.trim().toUpperCase() : "";
-    const outcome = rawOutcome === "UP" ? "UP" : rawOutcome === "DOWN" ? "DOWN" : null;
-    const size = number(source.current_size ?? source.size ?? source.total_size);
-    const averagePrice = number(source.avgPrice ?? source.avg_price ?? source.average_price);
-    const initialValue = number(source.initialValue ?? source.initial_value ?? source.costBasis ?? source.cost_basis);
-    const currentValue = number(source.currentValue ?? source.current_value ?? source.current_value_usd ?? source.value);
-    if (size === null || size < 0) throw new Error("Position size was unreadable; live orders are blocked.");
-    if (size > 0 && !tokenID) throw new Error("A position has no exact token ID; live orders are blocked until wallet positions are fully readable.");
-    const basis = averagePrice !== null && averagePrice > 0 && averagePrice <= 1 ? size * averagePrice : initialValue;
-    if (size > 0 && (basis === null || basis <= 0)) throw new Error("Position cost basis was unreadable; live orders are blocked.");
-    const exposureUsd = size > 0 ? Math.max(size * (averagePrice ?? 0), initialValue ?? 0) : 0;
-    return { tokenID, conditionId, slug, outcome, size, averagePrice, exposureUsd, currentValueUsd: size > 0 ? Math.max(0, currentValue ?? exposureUsd) : 0 };
-  }).filter((position) => position.size > 0);
+  return await response.json() as unknown;
+};
+
+/** Every wallet position, across all pages; resolved (redeemable) rows are flagged, not dropped. */
+const readPositions = async (wallet: string): Promise<PositionRow[]> => {
+  // Combo positions live on a separate endpoint the engine cannot value; refuse rather than under-count.
+  assertNoComboPositions(await fetchWithRetry(comboPositionsUrl(DATA_API, wallet)));
+  return fetchAllWalletPositions((cursor) => fetchWithRetry(positionsUrl(DATA_API, wallet, cursor)));
 };
 
 const readClosedTrades = async (wallet: string, now: number): Promise<ClosedPaperTrade[]> => {
@@ -284,24 +289,55 @@ const readClosedTrades = async (wallet: string, now: number): Promise<ClosedPape
 
 const readBalance = async (client: ClobClient) => {
   const payload = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-  const raw = number(payload.balance);
-  if (raw === null || raw < 0) return null;
-  return raw >= 1_000_000 ? raw / 1_000_000 : raw;
+  return collateralUsdFromRaw(payload.balance);
 };
 
-const liveEquity = (balance: number, positions: PositionRow[]) => balance + positions.reduce((sum, position) => sum + position.currentValueUsd, 0);
+/** Latest executable book per held token, refreshed on a fixed schedule; the source of position marks. */
+const positionBooks = new Map<string, { book: OrderBook; feeSchedule?: MarketFeeSchedule }>();
 
-const updateRiskBaselines = (state: TraderState, equityUsd: number, now: number) => {
-  const dayKey = new Date(now).toISOString().slice(0, 10);
-  if (state.riskDayKey !== dayKey || !state.riskDayStartEquityUsd || state.riskDayStartEquityUsd <= 0
-    || !state.peakLiquidationEquityUsd || state.peakLiquidationEquityUsd <= 0) {
-    state.riskDayKey = dayKey;
-    state.riskDayStartEquityUsd = Math.max(1, equityUsd);
-    state.peakLiquidationEquityUsd = Math.max(1, equityUsd);
-  } else {
-    state.peakLiquidationEquityUsd = Math.max(state.peakLiquidationEquityUsd, equityUsd);
+/**
+ * Liquidation equity: cash, plus what each open position would raise by
+ * selling into its current bids after fees, plus the fixed value of resolved
+ * positions awaiting redemption. A position without a fresh book is valued at
+ * zero, never at the Data API's mark, so a thin book cannot inflate equity.
+ */
+const liveEquity = (balance: number, positions: PositionRow[]) => balance + positions.reduce((sum, position) => {
+  if (position.settled) return sum + position.currentValueUsd;
+  const entry = position.tokenID ? positionBooks.get(position.tokenID) : undefined;
+  if (!entry || entry.book.timestamp === null || synchronizedPolymarketTime() - entry.book.timestamp > MAX_ORDER_BOOK_AGE_MS * 3) return sum;
+  return sum + bidLiquidationValue(entry.book.bids, position.size, entry.feeSchedule, RISK.feeRate);
+}, 0);
+
+const rememberPositionBooks = (positions: PositionRow[], markets: Iterable<LiveMarket>) => {
+  const held = new Set(openPositions(positions).flatMap((position) => position.tokenID ? [position.tokenID] : []));
+  for (const market of markets) {
+    if (held.has(market.upTokenId) && market.upBook) positionBooks.set(market.upTokenId, { book: market.upBook, feeSchedule: market.feeSchedule });
+    if (held.has(market.downTokenId) && market.downBook) positionBooks.set(market.downTokenId, { book: market.downBook, feeSchedule: market.feeSchedule });
+  }
+  for (const token of [...positionBooks.keys()]) if (!held.has(token)) positionBooks.delete(token);
+};
+
+/** Fetch books for held tokens that the active-market scan does not cover (unrelated or older markets). */
+const refreshPositionBooks = async (positions: PositionRow[], covered: ReadonlySet<string>) => {
+  const missing = openPositions(positions).flatMap((position) => position.tokenID && !covered.has(position.tokenID) ? [position.tokenID] : []);
+  if (!missing.length) return;
+  const books = await fetchOrderBooks(missing);
+  for (const token of missing) {
+    const book = books.get(token);
+    if (book) positionBooks.set(token, { book });
+    else positionBooks.delete(token);
   }
 };
+/** Capital at risk in open markets; resolved positions are fixed in value and carry no exposure. */
+const openExposureUsd = (positions: PositionRow[]) => openPositions(positions).reduce((sum, position) => sum + position.exposureUsd, 0);
+
+const redemptionNotice = (positions: PositionRow[]): string | null => {
+  const settled = settledPositions(positions);
+  if (!settled.length) return null;
+  const value = settled.reduce((sum, position) => sum + position.currentValueUsd, 0);
+  return `${settled.length} resolved position(s) worth ${money(value)} await redemption. They no longer count as open exposure, but their cash is unavailable until you redeem them on polymarket.com; this trader does not send on-chain redemption transactions.`;
+};
+
 
 const liveProfileFor = (equityUsd: number, duration: "5m" | "15m"): LiveBankrollProfile => {
   return liveBankrollProfile(equityUsd, LIVE_MINIMUM_EQUITY_USD, LIVE_ENTRY_RISK_PCT, duration);
@@ -314,18 +350,24 @@ const liveExitBookIssue = (market: LiveMarket, tokenID: string, now: number): st
     return "The market interval is not verified and active for an automatic exit.";
   }
   const sideBook = tokenID === market.upTokenId ? market.upBook : tokenID === market.downTokenId ? market.downBook : null;
-  if (!sideBook || sideBook.timestamp === null || sideBook.timestamp > marketNow + 30_000
-    || marketNow - sideBook.timestamp > 60_000 || !sideBook.bids.some((level) => level.price > 0 && level.price < 1 && level.size > 0)) {
+  if (!sideBook || sideBook.timestamp === null || sideBook.timestamp > marketNow + 2_000
+    || marketNow - sideBook.timestamp > MAX_ORDER_BOOK_AGE_MS || !sideBook.bids.some((level) => level.price > 0 && level.price < 1 && level.size > 0)) {
     return "The position has no fresh executable bid for an automatic exit.";
   }
   return null;
 };
+
+let fixedExitThresholdsEnabled = false;
 
 const liveExitPolicyFor = (equityUsd: number) => {
   const profile = bankrollProfile(equityUsd);
   return {
     ...DEFAULT_LIVE_EARLY_EXIT,
     earlyExitEnabled: true,
+    // Optional 20% take-profit / stop-loss; even then they only fire when the
+    // model does not value holding above the fee-adjusted sale.
+    earlyExitTakeProfitPct: fixedExitThresholdsEnabled ? 0.2 : 0,
+    earlyExitStopLossPct: fixedExitThresholdsEnabled ? 0.2 : 0,
     earlyExitMinProfitUsd: Math.min(DEFAULT_LIVE_EARLY_EXIT.earlyExitMinProfitUsd, Math.max(0.02, profile.minExpectedProfitUsd)),
     earlyExitMinProfitPct: Math.min(DEFAULT_LIVE_EARLY_EXIT.earlyExitMinProfitPct, Math.max(0.025, profile.minExpectedProfitOnStakePct / 2)),
   };
@@ -339,12 +381,14 @@ const evaluateLiveHoldExit = (market: LiveMarket, position: PositionRow, side: "
     venueMinimum !== null && venueMinimum !== undefined && Number.isFinite(venueMinimum) && venueMinimum > 0 ? venueMinimum : 0);
   if (requestedShares < minimumShares) return null;
   if (!sideBook?.bids.length) return null;
-  const bids = [...sideBook.bids].sort((left, right) => right.price - left.price);
-  const minimumPrice = bids[0].price * (1 - RISK.slippageBps / 10_000);
-  const executableBids = bids.filter((level) => level.price + 1e-8 >= minimumPrice);
-  const depthShares = executableBids.reduce((sum, level) => sum + level.size, 0);
-  const executableShares = Math.floor(Math.min(requestedShares, depthShares) * 100 + 1e-8) / 100;
-  if (executableShares < minimumShares) return null;
+  // Price the exit exactly as it would be posted: the book's own tick and the
+  // capped tolerance, judged on the worst proceeds the limit allows.
+  const tickSize = String(sideBook.tickSize ?? 0.01);
+  const quote = quoteSell({ bids: sideBook.bids, shares: requestedShares, tickSize, toleranceTicks: LIVE_LIMIT_TOLERANCE_TICKS, minimumShares,
+    feeSchedule: market.feeSchedule, fallbackFeeRate: RISK.feeRate });
+  if (!quote) return null;
+  const executableBids = sideBook.bids.filter((level) => level.price + 1e-8 >= quote.limitPrice);
+  const executableShares = quote.shares;
   const executionBook = { ...sideBook, bids: executableBids };
   const executionMarket = side === "UP" ? { ...market, upBook: executionBook } : { ...market, downBook: executionBook };
   const fill = estimatePaperExitFill(executionMarket, side, executableShares, { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, now);
@@ -361,7 +405,7 @@ const evaluateLiveHoldExit = (market: LiveMarket, position: PositionRow, side: "
     entryCostUsd: position.exposureUsd * (requestedShares / position.size),
     originalShares: requestedShares,
     filledShares: executableShares,
-    netExitProceedsUsd: fill.totalCost,
+    netExitProceedsUsd: Math.min(fill.totalCost, quote.worstProceedsUsd),
     sideFairProbability: fairProbability,
     remainingSeconds: market.remaining,
     directionalReversal,
@@ -371,35 +415,28 @@ const evaluateLiveHoldExit = (market: LiveMarket, position: PositionRow, side: "
   return { evaluation, requestedShares, executableShares, fairProbability, modelRead };
 };
 
-const liveSellQuote = (market: LiveMarket, side: "UP" | "DOWN", shares: number, tickSize: number, now: number) => {
+const liveSellQuote = (market: LiveMarket, side: "UP" | "DOWN", shares: number, tickSize: string, now: number) => {
   const sourceBook = side === "UP" ? market.upBook : market.downBook;
   if (!sourceBook?.bids.length || shares <= 0) return null;
-  const bids = [...sourceBook.bids].sort((left, right) => right.price - left.price);
-  const bestBid = bids[0].price;
-  const minimumPrice = bestBid * (1 - RISK.slippageBps / 10_000);
-  // SELL prices are minimum acceptable proceeds, so round the limit up to a
-  // valid tick. Rounding down could exceed the configured slippage bound.
-  const roundedLimit = Number((Math.ceil((minimumPrice - 1e-10) / tickSize) * tickSize).toFixed(Math.max(0, (String(tickSize).split(".")[1] ?? "").length)));
-  if (!Number.isFinite(roundedLimit) || roundedLimit <= 0 || roundedLimit > bestBid + 1e-8 || roundedLimit >= 1) return null;
-  const executableBids = bids.filter((level) => level.price + 1e-8 >= roundedLimit);
-  const executableShares = Math.floor(Math.min(shares, executableBids.reduce((sum, level) => sum + level.size, 0)) * 100 + 1e-8) / 100;
   const minimumShares = Math.max(LIVE_MINIMUM_SHARES, sourceBook.minOrderSize ?? 0);
-  if (executableShares + 1e-8 < minimumShares) return null;
-  const limitedBook = { ...sourceBook, bids: executableBids };
+  const quote = quoteSell({ bids: sourceBook.bids, shares, tickSize, toleranceTicks: LIVE_LIMIT_TOLERANCE_TICKS, minimumShares,
+    feeSchedule: market.feeSchedule, fallbackFeeRate: RISK.feeRate });
+  if (!quote) return null;
+  const limitedBook = { ...sourceBook, bids: sourceBook.bids.filter((level) => level.price + 1e-8 >= quote.limitPrice) };
   const executionMarket = side === "UP" ? { ...market, upBook: limitedBook } : { ...market, downBook: limitedBook };
-  const estimatedFill = estimatePaperExitFill(executionMarket, side, executableShares, { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, now);
-  return estimatedFill && estimatedFill.shares + 1e-8 >= executableShares
-    ? { shares: executableShares, limitPrice: roundedLimit, executionMarket, estimatedFill } : null;
+  const estimatedFill = estimatePaperExitFill(executionMarket, side, quote.shares, { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, now);
+  return estimatedFill && estimatedFill.shares + 1e-8 >= quote.shares
+    ? { shares: quote.shares, limitPrice: quote.limitPrice, worstProceedsUsd: quote.worstProceedsUsd, executionMarket, estimatedFill } : null;
 };
 
 const buildPaperAccount = (balance: number, rows: PositionRow[], markets: Map<string, LiveMarket>, timestamp: number, dayStart: number,
   closedTrades: ClosedPaperTrade[] = []): PaperAccount => {
-  const positions: PaperPosition[] = rows.map((row, index) => {
+  const positions: PaperPosition[] = openPositions(rows).map((row, index) => {
     const market = [...markets.values()].find((candidate) => candidate.upTokenId === row.tokenID || candidate.downTokenId === row.tokenID
       || Boolean(candidate.conditionId && row.conditionId && candidate.conditionId.toLowerCase() === row.conditionId.toLowerCase())
       || candidate.slug.toLowerCase() === row.slug?.toLowerCase());
     const tokenSide = market && row.tokenID === market.downTokenId ? "DOWN" : market && row.tokenID === market.upTokenId ? "UP" : null;
-    const side = tokenSide ?? row.outcome;
+    const side = tokenSide ?? row.side;
     // Wallets can hold unrelated markets, including YES/NO outcomes, while this
     // engine only trades crypto UP/DOWN. Keep those costs in aggregate exposure
     // and open-position limits, but give each an isolated identity so it can
@@ -410,7 +447,7 @@ const buildPaperAccount = (balance: number, rows: PositionRow[], markets: Map<st
     const marketId = riskMarket?.id ?? (isUnmapped
       ? `unmapped:${row.tokenID ?? row.conditionId ?? row.slug ?? index}`
       : row.conditionId ?? row.slug ?? row.tokenID ?? `position:${index}`);
-    const avgEntry = row.averagePrice && row.averagePrice > 0 && row.averagePrice <= 1 ? row.averagePrice : row.exposureUsd / row.size;
+    const avgEntry = row.averagePrice && row.averagePrice > 0 && row.averagePrice <= 1 ? row.averagePrice : Math.max(0.0001, row.exposureUsd / row.size);
     return {
       id: row.tokenID ?? marketId,
       marketId,
@@ -420,7 +457,7 @@ const buildPaperAccount = (balance: number, rows: PositionRow[], markets: Map<st
       side: riskSide,
       shares: row.size,
       avgEntry,
-      totalCost: row.exposureUsd,
+      totalCost: Math.max(0.0001, row.exposureUsd),
       mark: null,
       endTime: riskMarket?.endTime ?? timestamp,
       openedAt: timestamp,
@@ -460,7 +497,9 @@ const withFreshExecutionBook = (market: LiveMarket, tokenID: string, rawBook: un
     tokenId: tokenID,
     bids,
     asks,
-    timestamp: receivedAt,
+    // Book timestamps are server time everywhere in the engine.
+    timestamp: number(source.timestamp) ?? synchronizedPolymarketTime(receivedAt),
+    tickSize: number(source.tick_size),
     minOrderSize: number(source.min_order_size ?? source.minOrderSize)
       ?? (tokenID === market.upTokenId ? market.upBook?.minOrderSize : market.downBook?.minOrderSize) ?? null,
     hash: typeof source.hash === "string" ? source.hash : null,
@@ -470,45 +509,71 @@ const withFreshExecutionBook = (market: LiveMarket, tokenID: string, rawBook: un
   throw new Error("The refreshed order book did not match the selected market token.");
 };
 
-type MinimumShareOrder = { minimumShares: number; requestedShares: number; limitPrice: number; amountUsd: number; worstTotalCostUsd: number };
-
-const minimumShareOrder = (market: LiveMarket, side: "UP" | "DOWN", tickSize: number, fairProbability: number): MinimumShareOrder | null => {
+const minimumShareOrder = (market: LiveMarket, side: "UP" | "DOWN", tickSize: string, fairProbability: number) => {
   const book = side === "UP" ? market.upBook : market.downBook;
-  if (!book || book.minOrderSize === null || !Number.isFinite(book.minOrderSize) || book.minOrderSize <= 0 || !book.asks.length) return null;
-  const minimumShares = Math.max(LIVE_MINIMUM_SHARES, book.minOrderSize);
-  const asks = [...book.asks].sort((left, right) => left.price - right.price);
-  const bestAsk = asks[0].price;
-  let cumulativeShares = 0;
-  let priceForMinimum = 0;
-  for (const askLevel of asks) {
-    cumulativeShares += askLevel.size;
-    if (cumulativeShares + 1e-8 >= minimumShares) { priceForMinimum = askLevel.price; break; }
+  if (!book) return null;
+  return quoteMinimumShareBuy({ asks: book.asks, venueMinimumShares: book.minOrderSize, floorShares: LIVE_MINIMUM_SHARES, tickSize,
+    fairProbability, minEdge: RISK.minEdge, slippageBps: RISK.slippageBps, toleranceTicks: LIVE_LIMIT_TOLERANCE_TICKS,
+    feeSchedule: market.feeSchedule, fallbackFeeRate: RISK.feeRate });
+};
+
+/**
+ * Can this equity place any entry at all? The smallest order is the venue
+ * minimum at the tier's lowest allowed entry price; if that exceeds the
+ * per-entry cap, the trader would scan forever without trading.
+ */
+const liveEntryFeasibility = (equityUsd: number) => {
+  const profile = liveProfileFor(equityUsd, "5m");
+  const perEntryCap = Math.min(RISK.maxTradeUsd, equityUsd * profile.maxStakePct);
+  const cheapest = LIVE_MINIMUM_SHARES * (profile.minEntryPrice + takerFeePerShare(profile.minEntryPrice, undefined, RISK.feeRate));
+  const requiredEquity = Math.ceil(cheapest / profile.maxStakePct * 100) / 100;
+  return { feasible: profile.eligible && cheapest <= perEntryCap + 1e-9, perEntryCap, cheapest, requiredEquity, profile };
+};
+
+const assertEntryEligible = (balance: number, positions: PositionRow[]) => {
+  const equity = liveEquity(balance, positions);
+  if (equity < LIVE_MINIMUM_EQUITY_USD) throw new Error("Liquidation equity is below the $10 live-entry floor.");
+  if (balance < 1) throw new Error("Available USDC is below the $1 minimum executable stake.");
+  const feasibility = liveEntryFeasibility(equity);
+  if (!feasibility.feasible) {
+    throw new Error(`No entry can pass at this balance: the ${feasibility.profile.tier} tier caps an entry at ${money(feasibility.perEntryCap)}, but the smallest allowed order (${LIVE_MINIMUM_SHARES} shares at the tier's ${Math.round(feasibility.profile.minEntryPrice * 100)}c floor, with fees) costs ${money(feasibility.cheapest)}. At least ${money(feasibility.requiredEquity)} of equity is needed.`);
   }
-  if (priceForMinimum <= 0) return null;
-  const slippagePriceCeiling = bestAsk * (1 + RISK.slippageBps / 10_000);
-  const modelPriceCeiling = (fairProbability - RISK.minEdge) / (1 + RISK.feeRate);
-  const rawLimit = Math.min(priceForMinimum, slippagePriceCeiling, modelPriceCeiling);
-  const limitPrice = Math.floor((rawLimit + 1e-10) / tickSize) * tickSize;
-  const priceDecimals = Math.max(0, (String(tickSize).split(".")[1] ?? "").length);
-  const roundedLimit = Number(limitPrice.toFixed(priceDecimals));
-  if (!Number.isFinite(roundedLimit) || roundedLimit < bestAsk || roundedLimit >= 1) return null;
-  const executableShares = asks.filter((level) => level.price <= roundedLimit + tickSize * 1e-6).reduce((sum, level) => sum + level.size, 0);
-  const amountUsd = Math.max(1, Math.ceil((minimumShares * roundedLimit - 1e-9) * 100) / 100);
-  // The SDK expresses BUY market-order size in dollars and converts that to
-  // shares at the limit price. Check the rounded request, which can be slightly
-  // larger than the nominal venue minimum, against visible executable depth.
-  const requestedShares = sdkMarketBuyShares(amountUsd, roundedLimit, String(tickSize));
-  if (requestedShares + 1e-8 < minimumShares) return null;
-  if (executableShares + 1e-8 < requestedShares) return null;
-  const feeSchedule = market.feeSchedule ?? CONSERVATIVE_CRYPTO_FEE_SCHEDULE;
-  const worstFeeRate = asks.filter((level) => level.price <= roundedLimit + tickSize * 1e-6).reduce((worst, level) => {
-    const marketFee = feeSchedule.feesEnabled
-      ? feeSchedule.rate * Math.pow(level.price * (1 - level.price), feeSchedule.exponent)
-      : 0;
-    return Math.max(worst, RISK.feeRate, marketFee / roundedLimit);
-  }, RISK.feeRate);
-  const worstTotalCostUsd = Math.ceil((amountUsd * (1 + worstFeeRate) + 1e-9) * 100) / 100;
-  return { minimumShares, requestedShares, limitPrice: roundedLimit, amountUsd, worstTotalCostUsd };
+};
+
+const normalizeTradeStatus = (status: unknown) => String(status ?? "").toUpperCase().replace(/^TRADE_STATUS_/, "");
+
+/**
+ * One reconciliation pass for a SETTLING order: the CLOB order record, the
+ * status of each of its trades, open orders, and the wallet. A FAK remainder
+ * still reported open is cancelled.
+ */
+const reconcileJournalOrder = async (client: ClobClient, walletAddress: string, order: JournalOrder) => {
+  const [balance, openOrders, positions] = await Promise.all([readBalance(client), client.getOpenOrders(undefined, true), readPositions(walletAddress)]);
+  let matchedShares: number | null = null;
+  let tradeIds: string[] = order.tradeIds ?? [];
+  try {
+    const record = await client.getOrder(order.orderID!);
+    matchedShares = number(record?.size_matched);
+    if (Array.isArray(record?.associate_trades)) tradeIds = record.associate_trades.filter((id): id is string => typeof id === "string" && id.length > 0);
+  } catch { /* unreadable this pass; the decision waits */ }
+  let orderStillOpen = openOrders.some((open) => open.id === order.orderID);
+  const unrelatedOpen = openOrders.filter((open) => open.id !== order.orderID);
+  if (unrelatedOpen.length) return { decision: { kind: "HALT", reason: "An unrelated open order appeared while an order was settling." } as SettlementDecision, balance, positions, tradeIds };
+  if (orderStillOpen && Date.now() - order.submittedAt > 1_500) {
+    await client.cancelOrder({ orderID: order.orderID! }).catch(() => undefined);
+    orderStillOpen = (await client.getOpenOrders(undefined, true)).some((open) => open.id === order.orderID);
+  }
+  const trades: TradeObservation[] = [];
+  for (const id of tradeIds) {
+    try {
+      const rows = await client.getTrades({ id }, true);
+      const trade = rows.find((row) => row.id === id);
+      if (trade) trades.push({ id, status: normalizeTradeStatus(trade.status), size: number(trade.size) ?? 0 });
+    } catch { /* a missing trade keeps the decision waiting */ }
+  }
+  const walletShares = positions.find((position) => position.tokenID === order.tokenID)?.size ?? 0;
+  const decision = decideSettlement({ order, matchedShares, orderStillOpen, trades, walletShares, now: Date.now() });
+  return { decision, balance, positions, tradeIds };
 };
 
 const evaluateLiveOpportunity = (input: {
@@ -547,7 +612,10 @@ async function main() {
   const signatureInput = process.env.POLYMARKET_SIGNATURE_TYPE?.trim() || await ask("Signature type (0-3): ");
   const signatureType = Number(signatureInput);
   if (!Number.isInteger(signatureType) || signatureType < 0 || signatureType > 3) throw new Error("Choose one of the listed signature types.");
-  const privateKey = process.env.POLYMARKET_PRIVATE_KEY?.trim() || await askSecret("Signer private key (input hidden): ");
+  if (process.env.POLYMARKET_PRIVATE_KEY) {
+    console.log("POLYMARKET_PRIVATE_KEY is set in the environment and is ignored. Remove it from .env; the key is only accepted through the hidden prompt.");
+  }
+  const privateKey = await askSecret("Signer private key (input hidden): ");
   if (!/^(?:0x)?[a-fA-F0-9]{64}$/.test(privateKey)) throw new Error("The key must be exactly 32 bytes in hexadecimal format.");
 
   const unlock = await acquireLock();
@@ -557,7 +625,7 @@ async function main() {
   let stopSignalListener: (() => void) | undefined;
   try {
     const state = await readState();
-    if (state.pending) throw new Error("A previous live order outcome remains unresolved. Reconcile the wallet before restarting.");
+    if (state.pending) console.log(`Resuming reconciliation of ${state.pending.action} order ${state.pending.orderID}; no new orders until it settles.`);
     const account = privateKeyToAccount((privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as `0x${string}`);
     if (signatureType === SignatureTypeV2.EOA && account.address.toLowerCase() !== walletAddress.toLowerCase()) throw new Error("Signature type 0 requires the wallet address to match the private-key signer.");
     const signer = createWalletClient({ account, chain: polygon, transport: http() });
@@ -575,20 +643,34 @@ async function main() {
     console.log(`Available USDC: ${money(balance)}`);
     console.log(`Open positions: ${positions.length} · open orders: ${orders.length}`);
     if (positions.length) console.log(`Existing exposure: ${money(positions.reduce((sum, position) => sum + position.exposureUsd, 0))}`);
-    if (orders.length) throw new Error("Open orders exist. Reconcile or cancel them in Polymarket, then restart the terminal trader.");
-    if (liveEquity(balance, positions) < LIVE_MINIMUM_EQUITY_USD) throw new Error("Liquidation equity is below the $10 live-entry floor.");
-    if (balance < 1) throw new Error("Available USDC is below the $1 minimum executable stake.");
+    if (orders.some((order) => order.id !== state.pending?.orderID)) throw new Error("Open orders exist. Reconcile or cancel them in Polymarket, then restart the terminal trader.");
+    if (!state.pending) await refreshPositionBooks(positions, new Set());
+    const notice = redemptionNotice(positions);
+    if (notice) console.log(notice);
+    if (!state.pending) assertEntryEligible(balance, positions);
+    const calibrationPath = process.env.POLYMARKET_CALIBRATION_FILE?.trim() || join(process.cwd(), "var", "model-calibration.json");
+    const calibration = await loadCalibrationFile(calibrationPath);
+    console.log(calibration.active
+      ? `Model weight: fitted stacking calibration from ${calibration.active.markets} settled markets (model coefficient ${calibration.active.modelCoefficient.toFixed(2)}, lower bound ${calibration.active.modelCoefficientLower.toFixed(2)}).`
+      : `Model weight: conservative prior (${calibration.reason}). Entries need a large model/market disagreement, so expect few or none until \`pnpm run calibrate\` fits weights from at least 300 settled markets.`);
 
-    updateRiskBaselines(state, liveEquity(balance, positions), Date.now());
-    state.closedTrades = await readClosedTrades(walletAddress, Date.now());
-    state.closedTradesAt = Date.now();
+    if (!state.pending) {
+      updateRiskBaselines(state, liveEquity(balance, positions), Date.now());
+      state.closedTrades = await readClosedTrades(walletAddress, Date.now());
+      state.closedTradesAt = Date.now();
+    }
     await writeState(state);
 
-    console.log("\nLive guardrails: full market-specific model and bankroll filters · ENTRY or LOCK signals · tier-adjusted edge floor (never below 4% net) · five-share order minimum · FAK execution (partial fills reconciled) · 5% fee estimate · 25 bps slippage.");
+    console.log(`\nLive guardrails: full market-specific model and bankroll filters · ${RISK.requireLock ? "LOCK signals only" : "ENTRY or LOCK signals"} · tier-adjusted edge floor (never below 4% net) · five-share order minimum · FAK execution reconciled against the CLOB order record · each market's CLOB fee schedule · limit up to ${LIVE_LIMIT_TOLERANCE_TICKS} ticks past the observed price, never above the model ceiling.`);
     console.log("Live entries require at least $10 liquidation equity. A partial FAK fill below five shares will be tracked but held to settlement because it may be below the venue's exit minimum.");
     console.log("For balances up to $100, an entry may use up to 15% of equity to meet the five-share minimum, with a $5 per-order cap and 15% position, daily-loss, and drawdown limits. Larger balances keep their tier limits.");
-    const enableModelExits = (await ask("Enable automatic cashouts, 20% net take-profit, and 20% net stop-loss for positions opened by this trader? Type YES to enable, or press Enter to hold to settlement: ")).toUpperCase() === "YES";
-    console.log(enableModelExits ? "Model-aware cashouts, a 20% net take-profit, and a 20% net stop-loss are enabled for positions opened by this trader; all other wallet positions remain unmanaged." : "Automatic cashouts and stop-losses are off; the trader will hold its entries to market settlement unless you manage them manually.");
+    const enableModelExits = (await ask("Enable model-aware cashouts for positions opened by this trader? Type YES to enable, or press Enter to hold to settlement: ")).toUpperCase() === "YES";
+    if (enableModelExits) {
+      fixedExitThresholdsEnabled = (await ask("Also enable a 20% net take-profit and stop-loss? They still only sell when the model does not value holding above the sale. Type YES, or press Enter to skip: ")).toUpperCase() === "YES";
+    }
+    console.log(enableModelExits
+      ? `Model-aware cashouts are enabled${fixedExitThresholdsEnabled ? " with a model-checked 20% take-profit and stop-loss" : ""} for positions opened by this trader; all other wallet positions remain unmanaged.`
+      : "Automatic cashouts are off; the trader will hold its entries to market settlement unless you manage them manually.");
     const answer = await ask("Type YES to arm live trading: ");
     if (answer.toUpperCase() !== "YES") {
       console.log("Not armed. No order was placed.");
@@ -618,11 +700,142 @@ async function main() {
     let lastKnownPositions = positions;
     let lastStateWriteAt = Date.now();
     let lastPortfolioRefreshAt = Date.now();
+    let lastClockSyncAt = Date.now();
+    let lastRedemptionNoticeAt = Date.now();
+    let lastSettlementLogAt = 0;
+
+    /** Apply a settled order to the trader's own bookkeeping. */
+    const finalizeOrder = async (order: JournalOrder, filledShares: number, positions: PositionRow[], balanceNow: number | null) => {
+      const now = Date.now();
+      if (order.action === "BUY") {
+        if (filledShares > 0) {
+          state.attemptedMarkets = [...state.attemptedMarkets, order.marketId].slice(-300);
+          if (!state.managedPositionTokens.includes(order.tokenID)) state.managedPositionTokens = [...state.managedPositionTokens, order.tokenID].slice(-100);
+          state.managedPositionSince[order.tokenID] = now;
+          delete state.retryAfter[order.marketId];
+        } else {
+          state.retryAfter[order.marketId] = now + RETRY_NO_FILL_MS;
+        }
+      } else {
+        delete state.exitConfirmations[order.tokenID];
+        if (filledShares <= 0) state.retryAfter[`exit:${order.tokenID}`] = now + RETRY_NO_FILL_MS;
+        const residual = positions.find((position) => position.tokenID === order.tokenID);
+        if (!residual || residual.size < LIVE_MINIMUM_SHARES) {
+          state.managedPositionTokens = state.managedPositionTokens.filter((entry) => entry !== order.tokenID);
+          delete state.managedPositionSince[order.tokenID];
+        }
+      }
+      state.pending = null;
+      if (balanceNow !== null) {
+        lastKnownBalance = balanceNow;
+        lastKnownPositions = positions;
+        lastPortfolioRefreshAt = now;
+        updateRiskBaselines(state, liveEquity(balanceNow, positions), now);
+      }
+      await writeState(state);
+      lastStateWriteAt = now;
+      const partial = filledShares > 0 && filledShares + 0.005 < order.requestedShares;
+      console.log(`[${new Date().toLocaleTimeString()}] ${order.action} settled · ${filledShares > 0 ? `${filledShares.toFixed(4)} shares confirmed on-chain${partial ? ` of ${order.requestedShares.toFixed(4)} requested` : ""}` : "no fill"}${balanceNow !== null ? ` · USDC ${money(balanceNow)}` : ""}.`);
+      if (order.action === "BUY" && filledShares > 0 && filledShares + 1e-6 < LIVE_MINIMUM_SHARES) {
+        console.log("The confirmed fill is below five shares; it is tracked and held to settlement because the venue minimum prevents a sell.");
+      }
+    };
+
+    /** One settlement pass for the pending order. */
+    const settlePendingOrder = async (): Promise<"SETTLED" | "WAIT" | "HALT"> => {
+      const order = state.pending!;
+      try {
+        const result = await reconcileJournalOrder(client, walletAddress, order);
+        if (result.tradeIds.length && JSON.stringify(result.tradeIds) !== JSON.stringify(order.tradeIds ?? [])) {
+          state.pending = { ...order, tradeIds: result.tradeIds };
+          await writeState(state);
+        }
+        if (result.decision.kind === "SETTLED") {
+          await finalizeOrder(order, result.decision.filledShares, result.positions, result.balance);
+          if (result.decision.failedShares > 0) console.log(`${result.decision.failedShares.toFixed(4)} matched shares FAILED on-chain and were not filled.`);
+          return "SETTLED";
+        }
+        if (result.decision.kind === "HALT") {
+          console.error(`Order ${order.orderID} could not be reconciled: ${result.decision.reason}`);
+          console.error(`The trader halted with the order still recorded in ${STATE_PATH}. Reconcile Polymarket before restarting.`);
+          return "HALT";
+        }
+        if (Date.now() - lastSettlementLogAt >= 15_000) {
+          lastSettlementLogAt = Date.now();
+          console.log(`[${new Date().toLocaleTimeString()}] ${order.action} order ${order.orderID} settling: ${result.decision.reason} New orders are held.`);
+        }
+        return "WAIT";
+      } catch (error) {
+        console.log(`[${new Date().toLocaleTimeString()}] Settlement check held: ${scrubError(error, privateKey)}`);
+        if (settlementTimedOut(order, Date.now())) {
+          console.error(`Order ${order.orderID} has not reconciled within 10 minutes. The pending marker remains in ${STATE_PATH}; check Polymarket before restarting.`);
+          return "HALT";
+        }
+        return "WAIT";
+      }
+    };
+
+    /**
+     * Record the CLOB response for a submitted order. With an order ID it
+     * becomes SETTLING and is reconciled until final; an explicit rejection
+     * without an ID is a no-fill once the wallet confirms nothing moved.
+     */
+    const afterSubmission = async (response: { success?: boolean; orderID?: string; errorMsg?: string } | undefined): Promise<"SETTLED" | "WAIT" | "HALT"> => {
+      const order = state.pending!;
+      if (!response?.orderID) {
+        if (response && response.success === false) {
+          const [afterOrders, afterPositions] = await Promise.all([client.getOpenOrders(undefined, true), readPositions(walletAddress)]);
+          const walletShares = afterPositions.find((position) => position.tokenID === order.tokenID)?.size ?? 0;
+          if (!afterOrders.length && Math.abs(walletShares - order.baselineShares) <= 0.01) {
+            console.log(`[${new Date().toLocaleTimeString()}] Order rejected by the CLOB${response.errorMsg ? `: ${response.errorMsg}` : ""}.`);
+            await finalizeOrder(order, 0, afterPositions, await readBalance(client));
+            return "SETTLED";
+          }
+        }
+        console.error("Order outcome UNCERTAIN: the CLOB returned no order ID.");
+        console.error(`The trader halted with a pending marker. Check wallet positions, open orders, and activity before restart: ${STATE_PATH}`);
+        return "HALT";
+      }
+      state.pending = { ...order, phase: "SETTLING", orderID: response.orderID };
+      await writeState(state);
+      const fastPathUntil = Date.now() + RECONCILE_WAIT_MS;
+      while (Date.now() < fastPathUntil) {
+        const outcome = await settlePendingOrder();
+        if (outcome !== "WAIT") return outcome;
+        await sleep(750);
+      }
+      return "WAIT";
+    };
 
     while (!controller.signal.aborted) {
+      if (Date.now() - lastClockSyncAt >= CLOCK_RESYNC_MS) {
+        lastClockSyncAt = Date.now();
+        await syncPolymarketClock(controller.signal).catch(() => undefined);
+      }
+      if (Date.now() - lastRedemptionNoticeAt >= 15 * 60_000) {
+        lastRedemptionNoticeAt = Date.now();
+        const notice = redemptionNotice(lastKnownPositions);
+        if (notice) console.log(`[${new Date().toLocaleTimeString()}] ${notice}`);
+      }
       if (state.pending) {
-        console.error(`Trader halted with unresolved ${state.pending.action} order ${state.pending.requestId}; reconcile the wallet before continuing.`);
-        return;
+        if (state.pending.phase !== "SETTLING") {
+          console.error(`Trader halted with unresolved ${state.pending.action} order ${state.pending.requestId}; reconcile the wallet before continuing.`);
+          return;
+        }
+        // No new entries or exits while an order is settling: its outcome is
+        // part of the exposure every other decision depends on.
+        const outcome = await settlePendingOrder();
+        if (outcome === "HALT") return;
+        if (outcome === "SETTLED") {
+          try {
+            assertEntryEligible(lastKnownBalance, lastKnownPositions);
+          } catch (error) {
+            console.log(`Order reconciled; live entry remains disarmed: ${scrubError(error, privateKey)}`);
+            return;
+          }
+        }
+        await sleep(outcome === "SETTLED" ? SCAN_MS : 2_000);
+        continue;
       }
       let now = Date.now();
       for (const [marketKey, retryAt] of Object.entries(state.retryAfter)) if (retryAt <= now) delete state.retryAfter[marketKey];
@@ -659,7 +872,14 @@ async function main() {
         }
       }
       cycle += 1;
-      const tokenIds = definitions.flatMap((market) => [market.upTokenId, market.downTokenId]);
+      // Only markets that are trading now (or about to) need books every
+      // second; Gamma's two-hour discovery window would otherwise multiply the
+      // request load for no decision value.
+      const serverNow = synchronizedPolymarketTime(now);
+      const heldTokens = new Set(openPositions(lastKnownPositions).flatMap((position) => position.tokenID ? [position.tokenID] : []));
+      const tokenIds = definitions.filter((market) => (market.startTime === null || market.startTime <= serverNow + 5_000) && market.endTime > serverNow
+        || heldTokens.has(market.upTokenId) || heldTokens.has(market.downTokenId))
+        .flatMap((market) => [market.upTokenId, market.downTokenId]);
       if (!definitions.length || !tokenIds.length) {
         if (cycle % 10 === 0) console.log(`[${new Date().toLocaleTimeString()}] No active supported crypto market.`);
         await sleep(SCAN_MS);
@@ -690,11 +910,16 @@ async function main() {
           const market = applyPolymarketPriceTicks(buildLiveMarket(definition, books, new Map(), null, now, histories.get(definition.asset) ?? null), ticks, now);
           currentMarkets.set(market.id, market);
         }
-        if (enableModelExits && now - lastPortfolioRefreshAt >= 2_000) {
+        rememberPositionBooks(lastKnownPositions, currentMarkets.values());
+        // Wallet, marks and risk baselines refresh on a fixed schedule whether
+        // or not exits are enabled, so peaks and losses are never missed.
+        if (now - lastPortfolioRefreshAt >= PORTFOLIO_REFRESH_MS) {
           const [refreshedBalance, refreshedPositions] = await Promise.all([readBalance(client), readPositions(walletAddress)]);
-          if (refreshedBalance === null) throw new Error("The wallet balance could not be refreshed for live position management.");
+          if (refreshedBalance === null) throw new Error("The wallet balance could not be refreshed.");
           lastKnownBalance = refreshedBalance;
           lastKnownPositions = refreshedPositions;
+          rememberPositionBooks(refreshedPositions, currentMarkets.values());
+          await refreshPositionBooks(refreshedPositions, new Set([...currentMarkets.values()].flatMap((market) => [market.upTokenId, market.downTokenId])));
           updateRiskBaselines(state, liveEquity(refreshedBalance, refreshedPositions), now);
           lastPortfolioRefreshAt = now;
           await writeState(state);
@@ -773,11 +998,18 @@ async function main() {
             if (!(new Set(["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"])).has(tickSize)) throw new Error("Unsupported CLOB tick size; no exit order submitted.");
             const receivedAt = Date.now();
             const executionMarket = withFreshExecutionBook(confirmedExit.market, tokenID, marketBook, receivedAt);
+            // Judge the freshly read position and market, not the earlier snapshot:
+            // a market that has just resolved can no longer be sold.
+            if (freshPosition.settled || executionMarket.endTime <= synchronizedPolymarketTime(receivedAt) + 5_000) {
+              delete state.exitConfirmations[tokenID];
+              await sleep(SCAN_MS);
+              continue;
+            }
             const freshIssue = liveExitBookIssue(executionMarket, tokenID, receivedAt);
             const liveEquityUsd = liveEquity(freshBalance, freshPositions);
             const finalExit = freshIssue ? null : evaluateLiveHoldExit(executionMarket, freshPosition, confirmedExit.side, receivedAt, liveEquityUsd);
             const sellQuote = finalExit && finalExit.evaluation.shouldExit
-              ? liveSellQuote(executionMarket, confirmedExit.side, finalExit.executableShares, Number(tickSize), receivedAt) : null;
+              ? liveSellQuote(executionMarket, confirmedExit.side, finalExit.executableShares, tickSize, receivedAt) : null;
             const sellShares = sellQuote?.shares ?? 0;
             if (!finalExit?.evaluation.shouldExit || !sellQuote) {
               delete state.exitConfirmations[tokenID];
@@ -789,9 +1021,10 @@ async function main() {
               continue;
             }
             const marketKey = marketCycleKey(confirmedExit.market);
-            state.pending = { requestId: randomUUID(), marketId: marketKey, at: Date.now(), action: "SELL", tokenID, shares: sellShares };
+            state.pending = { requestId: randomUUID(), marketId: marketKey, tokenID, action: "SELL", requestedShares: sellShares,
+              limitPrice: sellQuote.limitPrice, reservedUsd: 0, baselineShares: freshPosition.size, phase: "SUBMITTING", submittedAt: Date.now() };
             await writeState(state);
-            console.log(`[${new Date().toLocaleTimeString()}] SELL ${confirmedExit.market.asset} ${confirmedExit.market.duration} ${confirmedExit.side} · ${sellShares.toFixed(2)} shares · model exit: ${finalExit.evaluation.reason} · limit ${percent(sellQuote.limitPrice)} · FAK`);
+            console.log(`[${new Date().toLocaleTimeString()}] SELL ${confirmedExit.market.asset} ${confirmedExit.market.duration} ${confirmedExit.side} · ${sellShares.toFixed(2)} shares · model exit: ${finalExit.evaluation.reason} · limit ${percent(sellQuote.limitPrice)} (worst proceeds ${money(sellQuote.worstProceedsUsd)}) · FAK`);
             let response;
             try {
               response = await client.createAndPostMarketOrder({ tokenID, amount: sellShares, side: Side.SELL, price: sellQuote.limitPrice, orderType: OrderType.FAK },
@@ -801,63 +1034,10 @@ async function main() {
               console.error(`The trader halted with a pending marker. Check wallet positions, open orders, and activity before restart: ${STATE_PATH}`);
               return;
             }
-            try {
-              let [afterBalance, afterOrders, afterPositions] = await Promise.all([readBalance(client), client.getOpenOrders(undefined, true), readPositions(walletAddress)]);
-              let canceledFakRemainder = false;
-              if (afterOrders.length) {
-                const orderStillOpen = Boolean(response.orderID) && afterOrders.some((order) => order.id === response.orderID);
-                if (!orderStillOpen) throw new Error("An unrelated order appeared during FAK exit reconciliation.");
-                await client.cancelOrder({ orderID: response.orderID });
-                await sleep(250);
-                [afterBalance, afterOrders, afterPositions] = await Promise.all([readBalance(client), client.getOpenOrders(undefined, true), readPositions(walletAddress)]);
-                if (afterOrders.length) throw new Error("The CLOB did not confirm cancellation of the FAK exit remainder.");
-                canceledFakRemainder = true;
-                console.log("Canceled the FAK exit remainder that the CLOB still reported as open.");
-              }
-              const startingSize = freshPosition.size;
-              let soldShares = Math.max(0, startingSize - (afterPositions.find((position) => position.tokenID === tokenID)?.size ?? 0));
-              for (let attempt = 0; attempt < 4 && soldShares + 0.005 < sellShares; attempt += 1) {
-                await sleep(500);
-                [afterBalance, afterOrders, afterPositions] = await Promise.all([readBalance(client), client.getOpenOrders(undefined, true), readPositions(walletAddress)]);
-                soldShares = Math.max(0, startingSize - (afterPositions.find((position) => position.tokenID === tokenID)?.size ?? 0));
-              }
-              if (afterBalance === null) throw new Error("Exit balance recheck returned no value.");
-              const exitFill = reconcileFakSellFill({ requestedShares: sellShares, walletSharesSold: soldShares,
-                accepted: response.success && !canceledFakRemainder });
-              if (exitFill.status === "UNCERTAIN") throw new Error("The FAK SELL response and wallet position do not prove a safe fill result.");
-              if (exitFill.status === "NO_FILL") {
-                state.pending = null;
-                state.retryAfter[`exit:${tokenID}`] = Date.now() + RETRY_NO_FILL_MS;
-                delete state.exitConfirmations[tokenID];
-                await writeState(state);
-                console.log(`[${new Date().toLocaleTimeString()}] Exit FAK did not fill; the model may retry after ${Math.ceil(RETRY_NO_FILL_MS / 1_000)} seconds.`);
-              } else {
-                state.pending = null;
-                delete state.exitConfirmations[tokenID];
-                const residual = afterPositions.find((position) => position.tokenID === tokenID);
-                if (!residual || residual.size < LIVE_MINIMUM_SHARES) {
-                  state.managedPositionTokens = state.managedPositionTokens.filter((entry) => entry !== tokenID);
-                  delete state.managedPositionSince[tokenID];
-                }
-                await writeState(state);
-                console.log(`[${new Date().toLocaleTimeString()}] Exit reconciled · sold ${soldShares.toFixed(2)} shares${soldShares + 0.005 < sellShares ? ` of ${sellShares.toFixed(2)} requested` : ""} · residual ${residual?.size.toFixed(4) ?? "0"} · USDC ${money(afterBalance)}.`);
-                if (residual && residual.size > 0 && residual.size < LIVE_MINIMUM_SHARES) {
-                  console.log("Residual position is below five shares and will be held to settlement because the venue minimum prevents another sell order.");
-                }
-              }
-              lastKnownBalance = afterBalance;
-              lastKnownPositions = afterPositions;
-              lastPortfolioRefreshAt = Date.now();
-              updateRiskBaselines(state, liveEquity(afterBalance, afterPositions), Date.now());
-              await writeState(state);
-              lastStateWriteAt = Date.now();
-              await sleep(SCAN_MS);
-              continue;
-            } catch (error) {
-              console.error(`Exit result could not be reconciled: ${scrubError(error, privateKey)}`);
-              console.error(`The trader halted and left a pending marker. Reconcile Polymarket before restarting: ${STATE_PATH}`);
-              return;
-            }
+            const exitOutcome = await afterSubmission(response);
+            if (exitOutcome === "HALT") return;
+            await sleep(SCAN_MS);
+            continue;
           }
         }
         const candidates: Array<{ market: LiveMarket; opportunity: PaperOpportunity }> = [];
@@ -880,6 +1060,7 @@ async function main() {
             positions: lastKnownPositions, state, now });
           if (!opportunity.approved) { recordBlock(opportunity.reason); continue; }
           if (opportunity.signal.action === "PASS" || opportunity.signal.tier === "PASS"
+            || (RISK.requireLock && opportunity.signal.tier !== "LOCK")
             || opportunity.signal.edge === null || opportunity.signal.edge < RISK.minEdge) {
             recordBlock(opportunity.signal.reason); continue;
           }
@@ -912,7 +1093,7 @@ async function main() {
         updateRiskBaselines(state, freshEquity, Date.now());
         if (Date.now() - lastStateWriteAt >= 30_000) { await writeState(state); lastStateWriteAt = Date.now(); }
         const currentMarketKey = marketCycleKey(best.market);
-        const activeMarketPosition = freshPositions.find((position) => position.tokenID === best.market.upTokenId || position.tokenID === best.market.downTokenId || (best.market.conditionId && position.conditionId?.toLowerCase() === best.market.conditionId.toLowerCase()) || position.slug?.toLowerCase() === best.market.slug.toLowerCase());
+        const activeMarketPosition = openPositions(freshPositions).find((position) => position.tokenID === best.market.upTokenId || position.tokenID === best.market.downTokenId || (best.market.conditionId && position.conditionId?.toLowerCase() === best.market.conditionId.toLowerCase()) || position.slug?.toLowerCase() === best.market.slug.toLowerCase());
         if (activeMarketPosition) {
           console.log(`[${new Date().toLocaleTimeString()}] ${best.market.asset} ${best.market.duration} held: a position already exists in this market.`);
           await sleep(SCAN_MS);
@@ -939,6 +1120,7 @@ async function main() {
         const finalOpportunity = evaluateLiveOpportunity({ market: executionMarket, markets: executionMarkets,
           balance: freshBalance, positions: freshPositions, state, now: bookReceivedAt });
         if (!finalOpportunity.approved || finalOpportunity.signal.action !== side || finalOpportunity.signal.tier === "PASS"
+          || (RISK.requireLock && finalOpportunity.signal.tier !== "LOCK")
           || finalOpportunity.signal.edge === null || finalOpportunity.signal.edge < RISK.minEdge || !finalOpportunity.sizing) {
           console.log(`[${new Date().toLocaleTimeString()}] ${best.market.asset} held after model recheck: ${finalOpportunity.reason}`);
           await sleep(SCAN_MS);
@@ -947,15 +1129,15 @@ async function main() {
         const fairUp = finalOpportunity.signal.fairUp;
         const fairProbability = fairUp === null ? null : side === "UP" ? fairUp : 1 - fairUp;
         if (fairProbability === null) throw new Error("The final model probability is unavailable.");
-        const orderQuote = minimumShareOrder(executionMarket, side, Number(tickSize), fairProbability);
+        const orderQuote = minimumShareOrder(executionMarket, side, tickSize, fairProbability);
         if (!orderQuote) {
-          console.log(`[${new Date().toLocaleTimeString()}] ${best.market.asset} ${side} held: the fresh book cannot fill ${LIVE_MINIMUM_SHARES} shares inside the model and 25 bps price limits.`);
+          console.log(`[${new Date().toLocaleTimeString()}] ${best.market.asset} ${side} held: the fresh book cannot fill ${LIVE_MINIMUM_SHARES} shares at or below the model's price ceiling.`);
           await sleep(SCAN_MS);
           continue;
         }
         const freshProfile = liveProfileFor(freshEquity, best.market.duration);
         const perEntryCap = Math.min(RISK.maxTradeUsd, freshBalance * freshProfile.maxStakePct, freshEquity * freshProfile.maxStakePct);
-        const totalExposure = freshPositions.reduce((sum, position) => sum + position.exposureUsd, 0);
+        const totalExposure = openExposureUsd(freshPositions);
         const totalExposureCap = freshEquity * freshProfile.maxExposurePct;
         if (orderQuote.worstTotalCostUsd > perEntryCap + 1e-8 || orderQuote.worstTotalCostUsd > finalOpportunity.sizing.stakeUsd + 0.01) {
           console.log(`[${new Date().toLocaleTimeString()}] ${best.market.asset} ${side} held: a ${orderQuote.minimumShares}-share FAK would cost up to ${money(orderQuote.worstTotalCostUsd)}, above the approved live size ${money(Math.min(perEntryCap, finalOpportunity.sizing.stakeUsd))}.`);
@@ -967,8 +1149,9 @@ async function main() {
           await sleep(SCAN_MS);
           continue;
         }
-        const requestId = randomUUID();
-        state.pending = { requestId, marketId: currentMarketKey, at: Date.now(), action: "BUY", tokenID, shares: orderQuote.requestedShares };
+        state.pending = { requestId: randomUUID(), marketId: currentMarketKey, tokenID, action: "BUY", requestedShares: orderQuote.requestedShares,
+          limitPrice: orderQuote.limitPrice, reservedUsd: orderQuote.worstTotalCostUsd,
+          baselineShares: freshPositions.find((position) => position.tokenID === tokenID)?.size ?? 0, phase: "SUBMITTING", submittedAt: Date.now() };
         delete state.retryAfter[currentMarketKey];
         await writeState(state);
         console.log(`[${new Date().toLocaleTimeString()}] SUBMIT ${best.market.asset} ${best.market.duration} ${side} · ${orderQuote.requestedShares.toFixed(4)} shares requested (minimum ${orderQuote.minimumShares}) · ${money(orderQuote.amountUsd)} order amount · up to ${money(orderQuote.worstTotalCostUsd)} incl. fees · net edge ${percent(finalOpportunity.signal.edge)} · limit ${percent(orderQuote.limitPrice)} · FAK`);
@@ -980,66 +1163,8 @@ async function main() {
           console.error(`The trader has halted. Check positions, open orders, and activity before removing the pending marker in ${STATE_PATH}.`);
           return;
         }
-        try {
-          let [afterBalance, afterOrders, afterPositions] = await Promise.all([readBalance(client), client.getOpenOrders(undefined, true), readPositions(walletAddress)]);
-          let canceledFakRemainder = false;
-          if (afterOrders.length) {
-            const orderStillOpen = Boolean(response.orderID) && afterOrders.some((order) => order.id === response.orderID);
-            if (!orderStillOpen) throw new Error("An unrelated order appeared during FAK entry reconciliation.");
-            await client.cancelOrder({ orderID: response.orderID });
-            await sleep(250);
-            [afterBalance, afterOrders, afterPositions] = await Promise.all([readBalance(client), client.getOpenOrders(undefined, true), readPositions(walletAddress)]);
-            if (afterOrders.length) throw new Error("The CLOB did not confirm cancellation of the FAK entry remainder.");
-            canceledFakRemainder = true;
-            console.log("Canceled the FAK entry remainder that the CLOB still reported as open.");
-          }
-          const previousSize = freshPositions.find((position) => position.tokenID === tokenID)?.size ?? 0;
-          let positionDelta = Math.max(0, (afterPositions.find((position) => position.tokenID === tokenID)?.size ?? 0) - previousSize);
-          if (positionDelta <= 1e-6) {
-            for (let attempt = 0; attempt < 4 && positionDelta <= 1e-6; attempt += 1) {
-              await sleep(500);
-              [afterBalance, afterOrders, afterPositions] = await Promise.all([readBalance(client), client.getOpenOrders(undefined, true), readPositions(walletAddress)]);
-              positionDelta = Math.max(0, (afterPositions.find((position) => position.tokenID === tokenID)?.size ?? 0) - previousSize);
-              if (positionDelta > 1e-6) break;
-            }
-          }
-          if (afterBalance === null) throw new Error("Balance recheck returned no value.");
-          const newPosition = afterPositions.find((position) => position.tokenID === tokenID);
-          const responseShares = number(response.takingAmount) ?? 0;
-          const entryFill = reconcileFakBuyFill({ requestedShares: orderQuote.requestedShares, walletPositionDelta: positionDelta,
-            responseShares, accepted: response.success && !canceledFakRemainder });
-          if (entryFill.status === "UNCERTAIN") throw new Error("The FAK response quantity and reconciled wallet position do not prove a safe fill result.");
-          const filledShares = entryFill.filledShares;
-          console.log(`Order response: ${response.success ? "accepted" : "rejected"} · status ${response.status ?? "—"} · filled ${filledShares.toFixed(4)} shares · amount ${response.makingAmount ?? "—"}`);
-          console.log(`Reconciled USDC ${money(afterBalance)} · positions ${afterPositions.length} · open orders ${afterOrders.length}${newPosition ? ` · ${side} position ${newPosition.size.toFixed(4)} shares` : ""}`);
-          if (entryFill.status === "FULL" || entryFill.status === "PARTIAL") {
-            state.pending = null;
-            state.attemptedMarkets.push(currentMarketKey);
-            state.attemptedMarkets = state.attemptedMarkets.slice(-300);
-            if (!state.managedPositionTokens.includes(tokenID)) state.managedPositionTokens.push(tokenID);
-            state.managedPositionSince[tokenID] = Date.now();
-            state.managedPositionTokens = state.managedPositionTokens.slice(-100);
-            delete state.retryAfter[currentMarketKey];
-            if (filledShares + 1e-6 < orderQuote.minimumShares) {
-              console.log("Partial FAK fill is below five shares; it is tracked as a position and will be held to settlement.");
-            } else if (filledShares + 1e-6 < orderQuote.requestedShares) {
-              console.log(`[${new Date().toLocaleTimeString()}] FAK partial fill · ${filledShares.toFixed(4)} of ${orderQuote.requestedShares.toFixed(4)} requested shares; the unfilled remainder was canceled.`);
-            }
-          } else {
-            state.pending = null;
-            state.retryAfter[currentMarketKey] = Date.now() + RETRY_NO_FILL_MS;
-            console.log(`[${new Date().toLocaleTimeString()}] FAK did not fill; this market can retry after ${Math.ceil(RETRY_NO_FILL_MS / 1_000)} seconds if the model still qualifies.`);
-          }
-          lastKnownBalance = afterBalance;
-          lastKnownPositions = afterPositions;
-          updateRiskBaselines(state, liveEquity(afterBalance, afterPositions), Date.now());
-          await writeState(state);
-          lastStateWriteAt = Date.now();
-        } catch (error) {
-          console.error(`Order result could not be reconciled: ${scrubError(error, privateKey)}`);
-          console.error(`The trader has halted and left a pending marker. Reconcile Polymarket before restarting: ${STATE_PATH}`);
-          return;
-        }
+        const entryOutcome = await afterSubmission(response);
+        if (entryOutcome === "HALT") return;
       } catch (error) {
         console.log(`[${new Date().toLocaleTimeString()}] Scan held safely: ${scrubError(error, privateKey)}`);
       }

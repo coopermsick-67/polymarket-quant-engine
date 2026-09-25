@@ -1,25 +1,22 @@
 # Strategy notes
 
-The live paper-entry signal uses a chart filter followed by an execution-cost filter:
+## Forecast
 
-    chart direction = EMA trend + recent log returns + RSI + candle bodies + relative volume
-    confluence      = target-duration trend agrees with the other timeframe
-    fair probability = normal-CDF estimate from spot/reference distance and recent realized volatility,
-                       adjusted modestly by the combined chart score
-    net edge         = fair probability - depth-walked ask including configured fees and slippage
+Crypto Up/Down markets settle on whether the 60-second Chainlink TWAP at expiry is at or above the TWAP at the start (the price to beat). The forecast starts from Chainlink spot, because the TWAP lags spot by about half its window:
 
-Coinbase 5m and 15m OHLC history is cached for one minute and the active candles are updated from the Coinbase ticker stream. Both charts need at least 24 complete candles. When Gamma does not provide the market opening reference, the matching Coinbase 5m candle open is labeled as an estimate; it is only a proxy because these markets resolve against Chainlink. Estimated references require extra edge, lose confidence, and can never receive a LOCK tier. Missing or stale history, missing references, conflicting trends, weak model confidence, wide books, and insufficient net edge all produce PASS. A LOCK requires stricter confidence, edge, and two-timeframe thresholds; it is not a promise of a winning trade.
+- **More than 60 s left:** the whole averaging window is in the future. The average of a Brownian path over it has variance σ²(τ − 40) around current spot.
+- **60 s or less left:** the observed part of the window is locked in, averaged from spot ticks. Each tick is held for at most 3 s, and at least 80% of the elapsed window must be covered. The future part adds variance σ²·spot²·τ³/3.
 
-The UI exposes components that should be learned and validated from timestamped historical or recorded paper data:
+σ and a small drift come from the market's own horizon candles.
 
-- distance from the market reference price;
-- remaining time and realized short-horizon volatility;
-- momentum and acceleration;
-- market-book imbalance and microprice;
-- quote velocity and liquidity;
-- cross-duration context;
-- execution quality and stale-data risk.
+## From forecast to edge
 
-The current CSV backtest does not include OHLC indicators, so its metrics do not measure the live chart-signal algorithm.
+- **Anchoring:** the raw forecast is combined with the book mid in log-odds. `pnpm run calibrate` fits `logit P = a + b_model·logit(model) + b_market·logit(mid)` on settled observations of the current model version. Until a fit passes every gate (300+ markets, a positive time-block lower bound on `b_model`, and beating the book on the most recent 30% of markets), a conservative prior gives the model a quarter of the weight.
+- **Edge:** the anchored probability minus the depth-walked ask, including each market's CLOB taker fee (`rate × p × (1 − p)`) and a slippage buffer.
+- **Gates:** freshness, a model/market gap cap, the trend filter, price and spread limits, the net-edge floor, and the bankroll tier gates.
 
-Do not promote a strategy to live based on a small sample, in-sample tuning, headline win rate, or a single market regime. Require walk-forward or out-of-sample calibration, Brier/log-loss reporting, net-of-cost results, and a minimum sample size.
+## Evidence
+
+A better calibration fit shows the model carries information. It is not a net-of-fee trading edge. The daemon records every usable market's decision, including PASS, with its fee schedule and model version. `pnpm run calibrate` reports the first recorded entry per settled market, comparing claimed edge with realized edge per share, with a time-block 95% interval. Only a positive lower bound there, over many markets and a pre-registered chronological cohort, supports going live.
+
+The CSV replay trades only rows with an explicit recorded decision and probability. It recomputes edge from the simulated fill and each row's fee rate, and settles at market expiry. Its drawdown is settlement-basis, not intramarket liquidation.
