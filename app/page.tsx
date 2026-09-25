@@ -1212,11 +1212,14 @@ export default function Home() {
           const currentPrice = mapped.side === "UP" ? mapped.market.upBid : mapped.market.downBid;
           const mappedFairUp = anchoredFairUp(mapped.market);
           const fairProbability = mappedFairUp === null ? null : mapped.side === "UP" ? mappedFairUp : 1 - mappedFairUp;
-          if (currentPrice === null || fairProbability === null) {
+          if (currentPrice === null) {
             liveExitObservations.current.delete(tokenID);
             continue;
           }
-          const evaluation = evaluateModelAwareExit({ policy: liveRisk, entryPrice: position.averagePrice, currentPrice, fairProbability, shares: position.size, feeRate: liveRisk.feeRate, remainingSeconds: mapped.market.remaining });
+          const evaluation = evaluateModelAwareExit({ policy: liveRisk, entryPrice: position.averagePrice, currentPrice,
+            fairProbability: fairProbability ?? 0.5,
+            modelDataAvailable: fairProbability !== null && marketDataFreshnessIssue(mapped.market, now) === null,
+            shares: position.size, feeRate: liveRisk.feeRate, remainingSeconds: mapped.market.remaining });
           if (!evaluation.shouldExit) {
             liveExitObservations.current.delete(tokenID);
             continue;

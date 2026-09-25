@@ -27,8 +27,8 @@ import { subscribePolymarketPrices, type PolymarketPriceStreamStatus } from "../
 import { analyzeMarketSignal, estimatePaperExitFill, marketDataFreshnessIssue, type ClosedPaperTrade, type PaperAccount, type PaperPosition } from "../app/lib/engines";
 import { enforceLiveExecutionRisk } from "../app/lib/live-risk";
 import { DEFAULT_LIVE_EARLY_EXIT, evaluatePaperHoldExit } from "../app/lib/early-exit";
-import { bankrollProfile, type BankrollProfile } from "../app/lib/bankroll-policy";
-import { liveBankrollProfile } from "../app/lib/live-bankroll-policy";
+import { bankrollProfile } from "../app/lib/bankroll-policy";
+import { liveBankrollProfile, type LiveBankrollProfile } from "../app/lib/live-bankroll-policy";
 import { reconcileFakBuyFill, reconcileFakSellFill } from "../app/lib/fak-fill-reconciliation";
 import { evaluatePaperMarket, type PaperOpportunity } from "../app/lib/paper-bankroll";
 import { sdkMarketBuyShares } from "../app/lib/live-order-sizing";
@@ -291,8 +291,22 @@ const updateRiskBaselines = (state: TraderState, equityUsd: number, now: number)
   }
 };
 
-const liveProfileFor = (equityUsd: number): BankrollProfile => {
-  return liveBankrollProfile(equityUsd, LIVE_MINIMUM_EQUITY_USD, LIVE_ENTRY_RISK_PCT);
+const liveProfileFor = (equityUsd: number, duration: "5m" | "15m"): LiveBankrollProfile => {
+  return liveBankrollProfile(equityUsd, LIVE_MINIMUM_EQUITY_USD, LIVE_ENTRY_RISK_PCT, duration);
+};
+
+const liveExitBookIssue = (market: LiveMarket, tokenID: string, now: number): string | null => {
+  const marketNow = synchronizedPolymarketTime(now);
+  if (market.priceFeed === "UNSUPPORTED" || !market.startTimeVerified || market.startTime === null
+    || market.startTime > marketNow + 1_000 || market.remaining < DEFAULT_LIVE_EARLY_EXIT.earlyExitStopLossMinRemainingSeconds) {
+    return "The market interval is not verified and active for an automatic exit.";
+  }
+  const sideBook = tokenID === market.upTokenId ? market.upBook : tokenID === market.downTokenId ? market.downBook : null;
+  if (!sideBook || sideBook.timestamp === null || sideBook.timestamp > marketNow + 30_000
+    || marketNow - sideBook.timestamp > 60_000 || !sideBook.bids.some((level) => level.price > 0 && level.price < 1 && level.size > 0)) {
+    return "The position has no fresh executable bid for an automatic exit.";
+  }
+  return null;
 };
 
 const liveExitPolicyFor = (equityUsd: number) => {
@@ -312,26 +326,37 @@ const evaluateLiveHoldExit = (market: LiveMarket, position: PositionRow, side: "
   const minimumShares = Math.max(LIVE_MINIMUM_SHARES,
     venueMinimum !== null && venueMinimum !== undefined && Number.isFinite(venueMinimum) && venueMinimum > 0 ? venueMinimum : 0);
   if (requestedShares < minimumShares) return null;
+  if (!sideBook?.bids.length) return null;
+  const bids = [...sideBook.bids].sort((left, right) => right.price - left.price);
+  const minimumPrice = bids[0].price * (1 - RISK.slippageBps / 10_000);
+  const executableBids = bids.filter((level) => level.price + 1e-8 >= minimumPrice);
+  const depthShares = executableBids.reduce((sum, level) => sum + level.size, 0);
+  const executableShares = Math.floor(Math.min(requestedShares, depthShares) * 100 + 1e-8) / 100;
+  if (executableShares < minimumShares) return null;
+  const executionBook = { ...sideBook, bids: executableBids };
+  const executionMarket = side === "UP" ? { ...market, upBook: executionBook } : { ...market, downBook: executionBook };
+  const fill = estimatePaperExitFill(executionMarket, side, executableShares, { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, now);
+  if (!fill || fill.shares + 1e-8 < executableShares) return null;
   const fairUp = anchoredFairUp(market);
-  if (fairUp === null) return null;
-  const fill = estimatePaperExitFill(market, side, requestedShares, { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, now);
-  if (!fill || fill.shares + 1e-8 < requestedShares) return null;
-  const fairProbability = side === "UP" ? fairUp : 1 - fairUp;
-  const modelRead = analyzeMarketSignal(market, { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, Math.max(1, position.exposureUsd), 0.04, now);
+  const fairProbability = fairUp === null ? 0.5 : side === "UP" ? fairUp : 1 - fairUp;
+  const modelDataAvailable = fairUp !== null && marketDataFreshnessIssue(market, now) === null;
+  const modelRead = !modelDataAvailable ? null : analyzeMarketSignal(market,
+    { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, Math.max(1, position.exposureUsd), 0.04, now);
   const opposite = side === "UP" ? "DOWN" : "UP";
-  const directionalReversal = modelRead.bias === opposite && (modelRead.biasConfidence ?? 0) >= 0.6 && fairProbability < 0.45;
+  const directionalReversal = modelRead?.bias === opposite && (modelRead.biasConfidence ?? 0) >= 0.6 && fairProbability < 0.45;
   const evaluation = evaluatePaperHoldExit({
     policy: liveExitPolicyFor(equityUsd),
     entryCostUsd: position.exposureUsd * (requestedShares / position.size),
     originalShares: requestedShares,
-    filledShares: requestedShares,
+    filledShares: executableShares,
     netExitProceedsUsd: fill.totalCost,
     sideFairProbability: fairProbability,
     remainingSeconds: market.remaining,
     directionalReversal,
     reversalMarginPct: bankrollProfile(equityUsd).tier === "MICRO" ? 0.005 : 0.01,
+    modelDataAvailable,
   });
-  return { evaluation, requestedShares, fairProbability, modelRead };
+  return { evaluation, requestedShares, executableShares, fairProbability, modelRead };
 };
 
 const liveSellQuote = (market: LiveMarket, side: "UP" | "DOWN", shares: number, tickSize: number, now: number) => {
@@ -345,11 +370,14 @@ const liveSellQuote = (market: LiveMarket, side: "UP" | "DOWN", shares: number, 
   const roundedLimit = Number((Math.ceil((minimumPrice - 1e-10) / tickSize) * tickSize).toFixed(Math.max(0, (String(tickSize).split(".")[1] ?? "").length)));
   if (!Number.isFinite(roundedLimit) || roundedLimit <= 0 || roundedLimit > bestBid + 1e-8 || roundedLimit >= 1) return null;
   const executableBids = bids.filter((level) => level.price + 1e-8 >= roundedLimit);
-  if (executableBids.reduce((sum, level) => sum + level.size, 0) + 1e-8 < shares) return null;
+  const executableShares = Math.floor(Math.min(shares, executableBids.reduce((sum, level) => sum + level.size, 0)) * 100 + 1e-8) / 100;
+  const minimumShares = Math.max(LIVE_MINIMUM_SHARES, sourceBook.minOrderSize ?? 0);
+  if (executableShares + 1e-8 < minimumShares) return null;
   const limitedBook = { ...sourceBook, bids: executableBids };
   const executionMarket = side === "UP" ? { ...market, upBook: limitedBook } : { ...market, downBook: limitedBook };
-  const estimatedFill = estimatePaperExitFill(executionMarket, side, shares, { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, now);
-  return estimatedFill && estimatedFill.shares + 1e-8 >= shares ? { limitPrice: roundedLimit, executionMarket, estimatedFill } : null;
+  const estimatedFill = estimatePaperExitFill(executionMarket, side, executableShares, { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, now);
+  return estimatedFill && estimatedFill.shares + 1e-8 >= executableShares
+    ? { shares: executableShares, limitPrice: roundedLimit, executionMarket, estimatedFill } : null;
 };
 
 const buildPaperAccount = (balance: number, rows: PositionRow[], markets: Map<string, LiveMarket>, timestamp: number, dayStart: number,
@@ -481,14 +509,16 @@ const evaluateLiveOpportunity = (input: {
 }): PaperOpportunity => {
   const equity = liveEquity(input.balance, input.positions);
   const dayStart = input.state.riskDayStartEquityUsd ?? equity;
-  const profile = liveProfileFor(equity);
+  const profile = liveProfileFor(equity, input.market.duration);
   const maxTradeUsd = Math.min(RISK.maxTradeUsd, input.balance * profile.maxStakePct, equity * profile.maxStakePct);
   const account = buildPaperAccount(input.balance, input.positions, input.markets, input.now, dayStart, input.state.closedTrades);
   const opportunity = evaluatePaperMarket({ market: input.market, markets: input.markets, account,
     costs: { feeRate: RISK.feeRate, slippageBps: RISK.slippageBps }, liquidationEquityUsd: equity,
     dayStartLiquidationEquityUsd: dayStart, peakLiquidationEquityUsd: input.state.peakLiquidationEquityUsd ?? equity,
     minOrderUsd: LIVE_MINIMUM_ALL_IN_USD, maxTradeUsd, maxExposurePct: profile.maxExposurePct, minimumSharesOverride: LIVE_MINIMUM_SHARES,
-    profileOverride: profile, minNetEdge: RISK.minEdge, now: input.now });
+    profileOverride: profile, minNetEdge: RISK.minEdge,
+    strategyThresholds: { microScoreMinimum: profile.microScoreMinimum, smallBiasConfidenceMinimum: profile.smallBiasConfidenceMinimum },
+    now: input.now });
   if (input.state.closedTradesAt === null || input.now - input.state.closedTradesAt > CLOSED_HISTORY_MAX_AGE_MS) {
     return { ...opportunity, approved: false, reason: "PASS: recent realized P&L history is unavailable or stale, so live loss-streak controls cannot be applied." };
   }
@@ -542,11 +572,11 @@ async function main() {
     state.closedTradesAt = Date.now();
     await writeState(state);
 
-    console.log("\nLive guardrails: full shared model and bankroll filters · LOCK signals only · minimum 4% net edge · five-share order minimum · FAK execution (partial fills accepted) · 5% fee estimate · 25 bps slippage.");
+    console.log("\nLive guardrails: full market-specific model and bankroll filters · ENTRY or LOCK signals · tier-adjusted edge floor (never below 4% net) · five-share order minimum · FAK execution (partial fills reconciled) · 5% fee estimate · 25 bps slippage.");
     console.log("Live entries require at least $10 liquidation equity. A partial FAK fill below five shares will be tracked but held to settlement because it may be below the venue's exit minimum.");
     console.log("For balances up to $100, an entry may use up to 15% of equity to meet the five-share minimum, with a $5 per-order cap and 15% position, daily-loss, and drawdown limits. Larger balances keep their tier limits.");
-    const enableModelExits = (await ask("Enable model-aware auto-exits for positions opened by this trader? Type YES to enable, or press Enter to hold to settlement: ")).toUpperCase() === "YES";
-    console.log(enableModelExits ? "Model-aware exits are enabled for positions opened by this trader; all other wallet positions remain unmanaged." : "Model-aware exits are off; the trader will hold its entries to market settlement unless you manage them manually.");
+    const enableModelExits = (await ask("Enable automatic cashouts, 20% net take-profit, and 20% net stop-loss for positions opened by this trader? Type YES to enable, or press Enter to hold to settlement: ")).toUpperCase() === "YES";
+    console.log(enableModelExits ? "Model-aware cashouts, a 20% net take-profit, and a 20% net stop-loss are enabled for positions opened by this trader; all other wallet positions remain unmanaged." : "Automatic cashouts and stop-losses are off; the trader will hold its entries to market settlement unless you manage them manually.");
     const answer = await ask("Type YES to arm live trading: ");
     if (answer.toUpperCase() !== "YES") {
       console.log("Not armed. No order was placed.");
@@ -646,7 +676,7 @@ async function main() {
         const blockedReasons = new Map<string, number>();
         const recordBlock = (reason: string) => blockedReasons.set(reason, (blockedReasons.get(reason) ?? 0) + 1);
         if (enableModelExits) {
-          const confirmedExits: Array<{ market: LiveMarket; position: PositionRow; side: "UP" | "DOWN"; evaluation: NonNullable<ReturnType<typeof evaluateLiveHoldExit>>["evaluation"] }> = [];
+          const confirmedExits: Array<{ market: LiveMarket; position: PositionRow; side: "UP" | "DOWN"; evaluation: NonNullable<ReturnType<typeof evaluateLiveHoldExit>>["evaluation"]; executableShares: number }> = [];
           let exitStateChanged = false;
           const presentTokens = new Set(lastKnownPositions.flatMap((position) => position.tokenID ? [position.tokenID] : []));
           for (const tokenID of state.managedPositionTokens) {
@@ -670,8 +700,9 @@ async function main() {
             const retryKey = `exit:${tokenID}`;
             if ((state.retryAfter[retryKey] ?? 0) > now) continue;
             const market = [...currentMarkets.values()].find((candidate) => candidate.upTokenId === tokenID || candidate.downTokenId === tokenID);
-            if (!market || market.remaining < DEFAULT_LIVE_EARLY_EXIT.earlyExitMinRemainingSeconds
-              || streamHealth.status !== "CONNECTED" || marketDataFreshnessIssue(market, now)) {
+            const exitPolicy = liveExitPolicyFor(liveEquity(lastKnownBalance, lastKnownPositions));
+            const stopLossWindowStart = Math.min(exitPolicy.earlyExitMinRemainingSeconds, exitPolicy.earlyExitStopLossMinRemainingSeconds);
+            if (!market || market.remaining < stopLossWindowStart || liveExitBookIssue(market, tokenID, now)) {
               if (state.exitConfirmations[tokenID]) { delete state.exitConfirmations[tokenID]; exitStateChanged = true; }
               continue;
             }
@@ -685,10 +716,16 @@ async function main() {
             const count = previous && now - previous.lastSeen <= 10_000 ? previous.count + 1 : 1;
             state.exitConfirmations[tokenID] = { count, lastSeen: now };
             exitStateChanged = true;
-            if (count >= DEFAULT_LIVE_EARLY_EXIT.earlyExitConfirmations) confirmedExits.push({ market, position, side, evaluation: exit.evaluation });
+            if (count >= DEFAULT_LIVE_EARLY_EXIT.earlyExitConfirmations) confirmedExits.push({ market, position, side,
+              evaluation: exit.evaluation, executableShares: exit.executableShares });
           }
           if (exitStateChanged) { await writeState(state); lastStateWriteAt = now; }
-          confirmedExits.sort((left, right) => right.evaluation.exitAdvantageUsd - left.evaluation.exitAdvantageUsd);
+          confirmedExits.sort((left, right) => {
+            const leftStopLoss = left.evaluation.reason.startsWith("Stop-loss:");
+            const rightStopLoss = right.evaluation.reason.startsWith("Stop-loss:");
+            if (leftStopLoss !== rightStopLoss) return leftStopLoss ? -1 : 1;
+            return right.evaluation.exitAdvantageUsd - left.evaluation.exitAdvantageUsd;
+          });
           const confirmedExit = confirmedExits[0];
           if (confirmedExit) {
             const tokenID = confirmedExit.position.tokenID!;
@@ -709,12 +746,12 @@ async function main() {
             if (!(new Set(["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"])).has(tickSize)) throw new Error("Unsupported CLOB tick size; no exit order submitted.");
             const receivedAt = Date.now();
             const executionMarket = withFreshExecutionBook(confirmedExit.market, tokenID, marketBook, receivedAt);
-            const freshIssue = marketDataFreshnessIssue(executionMarket, receivedAt);
+            const freshIssue = liveExitBookIssue(executionMarket, tokenID, receivedAt);
             const liveEquityUsd = liveEquity(freshBalance, freshPositions);
             const finalExit = freshIssue ? null : evaluateLiveHoldExit(executionMarket, freshPosition, confirmedExit.side, receivedAt, liveEquityUsd);
-            const sellShares = finalExit?.requestedShares ?? 0;
             const sellQuote = finalExit && finalExit.evaluation.shouldExit
-              ? liveSellQuote(executionMarket, confirmedExit.side, sellShares, Number(tickSize), receivedAt) : null;
+              ? liveSellQuote(executionMarket, confirmedExit.side, finalExit.executableShares, Number(tickSize), receivedAt) : null;
+            const sellShares = sellQuote?.shares ?? 0;
             if (!finalExit?.evaluation.shouldExit || !sellQuote) {
               delete state.exitConfirmations[tokenID];
               lastKnownBalance = freshBalance;
@@ -815,7 +852,7 @@ async function main() {
           const opportunity = evaluateLiveOpportunity({ market, markets: currentMarkets, balance: lastKnownBalance,
             positions: lastKnownPositions, state, now });
           if (!opportunity.approved) { recordBlock(opportunity.reason); continue; }
-          if (opportunity.signal.action === "PASS" || opportunity.signal.tier !== "LOCK"
+          if (opportunity.signal.action === "PASS" || opportunity.signal.tier === "PASS"
             || opportunity.signal.edge === null || opportunity.signal.edge < RISK.minEdge) {
             recordBlock(opportunity.signal.reason); continue;
           }
@@ -833,7 +870,7 @@ async function main() {
             const freshOracleCount = activeMarkets.filter((market) => market.spotSource === "POLYMARKET"
               && market.spotUpdatedAt !== null && marketNow - market.spotUpdatedAt <= 10_000
               && market.spotUpdatedAt <= marketNow + 1_000).length;
-            console.log(`[${new Date().toLocaleTimeString()}] No actionable LOCK opportunity · ${definitions.length} markets discovered · ${activeMarkets.length} active · ${freshOracleCount}/${activeMarkets.length} active markets have a fresh oracle tick · ${leadingBlock}.`);
+            console.log(`[${new Date().toLocaleTimeString()}] No actionable model opportunity · ${definitions.length} markets discovered · ${activeMarkets.length} active · ${freshOracleCount}/${activeMarkets.length} active markets have a fresh oracle tick · ${leadingBlock}.`);
           }
           await sleep(SCAN_MS);
           continue;
@@ -874,7 +911,7 @@ async function main() {
         }
         const finalOpportunity = evaluateLiveOpportunity({ market: executionMarket, markets: executionMarkets,
           balance: freshBalance, positions: freshPositions, state, now: bookReceivedAt });
-        if (!finalOpportunity.approved || finalOpportunity.signal.action !== side || finalOpportunity.signal.tier !== "LOCK"
+        if (!finalOpportunity.approved || finalOpportunity.signal.action !== side || finalOpportunity.signal.tier === "PASS"
           || finalOpportunity.signal.edge === null || finalOpportunity.signal.edge < RISK.minEdge || !finalOpportunity.sizing) {
           console.log(`[${new Date().toLocaleTimeString()}] ${best.market.asset} held after model recheck: ${finalOpportunity.reason}`);
           await sleep(SCAN_MS);
@@ -889,7 +926,7 @@ async function main() {
           await sleep(SCAN_MS);
           continue;
         }
-        const freshProfile = liveProfileFor(freshEquity);
+        const freshProfile = liveProfileFor(freshEquity, best.market.duration);
         const perEntryCap = Math.min(RISK.maxTradeUsd, freshBalance * freshProfile.maxStakePct, freshEquity * freshProfile.maxStakePct);
         const totalExposure = freshPositions.reduce((sum, position) => sum + position.exposureUsd, 0);
         const totalExposureCap = freshEquity * freshProfile.maxExposurePct;

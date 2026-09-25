@@ -143,6 +143,10 @@ export const enforceLiveExecutionRisk = (input: Partial<LiveRiskConfig> | null |
     earlyExitModelGap: Math.max(risk.earlyExitModelGap, DEFAULT_LIVE_RISK.earlyExitModelGap),
     earlyExitMinRemainingSeconds: Math.max(risk.earlyExitMinRemainingSeconds, DEFAULT_LIVE_RISK.earlyExitMinRemainingSeconds),
     earlyExitConfirmations: Math.max(risk.earlyExitConfirmations, DEFAULT_LIVE_RISK.earlyExitConfirmations),
+    earlyExitTakeProfitPct: risk.earlyExitTakeProfitPct,
+    earlyExitStopLossPct: Math.min(Math.max(risk.earlyExitStopLossPct, 0.05), DEFAULT_LIVE_RISK.earlyExitStopLossPct),
+    earlyExitStopLossMinRemainingSeconds: Math.max(5,
+      Math.min(risk.earlyExitStopLossMinRemainingSeconds, 30)),
   };
 };
 

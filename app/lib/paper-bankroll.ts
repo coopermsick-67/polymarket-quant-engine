@@ -41,6 +41,7 @@ export const evaluatePaperMarket = (input: {
   minNetEdge?: number;
   minimumSharesOverride?: number;
   profileOverride?: BankrollProfile;
+  strategyThresholds?: { microScoreMinimum?: number; smallBiasConfidenceMinimum?: number };
   now?: number;
 }): PaperOpportunity => {
   const { market, markets, account, costs } = input;
@@ -69,13 +70,15 @@ export const evaluatePaperMarket = (input: {
   const side = signal.action;
   // MICRO accounts use a separate short-window momentum filter: only the most
   // liquid 5m contracts and an aligned live oracle micro-trend can qualify.
+  const microScoreMinimum = input.strategyThresholds?.microScoreMinimum ?? 0.45;
+  const smallBiasConfidenceMinimum = input.strategyThresholds?.smallBiasConfidenceMinimum ?? 0.58;
   if (profile.tier === "MICRO") {
     if (market.duration !== "5m") return blockSignal("PASS: MICRO strategy only trades 5m markets to limit time and capital exposure.");
-    if (signal.microScore === null || Math.abs(signal.microScore) < 0.45
+    if (signal.microScore === null || Math.abs(signal.microScore) < microScoreMinimum
       || Math.sign(signal.microScore) !== (side === "UP" ? 1 : -1)) {
       return blockSignal("PASS: MICRO strategy requires a strong, aligned live oracle micro-trend.");
     }
-  } else if (profile.tier === "SMALL" && (signal.biasConfidence ?? 0) < 0.58) {
+  } else if (profile.tier === "SMALL" && (signal.biasConfidence ?? 0) < smallBiasConfidenceMinimum) {
     return blockSignal(`PASS: SMALL strategy requires stronger ${market.duration}-specific directional confidence before using limited balance.`);
   }
   const book = side === "UP" ? upBook : downBook;

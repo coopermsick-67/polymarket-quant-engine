@@ -11,6 +11,7 @@ import {
   fetchCandleHistories,
   fetchOrderBooks,
   fetchSpotPrices,
+  synchronizedPolymarketTime,
 } from "../../../lib/polymarket-data";
 import { analyzeMarketSignal, estimateSidePrice, marketDataFreshnessIssue } from "../../../lib/engines";
 import { evaluateModelAwareExit } from "../../../lib/early-exit";
@@ -461,18 +462,28 @@ export async function POST(request: Request) {
       ]);
       const now = Date.now();
       let market = buildLiveMarket(definition, books, spots, null, now, histories.get(definition.asset) ?? null);
+      let modelDataAvailable = false;
       if (!manualExit) {
         const ticks = definition.priceFeed === "UNSUPPORTED" || definition.startTime === null ? [] : await readPolymarketPriceTicks([{ asset: definition.asset, priceFeed: definition.priceFeed, startTime: definition.startTime }]);
         market = applyPolymarketPriceTicks(market, ticks, Date.now());
-        const freshnessIssue = marketDataFreshnessIssue(market);
-        if (freshnessIssue) return json(pass(`Early exit blocked: ${freshnessIssue}`));
+        modelDataAvailable = marketDataFreshnessIssue(market) === null;
       }
       const currentPrice = side === "UP" ? market.upBid : market.downBid;
       const fairUp = manualExit ? null : anchoredFairUp(market);
       const fairProbability = fairUp === null ? null : side === "UP" ? fairUp : 1 - fairUp;
-      if (currentPrice === null || (!manualExit && fairProbability === null)) return json(pass("Current executable bid or model fair probability is unavailable."));
+      const positionBook = side === "UP" ? market.upBook : market.downBook;
+      const marketNow = synchronizedPolymarketTime(now);
+      const positionBookIsFresh = Boolean(positionBook && positionBook.timestamp !== null
+        && positionBook.timestamp <= marketNow + 30_000 && marketNow - positionBook.timestamp <= 60_000
+        && positionBook.bids.some((level) => level.price > 0 && level.price < 1 && level.size > 0));
+      if (!manualExit && (!market.startTimeVerified || market.startTime === null || market.startTime > marketNow + 1_000
+        || market.remaining < risk.earlyExitStopLossMinRemainingSeconds || !positionBookIsFresh)) {
+        return json(pass("Automatic early exit requires a verified active market and a fresh executable bid."));
+      }
+      if (currentPrice === null || (!manualExit && fairProbability === null && !positionBookIsFresh)) return json(pass("Current executable bid or safe exit quote is unavailable."));
       const shares = Math.min(requestedShares, position.size);
-      const evaluation = manualExit ? null : evaluateModelAwareExit({ policy: risk, entryPrice: position.averagePrice, currentPrice, fairProbability: fairProbability!, shares, feeRate: risk.feeRate, remainingSeconds: market.remaining });
+      const evaluation = manualExit ? null : evaluateModelAwareExit({ policy: risk, entryPrice: position.averagePrice, currentPrice,
+        fairProbability: fairProbability ?? 0.5, modelDataAvailable, shares, feeRate: risk.feeRate, remainingSeconds: market.remaining });
       if (evaluation && !evaluation.shouldExit) return json(pass(evaluation.reason, { evaluation, market: { id: market.id, asset: market.asset, duration: market.duration, remaining: market.remaining } }));
       const openOrders = await client.getOpenOrders({ asset_id: tokenID }, true);
       if (openOrders.length) return json(pass("An open order already exists for this position; the early exit was not submitted.", { openOrders: openOrders.length }));
