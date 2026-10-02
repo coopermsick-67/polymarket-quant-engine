@@ -1,12 +1,11 @@
 import type { Metadata } from "next";
-import ChatGPTAuthBanner from "./components/chatgpt-auth-banner";
 import "./globals.css";
 
 export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
-  title: "PM5 Predictor Terminal",
-  description: "A terminal-style paper signal monitor for a Polymarket 5-minute Up/Down predictor.",
+  title: "BTC 15M One-Shot",
+  description: "A single locked BTC 15-minute Up/Down signal using Polymarket oracle-aligned data.",
   other: {
     "codex-preview": "development",
   },
@@ -23,10 +22,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>
-        <ChatGPTAuthBanner />
-        {children}
-      </body>
+      <body>{children}</body>
     </html>
   );
 }
